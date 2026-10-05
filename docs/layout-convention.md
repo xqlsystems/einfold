@@ -1,5 +1,5 @@
 <!--
-SPDX-FileCopyrightText: 2026 Alex Merose
+SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
 
 SPDX-License-Identifier: Apache-2.0
 -->

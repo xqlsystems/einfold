@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # einfold: Fast Tensor Contractions for the XQL Model
 
-Status: draft v6. Author: Alex Merose. Last updated: 2026-10-04. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
+Status: draft v7. Author: Alex Merose. Last updated: 2026-10-04. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
 
 ## 1. Summary
 
@@ -71,7 +71,7 @@ einfold's output must run on engines we do not control. Hosts take plans in one 
 - **Apache DataFusion** (CPU). A query engine written in Rust, built on Arrow, and designed to be extended. xarray-sql, zarr-datafusion, and Zax-SQL all use it. It lets extensions add optimizer rules and physical operators, and it can write plans back out as SQL (through its `Unparser`) and as Substrait.
 - **NVIDIA GPU Query Engine (GQE)**. NVIDIA's GPU query engine, built on libcudf, the CUDA library behind NVIDIA's GPU DataFrames. It accepts Substrait, Flight SQL, and SQL, and uses DataFusion for planning.
 - **DuckDB** (CPU). An in-process analytical SQL database, like SQLite for analytics. It reads SQL, and reads Substrait through its `substrait` extension.
-- **DuckDB + [`gpudb`](https://github.com/singhpratech/duckdbgpumetaldbram)** (Apple Metal and NVIDIA CUDA). A community DuckDB extension that rewrites SQL statements before DuckDB plans them, and runs parts of them on the GPU. It does not read Substrait. It runs GROUP BY, joins, and expressions inside `SUM` on the GPU, and for some shapes it fuses join and aggregate without producing join output. It keeps `SUM` and `AVG` over floating-point columns on the CPU, because floating-point sums depend on the order of addition (section 8.3).
+- **DuckDB + [`gpudb`](https://github.com/singhpratech/duckdbgpumetaldbram)** (Apple Metal and NVIDIA CUDA). A community DuckDB extension that rewrites SQL statements before DuckDB plans them, and runs parts of them on the GPU. It does not read Substrait. It runs GROUP BY, joins, and expressions inside `SUM` on the GPU, and for some shapes it fuses join and aggregate without producing join output. It keeps `SUM` and `AVG` over floating-point columns on the CPU, because floating-point sums depend on the order of addition (section 8.6).
 - **DuckDB + [Sirius](https://github.com/sirius-db/sirius)** (NVIDIA CUDA). A GPU query engine built on libcudf that plugs into DuckDB as an extension. It intercepts every query through a hook in DuckDB's optimizer, converts it to Substrait, and runs it on the GPU. Operators it does not support fall back to DuckDB on the CPU. It supports filters, projections, hash and nested-loop joins, GROUP BY, aggregation, ORDER BY, top-N, LIMIT, and common table expressions (CTEs, the SQL `WITH` clause), over integer, floating-point, decimal, string, date, and timestamp types. Its `pin_table` function keeps a table resident in GPU memory between queries. Support for StarRocks, another analytical database, is announced.
 
 Because of this, einfold must write both **Substrait and SQL**.
@@ -98,7 +98,7 @@ Three more problems come from the XQL setting:
 2. **The XQL logical model is the contract.** A dataset is a table with one row per coordinate tuple, its dimensions as key columns and its variables as value columns. einfold never changes what a query means or the shape of its result. Layouts, tiles, and partial states are physical, and they live inside operators.
 3. **Every rewrite has a portable fallback.** If a host cannot run a richer form, einfold still gives it a plan made of standard relational operators.
 4. **Never wrong.** A rewrite is applied only when it is proven equivalent under SQL semantics, including NULLs and bag semantics (SQL tables may hold duplicate rows, and aggregates count every duplicate). Missing a speedup is acceptable; changing a result is not.
-5. **Deterministic by default.** The same plan on the same data gives bit-identical results, run after run (section 8.3).
+5. **Never add nondeterminism.** einfold never makes a plan less repeatable than the plan it received. Bit-for-bit determinism is a setting users can request, and the default wherever einfold itself executes (section 8.6).
 6. **A chunk is a partition.** Storage tiles are the natural unit of reading, pruning, parallelism, and partial aggregation (section 8.2).
 7. **Composable by default.** Readers, writers, fact providers, and planners are plugins behind narrow interfaces. Nothing in the core knows which engine or device is downstream.
 
@@ -216,7 +216,7 @@ einfold produces two output forms. The planner picks per subplan, based on the t
 
 ### 7.4 Target profiles
 
-A **target profile** describes a host: Substrait or SQL dialect, whether it implements the `Einsum` relation (and for which value types and forms), which join and aggregate shapes it fuses, its float-sum guarantee (section 8.3), how to stop it from reordering einfold's plan (section 9.3), whether its readers accept aggregate pushdown (section 10.5), and whether it scans a shared CTE once (section 9.5).
+A **target profile** describes a host: Substrait or SQL dialect, whether it implements the `Einsum` relation (and for which value types and forms), which join and aggregate shapes it fuses, its deterministic mechanisms and supported precision levels (section 8.6), how to stop it from reordering einfold's plan (section 9.3), whether its readers accept aggregate pushdown (section 10.5), and whether it scans a shared CTE once (section 9.5).
 
 Profiles are data, not code, so new hosts need no einfold release. Fallback is per subplan. If a host runs the `Einsum` relation for dense 64-bit floats but not for sparse integers, einfold emits the einsum form for the first subplan and the relational form for the second, in the same plan.
 
@@ -316,7 +316,7 @@ Slicing a summed dimension produces partial aggregates that must be combined (se
 
 ### 8.3 Partial aggregates
 
-A **partial aggregate** is the state of one output group, computed over part of the input and combined later. Eager aggregation (10.1), EinFold's accumulator (10.2), slicing (9.4), parallel partitions, and reduction at the source (10.5) all produce partial aggregates. So the SQL semantics and the determinism rules are defined once, here.
+A **partial aggregate** is the state of one output group, computed over part of the input and combined later. Eager aggregation (10.1), EinFold's accumulator (10.2), slicing (9.4), parallel partitions, and reduction at the source (10.5) all produce partial aggregates. So their SQL semantics are defined once, here. Their numerics are defined in section 8.6.
 
 **State.** For `SUM` over products, a group's state is:
 
@@ -325,24 +325,9 @@ A **partial aggregate** is the state of one output group, computed over part of 
 
 **Update.** For each joined row, set `matched`. Then, if the product is not NULL, add it to `value` (the first non-NULL product assigns it). Setting `matched` before the NULL test is what keeps an all-NULL group in the output as NULL, rather than dropping it.
 
-**Combine.** `matched` is OR-ed. `value` is added, with "none" as the identity. Partial aggregates are combined in a fixed order: partition order, then tile order. That order is what makes results deterministic.
+**Combine.** `matched` is OR-ed. `value` is added, with "none" as the identity. When einfold controls the combine (in its reference executor, and when determinism is requested), it combines partial aggregates in a fixed order: partition order, then tile order.
 
-**Accumulator precision.** Accumulate in higher precision than the inputs and round once at the end, as Gustavson recommends (section 10.2): 64-bit accumulators for 32-bit inputs.
-
-**Determinism.** *Decision: einfold is deterministic by default.* The same plan on the same data and host gives bit-identical results on every run.
-
-- *Why this is hard.* Floating-point addition is not associative, so a sum depends on the order of additions. Parallel hosts add in whatever order threads finish. That is why `gpudb` keeps floating-point `SUM` on the CPU. It matches our decision, but it blocks the GPU speedup for float tensors.
-- *einfold's rewrites change summation order too.* Eager aggregation and the contraction order change which numbers are added together, and when. So "equivalent" in principle 4 means mathematically equivalent. A rewritten plan is deterministic, but its bits can differ from the original plan's. Distributing a product over a sum can also change overflow behavior: `a·Σbⱼ` can overflow when every `a·bⱼ` does not.
-- *Options for `value`, in order of preference:*
-  1. **An order-independent accumulator.** Reproducible summation gives the same bits whatever the order of additions. It works either by binning values by exponent, as the ReproBLAS library (Demmel and Nguyen) does, or with an exact "superaccumulator" wide enough to hold any sum without rounding. Results are then deterministic *and* parallel. A rewrite that only reorders sums gives the original plan's exact bits, which makes testing easier. Cost: slower than a plain sum (spike S8).
-  2. **A fixed combine order**, as above. Deterministic on one host but not across hosts, and harder to make fast on GPU.
-  3. **Fixed-point values** (SQL `DECIMAL` or scaled integers) where the value range allows. Exact, and `gpudb` already sums these on GPU. Costly to prove safe.
-- *Consequences.*
-  - Relational form on hosts that sum floats on the CPU: plans still get the plan-shape benefits. The GPU float-sum speedup needs the host to offer a deterministic float sum. We propose option 1 to the `gpudb`, Sirius, and GQE maintainers.
-  - The `Einsum` relation's spec requires deterministic results, and its conformance suite checks bit-identical output across runs.
-  - Target profiles record each host's float-sum guarantee. einfold does not emit a plan whose determinism depends on a host that does not guarantee it.
-  - Proposal: a per-session or per-query opt-out for users who want maximum speed, such as when training ML models. Off by default.
-- *Still open.* Whether the `Einsum` relation's spec requires higher-precision accumulation of hosts.
+**Numerics.** How `value` is accumulated (its precision, and whether its result depends on the order of additions) is set by section 8.6.
 
 ### 8.4 Order is a layout
 
@@ -361,6 +346,83 @@ Most of what einfold computes depends only on **structure**: the einsum, the ext
 - **Plan caching.** Contraction trees are cached, keyed by the einsum in a canonical form plus extents rounded into buckets. Blacher et al. note that repeated einsums should not be re-planned. ddx caches each training step's physical plan for the same reason.
 - **Symbolic–numeric split.** When the support is fixed and only values change, Gustavson computes the output's structure once (the symbolic pass), then runs only a numeric pass with no hashing and no "already touched?" tests (section 10.2). ddx's training steps fit this exactly: each step runs the same contractions on new values.
 - **Measured facts.** Densities measured in one run (section 10.4) remain valid for later runs over the same support.
+
+### 8.6 Numerics: determinism and precision
+
+Floating-point addition is not associative: `(a + b) + c` can differ from `a + (b + c)` in the last bits. So a parallel sum, whose additions happen in whatever order threads finish, can give slightly different results on each run. This section sets einfold's policy, based on what SQL engines and JAX do.
+
+#### What the ecosystem does
+
+**SQL engines do not guarantee deterministic float sums in parallel.** Every engine we checked treats run-to-run variation as expected behavior:
+
+- **DuckDB.** Its maintainers call varying `sum(double)` results expected, and suggest `fsum` (Kahan summation), `threads=1`, or a cast to `DECIMAL` (DuckDB discussion #12693).
+- **PostgreSQL.** Serial plans give stable float sums, and parallel plans do not. This was reported in 2017 and treated as inherent to floating point.
+- **BigQuery and Snowflake.** Their documentation states that `SUM` over floats can differ between runs, and recommends fixed-point types where precision matters.
+- **DataFusion.** No documented guarantee. Our measurement (below) shows run-to-run variation.
+
+The engines accumulate `DOUBLE` sums in 64 bits, and offer `DECIMAL` for exact results.
+
+**Our measurement.** 4 million `DOUBLE` values spanning 16 orders of magnitude, with mixed signs; each configuration run 20 times on a 12-core machine; DuckDB 1.5.6 and DataFusion 54.0.0.
+
+| Engine and setting | Distinct results in 20 runs | Relative error vs exact sum |
+|---|---|---|
+| DuckDB `sum`, 12 threads | 19 | 1.8e-16 |
+| DuckDB `fsum` (Kahan), 12 threads | 5 | 3.5e-16 |
+| DuckDB `sum`, 1 thread | 1 | 6.9e-14 |
+| DuckDB `fsum`, 1 thread | 1 | 0 |
+| DataFusion `sum`, 1 input partition, `target_partitions = 1` | 1 | 2.7e-15 |
+| DataFusion `sum`, any other partitioning | 4–6 | 1–2e-15 |
+
+Two lessons:
+
+- **Compensated summation, such as Kahan's, is not a determinism fix.** It shrinks the effect of addition order but does not remove it. Only accumulators whose result is truly independent of order (below) are deterministic in parallel.
+- **Determinism and accuracy are different properties.** The single-threaded sums are repeatable but the least accurate, because adding strictly left to right accumulates rounding error. A fixed order buys repeatability, not accuracy.
+
+**JAX separates three concerns,** and handles each differently:
+
+- *Randomness* is deterministic by design. Random numbers come from explicit keys passed through pure functions.
+- *Order of operations* is fast by default and deterministic by opt-in. On GPUs, reductions use atomic operations, and the compiler's autotuner may choose different kernels between compilations. So results can vary between runs. Users opt into determinism with process-wide XLA flags (`--xla_gpu_exclude_nondeterministic_ops`, formerly `--xla_gpu_deterministic_ops`, plus `--xla_gpu_autotune_level=0`). XLA's documentation warns of substantial throughput loss.
+- *Precision* is fast by default, with explicit, scoped controls. Arrays default to 32-bit floats, and 64-bit must be enabled. A float32 matrix multiply at the default precision runs in bfloat16 on TPUs and in TF32 on A100 and H100 GPUs. Users raise precision per operation (a `precision=` argument) or for a block of code (the `jax.default_matmul_precision` context manager).
+
+#### einfold's policy
+
+einfold follows JAX's split.
+
+**1. Guaranteed by design: einfold never adds nondeterminism.**
+
+- A rewritten plan is never less deterministic than the plan einfold received. einfold's own decisions (the contraction tree, the choice of algorithm, run-time switching in section 10.4) depend only on the plan, the facts, and the data, never on timing.
+- Rewrites still change *which* numbers are added together and when, so a rewritten plan's bits can differ from the original plan's. "Equivalent" in principle 4 means mathematically equivalent. Distributing a product over a sum can also change overflow behavior: `a·Σbⱼ` can overflow when every `a·bⱼ` does not.
+
+**2. Determinism is a scoped setting, off by default on hosts.**
+
+- By default, einfold emits the fastest forms the host supports, with the host's usual float behavior, as every SQL engine above does.
+- A user can request determinism per session or per query, as with JAX's flag or DuckDB's `threads=1`. einfold then uses only mechanisms the host's target profile lists as deterministic: a single partition, the host's own deterministic mode, or a cast to `DECIMAL`. If the host offers none, einfold leaves that subplan in its original form and says why.
+- `DECIMAL` is the portable deterministic path, since every engine recommends it and it is exact. Its limits are value range and speed.
+
+**3. Deterministic by default where einfold executes.**
+
+- The reference executor (`EinsumExec`) and the `Einsum` relation's specification are deterministic by default, and the conformance suite checks that repeated runs give identical bits. einfold controls these, and conformance testing needs repeatability, much as JAX on TPU is deterministic in practice.
+- Ways to accumulate `value` deterministically, in order of preference:
+  1. **An order-independent accumulator.** Reproducible summation gives the same bits in any order. It works either by binning values by exponent, as the ReproBLAS library (Demmel and Nguyen) does, or with an exact "superaccumulator" wide enough to hold any sum without rounding. Results are then deterministic, parallel, and accurate, and a rewrite that only reorders sums gives the original plan's exact bits. Cost: slower than a plain sum (spike S8).
+  2. **A fixed combine order** (section 8.3). Deterministic on one host but not across hosts, harder to make fast on GPU, and only as accurate as its order.
+  3. **Fixed-point values** (SQL `DECIMAL` or scaled integers) where the value range allows. Exact, and `gpudb` already sums these on the GPU. Costly to prove safe.
+- Users who want maximum speed in the reference executor, for example when training models, can turn determinism off.
+
+**4. Precision is its own setting.** Modeled on JAX's precision levels:
+
+| Level | Accumulator | Einsum-form kernels |
+|---|---|---|
+| `fast` | the host's default | may use reduced-precision formats, such as TF32 or bfloat16, where the host offers them |
+| `default` | 64-bit for 32-bit and 64-bit floats | full input precision |
+| `highest` | an exact or reproducible accumulator | full input precision |
+
+`default` follows SQL's convention of 64-bit sums, and Gustavson's advice to accumulate in higher precision and round once (section 10.2). Precision and determinism are set independently, except that `highest` is also deterministic.
+
+**5. Warn where small differences become big ones.** In SQL, a sum that varies in its last bit can flip a comparison. Sums feed `WHERE` and `HAVING` filters, `ORDER BY … LIMIT`, `MIN` and `MAX` ties, `GROUP BY` on computed keys, and joins on computed values. Then a last-bit difference becomes different rows. ddx, for example, needs a tie-breaking rule for `MIN` and `MAX` because sums across partitions vary. einfold traces each float sum through the plan, and when one feeds such a decision without determinism requested, it warns and suggests deterministic mode. It does not change the plan on its own, since hosts don't either.
+
+**In target profiles,** each host records which deterministic mechanisms it offers and which precision levels it supports.
+
+**On GPU hosts,** the relational form still gets its plan-shape benefits. Fast deterministic float sums on GPU need host support for an order-independent accumulator, which einfold will propose to the `gpudb`, Sirius, and GQE maintainers.
 
 ## 9. Logical optimization
 
@@ -523,7 +585,7 @@ FROM A JOIN n1 ON A.j = n1.j GROUP BY A.i;
   - If all `bⱼ` are NULL, `Σbⱼ` is NULL, so `a·Σbⱼ` is NULL. Every `a·bⱼ` is also NULL. Both forms skip.
   - Otherwise both forms add the same non-NULL terms.
 
-The rule is therefore exact in SQL semantics, up to the floating-point effects in section 8.3.
+The rule is therefore exact in SQL semantics, up to the floating-point effects in section 8.6.
 
 **When it helps.** Yan and Larson skip pre-aggregation when the grouping columns form a key, because then nothing gets smaller. The einsum version of that test: a node gains only if it sums out at least one dimension. For matrix multiplication `nd,dh->nh`, the shared dimension `d` is summed only after the join, and nothing is private, so eager aggregation changes nothing. Matrix multiplication needs EinFold. Eager aggregation matters for chains of three or more operands, for ddx's multi-way gradient contractions, and for operands with private dimensions (marginals, traces, weighted means).
 
@@ -575,6 +637,8 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 
 **Symbolic–numeric split** (section 8.5). When the support is fixed and only values change, run the symbolic pass once to compute the output's structure. Later runs then do only the numeric pass, with no hashing and no "already touched?" test. The reference executor caches the symbolic result next to ddx's cached physical plan.
 
+**Accumulator precision.** Gustavson recommends accumulating `x` in higher precision than the inputs and rounding once, when the row is emitted (Gustavson, 1978, §3.5). einfold's precision levels (section 8.6) build on that advice.
+
 #### Dense and block-sparse algorithms
 
 - **Dense.** When both operands are dense over `S` and their free dimensions, with Exact coordinate maps that agree and unique coordinate tuples, skip hashing. View each tile through its layout and call a GEMM, batched over `Kₛ`. The layout's strides decide whether an input must be treated as transposed (section 8.4).
@@ -586,7 +650,7 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 - *NULLs and group existence:* section 8.3.
 - *Missing tiles:* section 8.1.
 - *Duplicate coordinate tuples.* The hash algorithm adds them up (bag semantics). The dense algorithms require unique tuples, which an Exact layout guarantees.
-- *Determinism.* Accumulation order is the order of the streamed input times the order of each hash-table entry's list. It is deterministic if both inputs arrive in a deterministic order and the lists keep insertion order. Parallel partitions are combined in fixed order, or with an order-independent accumulator (section 8.3).
+- *Determinism.* Accumulation order is the order of the streamed input times the order of each hash-table entry's list. It is deterministic if both inputs arrive in a deterministic order and the lists keep insertion order. When determinism is requested, parallel partitions are combined in a fixed order, or with an order-independent accumulator (section 8.6).
 
 **In the relational form.** The relational form cannot express EinFold. But on hosts whose profile says they fuse join and aggregate (such as `gpudb`, for some query shapes), the plain pairwise SQL already avoids materializing join rows.
 
@@ -637,7 +701,7 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 - **Fill values.** For each row of the fill-value table in section 8.1, check that skipping missing chunks matches a full scan.
 - **Gradients.** With einfold enabled, ddx's gradients still match those of JAX, Google's numerical computing library, computed with `jax.grad` (ddx's `tests/test_v2_jax.py`).
 - **Speed.** ddx's `matmul` and `attn` (attention) benchmark families (`crates/ddx-datafusion/tests/ad_perf.rs`), forward and backward, with einfold on and off. Measure the symbolic–numeric split separately: the first training step against later steps.
-- **Bits versus math.** Rewrites change summation order, so plain float results may differ in the last bits. Equivalence tests compare with a tolerance. Determinism tests compare the same plan across runs bit for bit. ddx currently tolerates last-bit differences. Under einfold's deterministic default (section 8.3), ddx's tests should also check that repeated runs give identical bits.
+- **Bits versus math.** Rewrites change summation order, so plain float results may differ in the last bits. Equivalence tests compare with a tolerance. Determinism tests compare the same plan across runs bit for bit. ddx currently tolerates last-bit differences. ddx's tests that use einfold's reference executor, which is deterministic by default (section 8.6), should also check that repeated runs give identical bits.
 
 ## 12. Integration
 
@@ -673,15 +737,15 @@ A spike is a short, time-boxed experiment that answers one design question.
 
 ### 13.2 Hosts
 
-- **S5: gpudb shapes.** Which relational-form shapes `gpudb` fuses on GPU, measured on matrix multiplication and attention. How to handle its float-sum rule (section 8.3).
+- **S5: gpudb shapes.** Which relational-form shapes `gpudb` fuses on GPU, measured on matrix multiplication and attention. How to handle its float-sum rule (section 8.6).
 - **S6: GQE Substrait.** Does GQE accept extension relations, reject plans that contain them, or ignore them? Which operators run on GPU?
 - **S7: DataFusion unparser.** Is the SQL that DataFusion's `Unparser` writes for DuckDB good enough to round-trip rewritten plans?
-- **S8: Cost of deterministic sums.** Measure reproducible summation against a plain sum on CPU and GPU, for matrix-multiply-sized reductions (section 8.3).
+- **S8: Cost of deterministic sums.** Measure reproducible summation against a plain sum on CPU and GPU, for matrix-multiply-sized reductions (section 8.6). Also measure a fixed combine order, and the cost of the precision levels.
 - **S9: Zax-SQL.** Which rewritten SQL shapes does Zax-SQL's DataFusion run well, and does its Icechunk metadata appear in `information_schema` (the standard SQL catalog of tables and columns)?
 - **S10: Plan protection.** For each host, which mechanism stops the optimizer from undoing the contraction tree (materialized CTEs, disabled passes, physical plans), and what does planning cost on a large decomposed einsum? Reproduce Blacher et al.'s satisfiability example on current DuckDB and DataFusion.
 - **S11: Algorithm thresholds.** At what density and size does EinFold's dense algorithm beat its hash algorithm on CPU? This also sets the switching threshold in section 10.4.
 - **S12: Reader aggregate pushdown.** How can a DataFusion table provider take over the `Partial` phase of an aggregation, and is there an equivalent for duckdb-zarr? What partial-state format do the engines expect?
-- **S15: Sirius.** Does DuckDB's optimizer reorder einfold's contraction tree before Sirius's hook sees the plan? Which relational-form shapes stay on GPU, and which fall back to CPU? Is the float `SUM` in Sirius (via libcudf) deterministic (section 8.3)? Can a Substrait extension relation reach Sirius through its hook? Does `pin_table` keep ddx's weights in GPU memory across training steps?
+- **S15: Sirius.** Does DuckDB's optimizer reorder einfold's contraction tree before Sirius's hook sees the plan? Which relational-form shapes stay on GPU, and which fall back to CPU? Is the float `SUM` in Sirius (via libcudf) deterministic (section 8.6)? Can a Substrait extension relation reach Sirius through its hook? Does `pin_table` keep ddx's weights in GPU memory across training steps?
 
 ### 13.3 Literature still to read
 
@@ -762,7 +826,7 @@ Agreed priority, highest first. Each lives in the section that owns it:
 - **Host optimizers undo or choke on einfold's plans.** Mitigation: plan protection in the target profile (S10).
 - **Host behavior drift.** Hosts change what they fuse and accelerate. Mitigation: target profiles are data, plus a benchmark suite per host.
 - **Facts lost in transit.** If no carrier survives the path from reader to plan, variable separation and EinFold's dense algorithms have nothing to use. Mitigation: spikes S1–S2 and S13–S14 come first.
-- **Float sums on GPU hosts.** See section 8.3.
+- **Float sums on GPU hosts.** Deterministic float sums on GPU need host support. Mitigation: determinism is a setting, not a default, on hosts (section 8.6).
 
 ## 18. References
 
@@ -804,6 +868,12 @@ Papers:
 - Yannakakis, M. (1981). Algorithms for Acyclic Database Schemes. *VLDB 1981*, 82–94.
 
 Software and documentation:
+- DuckDB discussion #12693, "sum of double not deterministic": https://github.com/duckdb/duckdb/discussions/12693
+- DuckDB issue #26143, on how `fsum` combines partial sums: https://github.com/duckdb/duckdb/issues/26143
+- PostgreSQL mailing list, "Non-deterministic behavior with floating point in parallel mode" (2017): https://www.postgresql.org/message-id/CAFRJ5K0%2BZZaUz0-ihX-aCj1h42H%3Ds-CLWO%2B2Fb6nHCvXx19Diw%40mail.gmail.com
+- XLA GPU determinism: https://openxla.org/xla/determinism
+- JAX discussion #10674, on GPU determinism: https://github.com/jax-ml/jax/discussions/10674
+- JAX default matmul precision: https://docs.jax.dev/en/latest/_autosummary/jax.default_matmul_precision.html and JAX issue #10413
 
 - Apache Arrow columnar format, dictionary-encoded layout: https://arrow.apache.org/docs/format/Columnar.html#dictionary-encoded-layout
 - DataFusion table statistics (`Statistics`, `ColumnStatistics`, `Precision`): https://docs.rs/datafusion/latest/datafusion/common/struct.Statistics.html

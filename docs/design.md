@@ -1,6 +1,12 @@
+<!--
+SPDX-FileCopyrightText: 2026 Alex Merose
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # einfold: Fast Tensor Contractions for the XQL Model
 
-Status: draft v6. Author: Alex Merose. Last updated: 2026-10-04.
+Status: draft v6. Author: Alex Merose. Last updated: 2026-10-04. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
 
 ## 1. Summary
 
@@ -709,7 +715,6 @@ To be validated by spike S3. Each rule follows from CuTe's layout algebra (secti
 - **Extension governance.** Where does the `Einsum` relation's spec live, and is it proposed upstream to Substrait?
 - **Benchmarks.** Dataset sizes, hardware, and pass/fail thresholds for section 15.
 - **Zax-SQL partnership.** Zax-SQL is a hosted service, so anything beyond the relational form needs Earthmover to run einfold inside their engine. Earthmover's stated goal for its compute engine ("the system should make those decisions, not the user") matches einfold's.
-- **Home and license.** The xqlsystems GitHub organization? Apache-2.0, to match DataFusion and `gpudb`?
 
 ## 15. Success benchmarks
 

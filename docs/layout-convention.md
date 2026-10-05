@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Alex Merose
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # XQL Systems Layout Convention for Zarr (draft)
 
 - **UUID**: f4cbf091-d7c1-40f7-80ba-c2ffdc4dcf69

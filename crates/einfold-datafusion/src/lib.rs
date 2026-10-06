@@ -2,10 +2,13 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! einfold for Apache DataFusion (design doc §7.3, §7.5).
+//! einfold for Apache DataFusion.
 //!
-//! The only einfold crate that depends on an engine. It will hold detection
-//! (§9.1), the optimizer rule, and the reference executor `EinsumExec` (§10.2).
+//! einfold speeds up tensor contractions written in SQL. A contraction, such
+//! as a matrix product, is a join followed by `SUM(product)` grouped by the
+//! output's coordinates. This crate finds such queries in DataFusion's plans
+//! and runs them with a fused join-and-sum operator. It is the only einfold
+//! crate that depends on a query engine.
 
 /// The DataFusion version this crate is built against. ddx must link the same.
 pub const DATAFUSION_VERSION: &str = datafusion::DATAFUSION_VERSION;

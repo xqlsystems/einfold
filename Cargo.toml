@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# einfold: fast tensor contractions for the XQL model. See docs/design.md.
+# einfold: fast tensor contractions inside SQL engines.
 [workspace]
 resolver = "3"
 members = [

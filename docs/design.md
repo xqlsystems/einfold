@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # einfold: Fast Tensor Contractions for the XQL Model
 
-Status: draft v9.1. Author: Alex Merose. Last updated: 2026-10-06. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
+Status: draft v9.2. Author: Alex Merose. Last updated: 2026-10-06. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
 
 ## 1. Summary
 
@@ -187,16 +187,32 @@ These are facts about the data model that einfold's rewrites must respect.
 
 ### 7.1 Overview
 
-```
-  frontends                          einfold core                                     writers
- ─────────────         ───────────────────────────────────────────────         ─────────────────────────
- Substrait plan ──┐                                                          ┌─► Substrait (GQE, Sirius, DuckDB, DataFusion)
- DataFusion plan ─┼─► Rel IR ─► detect ─► EinsumIR ─► logical ──► physical ───┼─► SQL text (DuckDB, gpudb, any SQL host)
- SQL (via DF) ────┤                          ▲         optimizer   realization └─► DataFusion plan (+ EinsumExec)
- program of plans ┘                          │      (egglog rules
-                                      fact providers  + planners)
-                                      (Zarr, Arrow, statistics,
-                                       ddx, user, runtime)
+```mermaid
+flowchart LR
+  subgraph frontends [Frontends]
+    fsub[Substrait plan]
+    fdf[DataFusion plan]
+    fsql[SQL, via DataFusion]
+    fprog[Program of plans]
+  end
+  subgraph core [einfold core]
+    rel[Rel IR] --> det[Detect] --> eir[EinsumIR]
+    eir --> logi["Logical optimizer<br/>(egglog rules + planners)"]
+    logi --> phys[Physical realization]
+  end
+  facts["Fact providers<br/>(Zarr, Arrow, statistics,<br/>ddx, user, runtime)"] --> eir
+  subgraph writers [Writers]
+    wsub["Substrait<br/>(GQE, Sirius, DuckDB, DataFusion)"]
+    wsql["SQL text<br/>(DuckDB, gpudb, any SQL host)"]
+    wdf["DataFusion plan<br/>(+ EinsumExec)"]
+  end
+  fsub --> rel
+  fdf --> rel
+  fsql --> rel
+  fprog --> rel
+  phys --> wsub
+  phys --> wsql
+  phys --> wdf
 ```
 
 - **Rel IR.** einfold's internal representation of relational plans, kept close to Substrait. Frontends convert into it and writers convert out of it.
@@ -459,9 +475,9 @@ einfold follows JAX's split.
 
 The logical optimizer rewrites einsums without choosing how each node will run. Sections 9.1, 9.2 and 9.5 are egglog rules and analyses. Sections 9.3 and 9.4 are specialized planners, applied to each sum-product region of the plan that egglog extracts (section 7.6).
 
-```
-detect & normalize ─► prune ─► plan contraction tree ─► choose tiling ─► share across einsums
-     (9.1)             (9.2)          (9.3)                (9.4)              (9.5)
+```mermaid
+flowchart LR
+  a["Detect and normalize<br/>(9.1)"] --> b["Prune<br/>(9.2)"] --> c["Plan contraction tree<br/>(9.3)"] --> d["Choose tiling<br/>(9.4)"] --> e["Share across einsums<br/>(9.5)"]
 ```
 
 ### 9.1 Detect and normalize

@@ -1,0 +1,544 @@
+source,store,coord,kind,class,n
+ERA5,gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3,time,time,exact,1323648
+ERA5,gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3,latitude,lat,exact,721
+ERA5,gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3,longitude,lon,exact,1440
+ERA5,gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3,level,vertical,monotone,37
+ERA5,gcp-public-data-arco-era5/ar/1959-2022-6h-512x256_equiangular_conservative.zarr,time,time,exact,92044
+ERA5,gcp-public-data-arco-era5/ar/1959-2022-6h-512x256_equiangular_conservative.zarr,longitude,lon,rounding,512
+ERA5,gcp-public-data-arco-era5/ar/1959-2022-6h-512x256_equiangular_conservative.zarr,latitude,lat,rounding,256
+ERA5,gcp-public-data-arco-era5/ar/1959-2022-6h-512x256_equiangular_conservative.zarr,level,vertical,monotone,13
+ERA5,gcp-public-data-arco-era5/ar/1959-2022-6h-64x32_equiangular_conservative.zarr,time,time,exact,92044
+ERA5,gcp-public-data-arco-era5/ar/1959-2022-6h-64x32_equiangular_conservative.zarr,longitude,lon,rounding,64
+ERA5,gcp-public-data-arco-era5/ar/1959-2022-6h-64x32_equiangular_conservative.zarr,latitude,lat,rounding,32
+ERA5,gcp-public-data-arco-era5/ar/1959-2022-6h-64x32_equiangular_conservative.zarr,level,vertical,monotone,13
+ERA5,gcp-public-data-arco-era5/ar/1959-2022-6h-240x121_equiangular_with_poles_conservative.zarr,time,time,exact,92040
+ERA5,gcp-public-data-arco-era5/ar/1959-2022-6h-240x121_equiangular_with_poles_conservative.zarr,longitude,lon,rounding,240
+ERA5,gcp-public-data-arco-era5/ar/1959-2022-6h-240x121_equiangular_with_poles_conservative.zarr,latitude,lat,rounding,121
+ERA5,gcp-public-data-arco-era5/ar/1959-2022-6h-240x121_equiangular_with_poles_conservative.zarr,level,vertical,monotone,13
+CMIP6 Amon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-CM4/historical/r1i1p1f1/Amon/ta/gr1/v20180701/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-CM4/historical/r1i1p1f1/Amon/ta/gr1/v20180701/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-CM4/historical/r1i1p1f1/Amon/ta/gr1/v20180701/,lat,lat,rounding,180
+CMIP6 Amon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-CM4/historical/r1i1p1f1/Amon/ta/gr1/v20180701/,lon,lon,rounding,288
+CMIP6 Amon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-CM4/historical/r1i1p1f1/Amon/ta/gr1/v20180701/,bnds,grid index,trivial,2
+CMIP6 Omon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-CM4/historical/r1i1p1f1/Omon/thetao/gn/v20180701/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-CM4/historical/r1i1p1f1/Omon/thetao/gn/v20180701/,lev,vertical,monotone,35
+CMIP6 Omon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-CM4/historical/r1i1p1f1/Omon/thetao/gn/v20180701/,y,lat,monotone,1080
+CMIP6 Omon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-CM4/historical/r1i1p1f1/Omon/thetao/gn/v20180701/,x,lon,monotone,1440
+CMIP6 Omon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-CM4/historical/r1i1p1f1/Omon/thetao/gn/v20180701/,bnds,grid index,trivial,2
+CMIP6 Omon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-CM4/historical/r1i1p1f1/Omon/thetao/gn/v20180701/,lat,2-D,curvilinear,1555200
+CMIP6 Amon,cmip6/CMIP6/CMIP/BCC/BCC-CSM2-MR/historical/r1i1p1f1/Amon/ta/gn/v20181126/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/BCC/BCC-CSM2-MR/historical/r1i1p1f1/Amon/ta/gn/v20181126/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/BCC/BCC-CSM2-MR/historical/r1i1p1f1/Amon/ta/gn/v20181126/,lat,lat,monotone,160
+CMIP6 Amon,cmip6/CMIP6/CMIP/BCC/BCC-CSM2-MR/historical/r1i1p1f1/Amon/ta/gn/v20181126/,lon,lon,exact,320
+CMIP6 Omon,cmip6/CMIP6/CMIP/BCC/BCC-CSM2-MR/historical/r1i1p1f1/Omon/thetao/gn/v20181126/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/BCC/BCC-CSM2-MR/historical/r1i1p1f1/Omon/thetao/gn/v20181126/,lev,vertical,monotone,40
+CMIP6 Omon,cmip6/CMIP6/CMIP/BCC/BCC-CSM2-MR/historical/r1i1p1f1/Omon/thetao/gn/v20181126/,lat,lat,monotone,232
+CMIP6 Omon,cmip6/CMIP6/CMIP/BCC/BCC-CSM2-MR/historical/r1i1p1f1/Omon/thetao/gn/v20181126/,lon,lon,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/BCC/BCC-CSM2-MR/historical/r1i1p1f1/Omon/thetao/gn/v20181126/,latitude,2-D,curvilinear,83520
+CMIP6 Amon,cmip6/CMIP6/CMIP/BCC/BCC-ESM1/historical/r2i1p1f1/Amon/ta/gn/v20181217/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/BCC/BCC-ESM1/historical/r2i1p1f1/Amon/ta/gn/v20181217/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/BCC/BCC-ESM1/historical/r2i1p1f1/Amon/ta/gn/v20181217/,lat,lat,monotone,64
+CMIP6 Amon,cmip6/CMIP6/CMIP/BCC/BCC-ESM1/historical/r2i1p1f1/Amon/ta/gn/v20181217/,lon,lon,exact,128
+CMIP6 Omon,cmip6/CMIP6/CMIP/BCC/BCC-ESM1/historical/r3i1p1f1/Omon/thetao/gn/v20181218/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/BCC/BCC-ESM1/historical/r3i1p1f1/Omon/thetao/gn/v20181218/,lev,vertical,monotone,40
+CMIP6 Omon,cmip6/CMIP6/CMIP/BCC/BCC-ESM1/historical/r3i1p1f1/Omon/thetao/gn/v20181218/,lat,lat,monotone,232
+CMIP6 Omon,cmip6/CMIP6/CMIP/BCC/BCC-ESM1/historical/r3i1p1f1/Omon/thetao/gn/v20181218/,lon,lon,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/BCC/BCC-ESM1/historical/r3i1p1f1/Omon/thetao/gn/v20181218/,latitude,2-D,curvilinear,83520
+CMIP6 Amon,cmip6/CMIP6/CMIP/AWI/AWI-CM-1-1-MR/historical/r4i1p1f1/Amon/ta/gn/v20181218/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/AWI/AWI-CM-1-1-MR/historical/r4i1p1f1/Amon/ta/gn/v20181218/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/AWI/AWI-CM-1-1-MR/historical/r4i1p1f1/Amon/ta/gn/v20181218/,lat,lat,monotone,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/AWI/AWI-CM-1-1-MR/historical/r4i1p1f1/Amon/ta/gn/v20181218/,lon,lon,exact,384
+CMIP6 Omon,cmip6/CMIP6/CMIP/AWI/AWI-CM-1-1-MR/historical/r1i1p1f1/Omon/thetao/gn/v20181218/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/AWI/AWI-CM-1-1-MR/historical/r1i1p1f1/Omon/thetao/gn/v20181218/,depth,vertical,monotone,46
+CMIP6 Omon,cmip6/CMIP6/CMIP/AWI/AWI-CM-1-1-MR/historical/r1i1p1f1/Omon/thetao/gn/v20181218/,lat,2-D,unstructured,830305
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM/historical/r1i1p1f1/Amon/ta/gn/v20190227/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM/historical/r1i1p1f1/Amon/ta/gn/v20190227/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM/historical/r1i1p1f1/Amon/ta/gn/v20190227/,lat,lat,linspace,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM/historical/r1i1p1f1/Amon/ta/gn/v20190227/,lon,lon,exact,288
+CMIP6 Amon,cmip6/CMIP6/CMIP/SNU/SAM0-UNICON/historical/r1i1p1f1/Amon/ta/gn/v20190323/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/SNU/SAM0-UNICON/historical/r1i1p1f1/Amon/ta/gn/v20190323/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/SNU/SAM0-UNICON/historical/r1i1p1f1/Amon/ta/gn/v20190323/,lat,lat,linspace,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/SNU/SAM0-UNICON/historical/r1i1p1f1/Amon/ta/gn/v20190323/,lon,lon,exact,288
+CMIP6 Omon,cmip6/CMIP6/CMIP/SNU/SAM0-UNICON/historical/r1i1p1f1/Omon/thetao/gn/v20190323/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/SNU/SAM0-UNICON/historical/r1i1p1f1/Omon/thetao/gn/v20190323/,lev,vertical,monotone,60
+CMIP6 Omon,cmip6/CMIP6/CMIP/SNU/SAM0-UNICON/historical/r1i1p1f1/Omon/thetao/gn/v20190323/,j,grid index,exact,384
+CMIP6 Omon,cmip6/CMIP6/CMIP/SNU/SAM0-UNICON/historical/r1i1p1f1/Omon/thetao/gn/v20190323/,i,grid index,exact,320
+CMIP6 Omon,cmip6/CMIP6/CMIP/SNU/SAM0-UNICON/historical/r1i1p1f1/Omon/thetao/gn/v20190323/,latitude,2-D,curvilinear,122880
+CMIP6 Amon,cmip6/CMIP6/CMIP/CCCma/CanESM5-CanOE/historical/r2i1p2f1/Amon/ta/gn/v20190429/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/CCCma/CanESM5-CanOE/historical/r2i1p2f1/Amon/ta/gn/v20190429/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CCCma/CanESM5-CanOE/historical/r2i1p2f1/Amon/ta/gn/v20190429/,lat,lat,monotone,64
+CMIP6 Amon,cmip6/CMIP6/CMIP/CCCma/CanESM5-CanOE/historical/r2i1p2f1/Amon/ta/gn/v20190429/,lon,lon,exact,128
+CMIP6 Omon,cmip6/CMIP6/CMIP/CCCma/CanESM5-CanOE/historical/r2i1p2f1/Omon/thetao/gn/v20190429/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/CCCma/CanESM5-CanOE/historical/r2i1p2f1/Omon/thetao/gn/v20190429/,lev,vertical,monotone,45
+CMIP6 Omon,cmip6/CMIP6/CMIP/CCCma/CanESM5-CanOE/historical/r2i1p2f1/Omon/thetao/gn/v20190429/,j,grid index,exact,291
+CMIP6 Omon,cmip6/CMIP6/CMIP/CCCma/CanESM5-CanOE/historical/r2i1p2f1/Omon/thetao/gn/v20190429/,i,grid index,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/CCCma/CanESM5-CanOE/historical/r2i1p2f1/Omon/thetao/gn/v20190429/,latitude,2-D,curvilinear,104760
+CMIP6 Omon,cmip6/CMIP6/CMIP/CCCma/CanESM5/historical/r6i1p2f1/Omon/thetao/gn/v20190429/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/CCCma/CanESM5/historical/r6i1p2f1/Omon/thetao/gn/v20190429/,lev,vertical,monotone,45
+CMIP6 Omon,cmip6/CMIP6/CMIP/CCCma/CanESM5/historical/r6i1p2f1/Omon/thetao/gn/v20190429/,j,grid index,exact,291
+CMIP6 Omon,cmip6/CMIP6/CMIP/CCCma/CanESM5/historical/r6i1p2f1/Omon/thetao/gn/v20190429/,i,grid index,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/CCCma/CanESM5/historical/r6i1p2f1/Omon/thetao/gn/v20190429/,latitude,2-D,curvilinear,104760
+CMIP6 Amon,cmip6/CMIP6/CMIP/CCCma/CanESM5/historical/r6i1p2f1/Amon/ta/gn/v20190429/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/CCCma/CanESM5/historical/r6i1p2f1/Amon/ta/gn/v20190429/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CCCma/CanESM5/historical/r6i1p2f1/Amon/ta/gn/v20190429/,lat,lat,monotone,64
+CMIP6 Amon,cmip6/CMIP6/CMIP/CCCma/CanESM5/historical/r6i1p2f1/Amon/ta/gn/v20190429/,lon,lon,exact,128
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2/historical/r11i1p1f1/Amon/ta/gn/v20190514/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2/historical/r11i1p1f1/Amon/ta/gn/v20190514/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2/historical/r11i1p1f1/Amon/ta/gn/v20190514/,lat,lat,linspace,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2/historical/r11i1p1f1/Amon/ta/gn/v20190514/,lon,lon,exact,288
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2/historical/r11i1p1f1/Omon/thetao/gn/v20190514/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2/historical/r11i1p1f1/Omon/thetao/gn/v20190514/,lev,vertical,monotone,60
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2/historical/r11i1p1f1/Omon/thetao/gn/v20190514/,nlat,grid index,exact,384
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2/historical/r11i1p1f1/Omon/thetao/gn/v20190514/,nlon,grid index,exact,320
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2/historical/r11i1p1f1/Omon/thetao/gn/v20190514/,lat,2-D,curvilinear,122880
+CMIP6 Omon,cmip6/CMIP6/CMIP/INM/INM-CM4-8/historical/r1i1p1f1/Omon/thetao/gr1/v20190530/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/INM/INM-CM4-8/historical/r1i1p1f1/Omon/thetao/gr1/v20190530/,lev,vertical,monotone,33
+CMIP6 Omon,cmip6/CMIP6/CMIP/INM/INM-CM4-8/historical/r1i1p1f1/Omon/thetao/gr1/v20190530/,lat,lat,exact,180
+CMIP6 Omon,cmip6/CMIP6/CMIP/INM/INM-CM4-8/historical/r1i1p1f1/Omon/thetao/gr1/v20190530/,lon,lon,exact,360
+CMIP6 Amon,cmip6/CMIP6/CMIP/INM/INM-CM4-8/historical/r1i1p1f1/Amon/ta/gr1/v20190605/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/INM/INM-CM4-8/historical/r1i1p1f1/Amon/ta/gr1/v20190605/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/INM/INM-CM4-8/historical/r1i1p1f1/Amon/ta/gr1/v20190605/,lat,lat,exact,120
+CMIP6 Amon,cmip6/CMIP6/CMIP/INM/INM-CM4-8/historical/r1i1p1f1/Amon/ta/gr1/v20190605/,lon,lon,exact,180
+CMIP6 Amon,cmip6/CMIP6/CMIP/NUIST/NESM3/historical/r1i1p1f1/Amon/ta/gn/v20190630/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/NUIST/NESM3/historical/r1i1p1f1/Amon/ta/gn/v20190630/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NUIST/NESM3/historical/r1i1p1f1/Amon/ta/gn/v20190630/,lat,lat,monotone,96
+CMIP6 Amon,cmip6/CMIP6/CMIP/NUIST/NESM3/historical/r1i1p1f1/Amon/ta/gn/v20190630/,lon,lon,exact,192
+CMIP6 Omon,cmip6/CMIP6/CMIP/NUIST/NESM3/historical/r4i1p1f1/Omon/thetao/gn/v20190704/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/NUIST/NESM3/historical/r4i1p1f1/Omon/thetao/gn/v20190704/,lev,vertical,monotone,46
+CMIP6 Omon,cmip6/CMIP6/CMIP/NUIST/NESM3/historical/r4i1p1f1/Omon/thetao/gn/v20190704/,j,grid index,exact,292
+CMIP6 Omon,cmip6/CMIP6/CMIP/NUIST/NESM3/historical/r4i1p1f1/Omon/thetao/gn/v20190704/,i,grid index,exact,362
+CMIP6 Omon,cmip6/CMIP6/CMIP/NUIST/NESM3/historical/r4i1p1f1/Omon/thetao/gn/v20190704/,latitude,2-D,curvilinear,105704
+CMIP6 Omon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-LR/historical/r9i1p1f1/Omon/thetao/gn/v20190710/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-LR/historical/r9i1p1f1/Omon/thetao/gn/v20190710/,lev,vertical,monotone,40
+CMIP6 Omon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-LR/historical/r9i1p1f1/Omon/thetao/gn/v20190710/,j,grid index,exact,220
+CMIP6 Omon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-LR/historical/r9i1p1f1/Omon/thetao/gn/v20190710/,i,grid index,exact,256
+CMIP6 Omon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-LR/historical/r9i1p1f1/Omon/thetao/gn/v20190710/,latitude,2-D,curvilinear,56320
+CMIP6 Amon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-LR/historical/r9i1p1f1/Amon/ta/gn/v20190710/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-LR/historical/r9i1p1f1/Amon/ta/gn/v20190710/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-LR/historical/r9i1p1f1/Amon/ta/gn/v20190710/,lat,lat,monotone,96
+CMIP6 Amon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-LR/historical/r9i1p1f1/Amon/ta/gn/v20190710/,lon,lon,exact,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-HR/historical/r7i1p1f1/Amon/ta/gn/v20190710/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-HR/historical/r7i1p1f1/Amon/ta/gn/v20190710/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-HR/historical/r7i1p1f1/Amon/ta/gn/v20190710/,lat,lat,monotone,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-HR/historical/r7i1p1f1/Amon/ta/gn/v20190710/,lon,lon,exact,384
+CMIP6 Omon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-HR/historical/r6i1p1f1/Omon/thetao/gn/v20190710/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-HR/historical/r6i1p1f1/Omon/thetao/gn/v20190710/,lev,vertical,monotone,40
+CMIP6 Omon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-HR/historical/r6i1p1f1/Omon/thetao/gn/v20190710/,j,grid index,exact,404
+CMIP6 Omon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-HR/historical/r6i1p1f1/Omon/thetao/gn/v20190710/,i,grid index,exact,802
+CMIP6 Omon,cmip6/CMIP6/CMIP/MPI-M/MPI-ESM1-2-HR/historical/r6i1p1f1/Omon/thetao/gn/v20190710/,latitude,2-D,curvilinear,324008
+CMIP6 Amon,cmip6/CMIP6/CMIP/INM/INM-CM5-0/historical/r10i1p1f1/Amon/ta/gr1/v20190712/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/INM/INM-CM5-0/historical/r10i1p1f1/Amon/ta/gr1/v20190712/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/INM/INM-CM5-0/historical/r10i1p1f1/Amon/ta/gr1/v20190712/,lat,lat,exact,120
+CMIP6 Amon,cmip6/CMIP6/CMIP/INM/INM-CM5-0/historical/r10i1p1f1/Amon/ta/gr1/v20190712/,lon,lon,exact,180
+CMIP6 Omon,cmip6/CMIP6/CMIP/INM/INM-CM5-0/historical/r10i1p1f1/Omon/thetao/gr1/v20190712/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/INM/INM-CM5-0/historical/r10i1p1f1/Omon/thetao/gr1/v20190712/,lev,vertical,monotone,33
+CMIP6 Omon,cmip6/CMIP6/CMIP/INM/INM-CM5-0/historical/r10i1p1f1/Omon/thetao/gr1/v20190712/,lat,lat,exact,180
+CMIP6 Omon,cmip6/CMIP6/CMIP/INM/INM-CM5-0/historical/r10i1p1f1/Omon/thetao/gr1/v20190712/,lon,lon,exact,360
+CMIP6 Amon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-ESM4/historical/r1i1p1f1/Amon/ta/gr1/v20190726/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-ESM4/historical/r1i1p1f1/Amon/ta/gr1/v20190726/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-ESM4/historical/r1i1p1f1/Amon/ta/gr1/v20190726/,lat,lat,rounding,180
+CMIP6 Amon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-ESM4/historical/r1i1p1f1/Amon/ta/gr1/v20190726/,lon,lon,rounding,288
+CMIP6 Amon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-ESM4/historical/r1i1p1f1/Amon/ta/gr1/v20190726/,bnds,grid index,trivial,2
+CMIP6 Omon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-ESM4/historical/r1i1p1f1/Omon/thetao/gr/v20190726/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-ESM4/historical/r1i1p1f1/Omon/thetao/gr/v20190726/,lev,vertical,monotone,35
+CMIP6 Omon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-ESM4/historical/r1i1p1f1/Omon/thetao/gr/v20190726/,lat,lat,rounding,180
+CMIP6 Omon,cmip6/CMIP6/CMIP/NOAA-GFDL/GFDL-ESM4/historical/r1i1p1f1/Omon/thetao/gr/v20190726/,lon,lon,rounding,360
+CMIP6 Amon,cmip6/CMIP6/CMIP/UA/MCM-UA-1-0/historical/r1i1p1f2/Amon/ta/gn/v20190731/,latitude,lat,monotone,80
+CMIP6 Amon,cmip6/CMIP6/CMIP/UA/MCM-UA-1-0/historical/r1i1p1f2/Amon/ta/gn/v20190731/,longitude,lon,exact,96
+CMIP6 Amon,cmip6/CMIP6/CMIP/UA/MCM-UA-1-0/historical/r1i1p1f2/Amon/ta/gn/v20190731/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/UA/MCM-UA-1-0/historical/r1i1p1f2/Amon/ta/gn/v20190731/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/UA/MCM-UA-1-0/historical/r1i1p1f2/Amon/ta/gn/v20190731/,bnds,grid index,trivial,2
+CMIP6 Omon,cmip6/CMIP6/CMIP/UA/MCM-UA-1-0/historical/r1i1p1f2/Omon/thetao/gn/v20190731/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/UA/MCM-UA-1-0/historical/r1i1p1f2/Omon/thetao/gn/v20190731/,lev,vertical,monotone,18
+CMIP6 Omon,cmip6/CMIP6/CMIP/UA/MCM-UA-1-0/historical/r1i1p1f2/Omon/thetao/gn/v20190731/,latitude,lat,monotone,80
+CMIP6 Omon,cmip6/CMIP6/CMIP/UA/MCM-UA-1-0/historical/r1i1p1f2/Omon/thetao/gn/v20190731/,longitude,lon,exact,192
+CMIP6 Omon,cmip6/CMIP6/CMIP/UA/MCM-UA-1-0/historical/r1i1p1f2/Omon/thetao/gn/v20190731/,bnds,grid index,trivial,2
+CMIP6 Omon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM6A-LR/historical/r32i1p1f1/Omon/thetao/gn/v20190802/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM6A-LR/historical/r32i1p1f1/Omon/thetao/gn/v20190802/,olevel,vertical,monotone,75
+CMIP6 Omon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM6A-LR/historical/r32i1p1f1/Omon/thetao/gn/v20190802/,nav_lat,2-D,curvilinear,120184
+CMIP6 Amon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM6A-LR/historical/r32i1p1f1/Amon/ta/gr/v20190802/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM6A-LR/historical/r32i1p1f1/Amon/ta/gr/v20190802/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM6A-LR/historical/r32i1p1f1/Amon/ta/gr/v20190802/,lat,lat,linspace,143
+CMIP6 Amon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM6A-LR/historical/r32i1p1f1/Amon/ta/gr/v20190802/,lon,lon,exact,144
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM/historical/r2i1p1f1/Omon/thetao/gr/v20190808/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM/historical/r2i1p1f1/Omon/thetao/gr/v20190808/,lev,vertical,monotone,33
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM/historical/r2i1p1f1/Omon/thetao/gr/v20190808/,lat,lat,exact,180
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM/historical/r2i1p1f1/Omon/thetao/gr/v20190808/,lon,lon,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM/historical/r2i1p1f1/Omon/thetao/gr/v20190808/,lat_bnds,2-D,curvilinear,360
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G-CC/historical/r1i1p1f1/Amon/ta/gn/v20190815/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G-CC/historical/r1i1p1f1/Amon/ta/gn/v20190815/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G-CC/historical/r1i1p1f1/Amon/ta/gn/v20190815/,lat,lat,exact,90
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G-CC/historical/r1i1p1f1/Amon/ta/gn/v20190815/,lon,lon,exact,144
+CMIP6 Omon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G-CC/historical/r1i1p1f1/Omon/thetao/gn/v20190815/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G-CC/historical/r1i1p1f1/Omon/thetao/gn/v20190815/,lev,vertical,monotone,40
+CMIP6 Omon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G-CC/historical/r1i1p1f1/Omon/thetao/gn/v20190815/,lat,lat,exact,180
+CMIP6 Omon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G-CC/historical/r1i1p1f1/Omon/thetao/gn/v20190815/,lon,lon,exact,288
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G/historical/r9i1p5f1/Amon/ta/gn/v20190905/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G/historical/r9i1p5f1/Amon/ta/gn/v20190905/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G/historical/r9i1p5f1/Amon/ta/gn/v20190905/,lat,lat,exact,90
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G/historical/r9i1p5f1/Amon/ta/gn/v20190905/,lon,lon,exact,144
+CMIP6 Omon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G/historical/r10i1p5f1/Omon/thetao/gn/v20190905/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G/historical/r10i1p5f1/Omon/thetao/gn/v20190905/,lev,vertical,monotone,40
+CMIP6 Omon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G/historical/r10i1p5f1/Omon/thetao/gn/v20190905/,lat,lat,exact,180
+CMIP6 Omon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-G/historical/r10i1p5f1/Omon/thetao/gn/v20190905/,lon,lon,exact,288
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCC/NorESM2-LM/historical/r2i1p1f1/Amon/ta/gn/v20190920/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCC/NorESM2-LM/historical/r2i1p1f1/Amon/ta/gn/v20190920/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCC/NorESM2-LM/historical/r2i1p1f1/Amon/ta/gn/v20190920/,lat,lat,linspace,96
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCC/NorESM2-LM/historical/r2i1p1f1/Amon/ta/gn/v20190920/,lon,lon,exact,144
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorESM2-LM/historical/r2i1p1f1/Omon/thetao/gr/v20190920/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorESM2-LM/historical/r2i1p1f1/Omon/thetao/gr/v20190920/,lev,vertical,monotone,70
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorESM2-LM/historical/r2i1p1f1/Omon/thetao/gr/v20190920/,j,grid index,exact,385
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorESM2-LM/historical/r2i1p1f1/Omon/thetao/gr/v20190920/,i,grid index,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorESM2-LM/historical/r2i1p1f1/Omon/thetao/gr/v20190920/,latitude,2-D,curvilinear,138600
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAS/FGOALS-f3-L/historical/r2i1p1f1/Amon/ta/gr/v20190927/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAS/FGOALS-f3-L/historical/r2i1p1f1/Amon/ta/gr/v20190927/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAS/FGOALS-f3-L/historical/r2i1p1f1/Amon/ta/gr/v20190927/,lat,lat,rounding,180
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAS/FGOALS-f3-L/historical/r2i1p1f1/Amon/ta/gr/v20190927/,lon,lon,rounding,288
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAS/FGOALS-f3-L/historical/r3i1p1f1/Omon/thetao/gn/v20191008/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAS/FGOALS-f3-L/historical/r3i1p1f1/Omon/thetao/gn/v20191008/,lev,vertical,monotone,30
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAS/FGOALS-f3-L/historical/r3i1p1f1/Omon/thetao/gn/v20191008/,j,grid index,exact,218
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAS/FGOALS-f3-L/historical/r3i1p1f1/Omon/thetao/gn/v20191008/,i,grid index,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAS/FGOALS-f3-L/historical/r3i1p1f1/Omon/thetao/gn/v20191008/,latitude,2-D,curvilinear,78480
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-H/historical/r3i1p3f1/Amon/ta/gn/v20191010/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-H/historical/r3i1p3f1/Amon/ta/gn/v20191010/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-H/historical/r3i1p3f1/Amon/ta/gn/v20191010/,lat,lat,exact,90
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-H/historical/r3i1p3f1/Amon/ta/gn/v20191010/,lon,lon,exact,144
+CMIP6 Omon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-H/historical/r3i1p3f1/Omon/thetao/gr/v20191010/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-H/historical/r3i1p3f1/Omon/thetao/gr/v20191010/,lev,vertical,monotone,33
+CMIP6 Omon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-H/historical/r3i1p3f1/Omon/thetao/gr/v20191010/,lat,lat,exact,180
+CMIP6 Omon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-1-H/historical/r3i1p3f1/Omon/thetao/gr/v20191010/,lon,lon,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAS/FGOALS-g3/historical/r2i1p1f1/Omon/thetao/gn/v20191013/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAS/FGOALS-g3/historical/r2i1p1f1/Omon/thetao/gn/v20191013/,lev,vertical,monotone,30
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAS/FGOALS-g3/historical/r2i1p1f1/Omon/thetao/gn/v20191013/,j,grid index,exact,218
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAS/FGOALS-g3/historical/r2i1p1f1/Omon/thetao/gn/v20191013/,i,grid index,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAS/FGOALS-g3/historical/r2i1p1f1/Omon/thetao/gn/v20191013/,latitude,2-D,curvilinear,78480
+CMIP6 Omon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1-HR/historical/r1i1p1f2/Omon/thetao/gn/v20191021/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1-HR/historical/r1i1p1f2/Omon/thetao/gn/v20191021/,lev,vertical,monotone,75
+CMIP6 Omon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1-HR/historical/r1i1p1f2/Omon/thetao/gn/v20191021/,lat,2-D,curvilinear,1514100
+CMIP6 Amon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1-HR/historical/r1i1p1f2/Amon/ta/gr/v20191021/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1-HR/historical/r1i1p1f2/Amon/ta/gr/v20191021/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1-HR/historical/r1i1p1f2/Amon/ta/gr/v20191021/,lat,lat,monotone,360
+CMIP6 Amon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1-HR/historical/r1i1p1f2/Amon/ta/gr/v20191021/,lon,lon,exact,720
+CMIP6 Amon,cmip6/CMIP6/CMIP/NIMS-KMA/KACE-1-0-G/historical/r1i1p1f1/Amon/ta/gr/v20191028/,time,time,exact,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/NIMS-KMA/KACE-1-0-G/historical/r1i1p1f1/Amon/ta/gr/v20191028/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NIMS-KMA/KACE-1-0-G/historical/r1i1p1f1/Amon/ta/gr/v20191028/,lat,lat,exact,144
+CMIP6 Amon,cmip6/CMIP6/CMIP/NIMS-KMA/KACE-1-0-G/historical/r1i1p1f1/Amon/ta/gr/v20191028/,lon,lon,exact,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAMS/CAMS-CSM1-0/historical/r1i1p1f2/Amon/ta/gn/v20191106/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAMS/CAMS-CSM1-0/historical/r1i1p1f2/Amon/ta/gn/v20191106/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAMS/CAMS-CSM1-0/historical/r1i1p1f2/Amon/ta/gn/v20191106/,lat,lat,monotone,160
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAMS/CAMS-CSM1-0/historical/r1i1p1f2/Amon/ta/gn/v20191106/,lon,lon,exact,320
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAMS/CAMS-CSM1-0/historical/r1i1p1f2/Omon/thetao/gn/v20191106/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAMS/CAMS-CSM1-0/historical/r1i1p1f2/Omon/thetao/gn/v20191106/,lev,vertical,monotone,50
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAMS/CAMS-CSM1-0/historical/r1i1p1f2/Omon/thetao/gn/v20191106/,j,grid index,exact,200
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAMS/CAMS-CSM1-0/historical/r1i1p1f2/Omon/thetao/gn/v20191106/,i,grid index,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAMS/CAMS-CSM1-0/historical/r1i1p1f2/Omon/thetao/gn/v20191106/,latitude,2-D,curvilinear,72000
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-2-H/historical/r5i1p1f1/Amon/ta/gn/v20191120/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-2-H/historical/r5i1p1f1/Amon/ta/gn/v20191120/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-2-H/historical/r5i1p1f1/Amon/ta/gn/v20191120/,lat,lat,exact,90
+CMIP6 Amon,cmip6/CMIP6/CMIP/NASA-GISS/GISS-E2-2-H/historical/r5i1p1f1/Amon/ta/gn/v20191120/,lon,lon,exact,144
+CMIP6 Omon,cmip6/CMIP6/CMIP/FIO-QLNM/FIO-ESM-2-0/historical/r1i1p1f1/Omon/thetao/gn/v20191125/,time,time,monthly,900
+CMIP6 Omon,cmip6/CMIP6/CMIP/FIO-QLNM/FIO-ESM-2-0/historical/r1i1p1f1/Omon/thetao/gn/v20191125/,lev,vertical,monotone,60
+CMIP6 Omon,cmip6/CMIP6/CMIP/FIO-QLNM/FIO-ESM-2-0/historical/r1i1p1f1/Omon/thetao/gn/v20191125/,j,grid index,exact,384
+CMIP6 Omon,cmip6/CMIP6/CMIP/FIO-QLNM/FIO-ESM-2-0/historical/r1i1p1f1/Omon/thetao/gn/v20191125/,i,grid index,exact,320
+CMIP6 Omon,cmip6/CMIP6/CMIP/FIO-QLNM/FIO-ESM-2-0/historical/r1i1p1f1/Omon/thetao/gn/v20191125/,latitude,2-D,curvilinear,122880
+CMIP6 Omon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1/historical/r1i1p1f1/Omon/thetao/gr/v20191204/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1/historical/r1i1p1f1/Omon/thetao/gr/v20191204/,lev,vertical,monotone,60
+CMIP6 Omon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1/historical/r1i1p1f1/Omon/thetao/gr/v20191204/,lat,lat,exact,180
+CMIP6 Omon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1/historical/r1i1p1f1/Omon/thetao/gr/v20191204/,lon,lon,exact,360
+CMIP6 Amon,cmip6/CMIP6/CMIP/FIO-QLNM/FIO-ESM-2-0/historical/r1i1p1f1/Amon/ta/gn/v20191204/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/FIO-QLNM/FIO-ESM-2-0/historical/r1i1p1f1/Amon/ta/gn/v20191204/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/FIO-QLNM/FIO-ESM-2-0/historical/r1i1p1f1/Amon/ta/gn/v20191204/,lat,lat,linspace,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/FIO-QLNM/FIO-ESM-2-0/historical/r1i1p1f1/Amon/ta/gn/v20191204/,lon,lon,exact,288
+CMIP6 Omon,cmip6/CMIP6/CMIP/HAMMOZ-Consortium/MPI-ESM-1-2-HAM/historical/r3i1p1f1/Omon/thetao/gn/v20191218/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/HAMMOZ-Consortium/MPI-ESM-1-2-HAM/historical/r3i1p1f1/Omon/thetao/gn/v20191218/,lev,vertical,monotone,40
+CMIP6 Omon,cmip6/CMIP6/CMIP/HAMMOZ-Consortium/MPI-ESM-1-2-HAM/historical/r3i1p1f1/Omon/thetao/gn/v20191218/,j,grid index,exact,220
+CMIP6 Omon,cmip6/CMIP6/CMIP/HAMMOZ-Consortium/MPI-ESM-1-2-HAM/historical/r3i1p1f1/Omon/thetao/gn/v20191218/,i,grid index,exact,256
+CMIP6 Omon,cmip6/CMIP6/CMIP/HAMMOZ-Consortium/MPI-ESM-1-2-HAM/historical/r3i1p1f1/Omon/thetao/gn/v20191218/,latitude,2-D,curvilinear,56320
+CMIP6 Amon,cmip6/CMIP6/CMIP/HAMMOZ-Consortium/MPI-ESM-1-2-HAM/historical/r3i1p1f1/Amon/ta/gn/v20191218/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/HAMMOZ-Consortium/MPI-ESM-1-2-HAM/historical/r3i1p1f1/Amon/ta/gn/v20191218/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/HAMMOZ-Consortium/MPI-ESM-1-2-HAM/historical/r3i1p1f1/Amon/ta/gn/v20191218/,lat,lat,monotone,96
+CMIP6 Amon,cmip6/CMIP6/CMIP/HAMMOZ-Consortium/MPI-ESM-1-2-HAM/historical/r3i1p1f1/Amon/ta/gn/v20191218/,lon,lon,exact,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/CCCR-IITM/IITM-ESM/historical/r1i1p1f1/Amon/ta/gn/v20191226/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/CCCR-IITM/IITM-ESM/historical/r1i1p1f1/Amon/ta/gn/v20191226/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CCCR-IITM/IITM-ESM/historical/r1i1p1f1/Amon/ta/gn/v20191226/,lat,lat,monotone,94
+CMIP6 Amon,cmip6/CMIP6/CMIP/CCCR-IITM/IITM-ESM/historical/r1i1p1f1/Amon/ta/gn/v20191226/,lon,lon,exact,192
+CMIP6 Omon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-ESM2-1/historical/r6i1p1f2/Omon/thetao/gn/v20200117/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-ESM2-1/historical/r6i1p1f2/Omon/thetao/gn/v20200117/,lev,vertical,monotone,75
+CMIP6 Omon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-ESM2-1/historical/r6i1p1f2/Omon/thetao/gn/v20200117/,lat,2-D,curvilinear,106428
+CMIP6 Omon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1-ECA/historical/r1i1p1f1/Omon/thetao/gr/v20200127/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1-ECA/historical/r1i1p1f1/Omon/thetao/gr/v20200127/,lev,vertical,monotone,60
+CMIP6 Omon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1-ECA/historical/r1i1p1f1/Omon/thetao/gr/v20200127/,lat,lat,exact,180
+CMIP6 Omon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1-ECA/historical/r1i1p1f1/Omon/thetao/gr/v20200127/,lon,lon,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/AWI/AWI-ESM-1-1-LR/historical/r1i1p1f1/Omon/thetao/gn/v20200212/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/AWI/AWI-ESM-1-1-LR/historical/r1i1p1f1/Omon/thetao/gn/v20200212/,depth,vertical,monotone,46
+CMIP6 Omon,cmip6/CMIP6/CMIP/AWI/AWI-ESM-1-1-LR/historical/r1i1p1f1/Omon/thetao/gn/v20200212/,lat,2-D,unstructured,126859
+CMIP6 Amon,cmip6/CMIP6/CMIP/AWI/AWI-ESM-1-1-LR/historical/r1i1p1f1/Amon/ta/gn/v20200212/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/AWI/AWI-ESM-1-1-LR/historical/r1i1p1f1/Amon/ta/gn/v20200212/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/AWI/AWI-ESM-1-1-LR/historical/r1i1p1f1/Amon/ta/gn/v20200212/,lat,lat,monotone,96
+CMIP6 Amon,cmip6/CMIP6/CMIP/AWI/AWI-ESM-1-1-LR/historical/r1i1p1f1/Amon/ta/gn/v20200212/,lon,lon,exact,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg-LR/historical/r3i1p1f1/Amon/ta/gr/v20200217/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg-LR/historical/r3i1p1f1/Amon/ta/gr/v20200217/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg-LR/historical/r3i1p1f1/Amon/ta/gr/v20200217/,lat,lat,monotone,160
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg-LR/historical/r3i1p1f1/Amon/ta/gr/v20200217/,lon,lon,exact,320
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM-FV2/historical/r2i1p1f1/Omon/thetao/gr/v20200226/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM-FV2/historical/r2i1p1f1/Omon/thetao/gr/v20200226/,lev,vertical,monotone,33
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM-FV2/historical/r2i1p1f1/Omon/thetao/gr/v20200226/,lat,lat,exact,180
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM-FV2/historical/r2i1p1f1/Omon/thetao/gr/v20200226/,lon,lon,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM-FV2/historical/r2i1p1f1/Omon/thetao/gr/v20200226/,lat_bnds,2-D,curvilinear,360
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM-FV2/historical/r2i1p1f1/Amon/ta/gn/v20200226/,time,time,monthly,1380
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM-FV2/historical/r2i1p1f1/Amon/ta/gn/v20200226/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM-FV2/historical/r2i1p1f1/Amon/ta/gn/v20200226/,lat,lat,linspace,96
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2-WACCM-FV2/historical/r2i1p1f1/Amon/ta/gn/v20200226/,lon,lon,exact,144
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-FV2/historical/r2i1p1f1/Omon/thetao/gn/v20200226/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-FV2/historical/r2i1p1f1/Omon/thetao/gn/v20200226/,lev,vertical,monotone,60
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-FV2/historical/r2i1p1f1/Omon/thetao/gn/v20200226/,nlat,grid index,exact,384
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-FV2/historical/r2i1p1f1/Omon/thetao/gn/v20200226/,nlon,grid index,exact,320
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCAR/CESM2-FV2/historical/r2i1p1f1/Omon/thetao/gn/v20200226/,lat,2-D,curvilinear,122880
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2-FV2/historical/r2i1p1f1/Amon/ta/gn/v20200226/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2-FV2/historical/r2i1p1f1/Amon/ta/gn/v20200226/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2-FV2/historical/r2i1p1f1/Amon/ta/gn/v20200226/,lat,lat,linspace,96
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCAR/CESM2-FV2/historical/r2i1p1f1/Amon/ta/gn/v20200226/,lon,lon,exact,144
+CMIP6 Omon,cmip6/CMIP6/CMIP/CSIRO-ARCCSS/ACCESS-CM2/historical/r3i1p1f1/Omon/thetao/gn/v20200306/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/CSIRO-ARCCSS/ACCESS-CM2/historical/r3i1p1f1/Omon/thetao/gn/v20200306/,lev,vertical,monotone,50
+CMIP6 Omon,cmip6/CMIP6/CMIP/CSIRO-ARCCSS/ACCESS-CM2/historical/r3i1p1f1/Omon/thetao/gn/v20200306/,j,grid index,exact,300
+CMIP6 Omon,cmip6/CMIP6/CMIP/CSIRO-ARCCSS/ACCESS-CM2/historical/r3i1p1f1/Omon/thetao/gn/v20200306/,i,grid index,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/CSIRO-ARCCSS/ACCESS-CM2/historical/r3i1p1f1/Omon/thetao/gn/v20200306/,latitude,2-D,curvilinear,108000
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAS/CAS-ESM2-0/historical/r1i1p1f1/Omon/thetao/gn/v20200306/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAS/CAS-ESM2-0/historical/r1i1p1f1/Omon/thetao/gn/v20200306/,lev,vertical,monotone,30
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAS/CAS-ESM2-0/historical/r1i1p1f1/Omon/thetao/gn/v20200306/,lat,lat,monotone,196
+CMIP6 Omon,cmip6/CMIP6/CMIP/CAS/CAS-ESM2-0/historical/r1i1p1f1/Omon/thetao/gn/v20200306/,lon,grid index,exact,360
+CMIP6 Amon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-ESM2-1/historical/r11i1p1f2/Amon/ta/gr/v20200408/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-ESM2-1/historical/r11i1p1f2/Amon/ta/gr/v20200408/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-ESM2-1/historical/r11i1p1f2/Amon/ta/gr/v20200408/,lat,lat,monotone,128
+CMIP6 Amon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-ESM2-1/historical/r11i1p1f2/Amon/ta/gr/v20200408/,lon,lon,exact,256
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAS/FGOALS-g3/historical/r6i1p1f1/Amon/ta/gn/v20200411/,time,time,monthly,2004
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAS/FGOALS-g3/historical/r6i1p1f1/Amon/ta/gn/v20200411/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAS/FGOALS-g3/historical/r6i1p1f1/Amon/ta/gn/v20200411/,lat,lat,monotone,80
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAS/FGOALS-g3/historical/r6i1p1f1/Amon/ta/gn/v20200411/,lon,lon,exact,180
+CMIP6 Amon,cmip6/CMIP6/CMIP/THU/CIESM/historical/r3i1p1f1/Amon/ta/gr/v20200417/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/THU/CIESM/historical/r3i1p1f1/Amon/ta/gr/v20200417/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/THU/CIESM/historical/r3i1p1f1/Amon/ta/gr/v20200417/,lat,lat,linspace,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/THU/CIESM/historical/r3i1p1f1/Amon/ta/gr/v20200417/,lon,lon,exact,288
+CMIP6 Omon,cmip6/CMIP6/CMIP/THU/CIESM/historical/r3i1p1f1/Omon/thetao/gn/v20200417/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/THU/CIESM/historical/r3i1p1f1/Omon/thetao/gn/v20200417/,lev,vertical,monotone,60
+CMIP6 Omon,cmip6/CMIP6/CMIP/THU/CIESM/historical/r3i1p1f1/Omon/thetao/gn/v20200417/,j,grid index,exact,384
+CMIP6 Omon,cmip6/CMIP6/CMIP/THU/CIESM/historical/r3i1p1f1/Omon/thetao/gn/v20200417/,i,grid index,exact,320
+CMIP6 Omon,cmip6/CMIP6/CMIP/THU/CIESM/historical/r3i1p1f1/Omon/thetao/gn/v20200417/,latitude,2-D,curvilinear,122880
+CMIP6 Omon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-0/historical/r5i1p1f1/Omon/thetao/gr/v20200429/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-0/historical/r5i1p1f1/Omon/thetao/gr/v20200429/,lev,vertical,monotone,60
+CMIP6 Omon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-0/historical/r5i1p1f1/Omon/thetao/gr/v20200429/,lat,lat,exact,180
+CMIP6 Omon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-0/historical/r5i1p1f1/Omon/thetao/gr/v20200429/,lon,lon,exact,360
+CMIP6 Amon,cmip6/CMIP6/CMIP/MIROC/MIROC6/historical/r20i1p1f1/Amon/ta/gn/v20200519/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/MIROC/MIROC6/historical/r20i1p1f1/Amon/ta/gn/v20200519/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/MIROC/MIROC6/historical/r20i1p1f1/Amon/ta/gn/v20200519/,lat,lat,monotone,128
+CMIP6 Amon,cmip6/CMIP6/CMIP/MIROC/MIROC6/historical/r20i1p1f1/Amon/ta/gn/v20200519/,lon,lon,exact,256
+CMIP6 Omon,cmip6/CMIP6/CMIP/MIROC/MIROC6/historical/r19i1p1f1/Omon/thetao/gn/v20200519/,y,lat,monotone,256
+CMIP6 Omon,cmip6/CMIP6/CMIP/MIROC/MIROC6/historical/r19i1p1f1/Omon/thetao/gn/v20200519/,x,lon,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/MIROC/MIROC6/historical/r19i1p1f1/Omon/thetao/gn/v20200519/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/MIROC/MIROC6/historical/r19i1p1f1/Omon/thetao/gn/v20200519/,lev,vertical,monotone,63
+CMIP6 Omon,cmip6/CMIP6/CMIP/MIROC/MIROC6/historical/r19i1p1f1/Omon/thetao/gn/v20200519/,latitude,2-D,curvilinear,92160
+CMIP6 Amon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1/historical/r29i1p1f2/Amon/ta/gr/v20200529/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1/historical/r29i1p1f2/Amon/ta/gr/v20200529/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1/historical/r29i1p1f2/Amon/ta/gr/v20200529/,lat,lat,monotone,128
+CMIP6 Amon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1/historical/r29i1p1f2/Amon/ta/gr/v20200529/,lon,lon,exact,256
+CMIP6 Omon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1/historical/r29i1p1f2/Omon/thetao/gn/v20200529/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1/historical/r29i1p1f2/Omon/thetao/gn/v20200529/,lev,vertical,monotone,75
+CMIP6 Omon,cmip6/CMIP6/CMIP/CNRM-CERFACS/CNRM-CM6-1/historical/r29i1p1f2/Omon/thetao/gn/v20200529/,lat,2-D,curvilinear,106428
+CMIP6 Omon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-MM/historical/r4i1p1f3/Omon/thetao/gn/v20200601/,time,time,exact,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-MM/historical/r4i1p1f3/Omon/thetao/gn/v20200601/,lev,vertical,monotone,75
+CMIP6 Omon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-MM/historical/r4i1p1f3/Omon/thetao/gn/v20200601/,j,grid index,exact,1205
+CMIP6 Omon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-MM/historical/r4i1p1f3/Omon/thetao/gn/v20200601/,i,grid index,exact,1440
+CMIP6 Omon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-MM/historical/r4i1p1f3/Omon/thetao/gn/v20200601/,latitude,2-D,curvilinear,1735200
+CMIP6 Amon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-MM/historical/r3i1p1f3/Amon/ta/gn/v20200601/,time,time,exact,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-MM/historical/r3i1p1f3/Amon/ta/gn/v20200601/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-MM/historical/r3i1p1f3/Amon/ta/gn/v20200601/,lat,lat,monotone,324
+CMIP6 Amon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-MM/historical/r3i1p1f3/Amon/ta/gn/v20200601/,lon,lon,monotone,432
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-SR5/historical/r1i1p1f1/Omon/thetao/gn/v20200616/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-SR5/historical/r1i1p1f1/Omon/thetao/gn/v20200616/,lev,vertical,monotone,50
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-SR5/historical/r1i1p1f1/Omon/thetao/gn/v20200616/,i,grid index,exact,292
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-SR5/historical/r1i1p1f1/Omon/thetao/gn/v20200616/,j,grid index,exact,362
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-SR5/historical/r1i1p1f1/Omon/thetao/gn/v20200616/,latitude,2-D,curvilinear,105704
+CMIP6 Amon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1-ECA/historical/r1i1p1f1/Amon/ta/gr/v20200624/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1-ECA/historical/r1i1p1f1/Amon/ta/gr/v20200624/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1-ECA/historical/r1i1p1f1/Amon/ta/gr/v20200624/,lat,lat,exact,180
+CMIP6 Amon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1-ECA/historical/r1i1p1f1/Amon/ta/gr/v20200624/,lon,lon,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/AS-RCEC/TaiESM1/historical/r1i1p1f1/Omon/thetao/gn/v20200630/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/AS-RCEC/TaiESM1/historical/r1i1p1f1/Omon/thetao/gn/v20200630/,lev,vertical,monotone,60
+CMIP6 Omon,cmip6/CMIP6/CMIP/AS-RCEC/TaiESM1/historical/r1i1p1f1/Omon/thetao/gn/v20200630/,j,grid index,exact,384
+CMIP6 Omon,cmip6/CMIP6/CMIP/AS-RCEC/TaiESM1/historical/r1i1p1f1/Omon/thetao/gn/v20200630/,i,grid index,exact,320
+CMIP6 Omon,cmip6/CMIP6/CMIP/AS-RCEC/TaiESM1/historical/r1i1p1f1/Omon/thetao/gn/v20200630/,latitude,2-D,curvilinear,122880
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorESM2-MM/historical/r3i1p1f1/Omon/thetao/gn/v20200702/,time,time,other,1997
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorESM2-MM/historical/r3i1p1f1/Omon/thetao/gn/v20200702/,rho,other,monotone,53
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorESM2-MM/historical/r3i1p1f1/Omon/thetao/gn/v20200702/,j,grid index,exact,385
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorESM2-MM/historical/r3i1p1f1/Omon/thetao/gn/v20200702/,i,grid index,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorESM2-MM/historical/r3i1p1f1/Omon/thetao/gn/v20200702/,latitude,2-D,curvilinear,138600
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCC/NorESM2-MM/historical/r3i1p1f1/Amon/ta/gn/v20200702/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCC/NorESM2-MM/historical/r3i1p1f1/Amon/ta/gn/v20200702/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCC/NorESM2-MM/historical/r3i1p1f1/Amon/ta/gn/v20200702/,lat,lat,linspace,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCC/NorESM2-MM/historical/r3i1p1f1/Amon/ta/gn/v20200702/,lon,lon,exact,288
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorCPM1/historical/r5i1p1f1/Omon/thetao/gr/v20200724/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorCPM1/historical/r5i1p1f1/Omon/thetao/gr/v20200724/,lev,vertical,monotone,35
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorCPM1/historical/r5i1p1f1/Omon/thetao/gr/v20200724/,j,grid index,exact,384
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorCPM1/historical/r5i1p1f1/Omon/thetao/gr/v20200724/,i,grid index,exact,320
+CMIP6 Omon,cmip6/CMIP6/CMIP/NCC/NorCPM1/historical/r5i1p1f1/Omon/thetao/gr/v20200724/,latitude,2-D,curvilinear,122880
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCC/NorCPM1/historical/r5i1p1f1/Amon/ta/gn/v20200724/,time,time,monthly,2160
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCC/NorCPM1/historical/r5i1p1f1/Amon/ta/gn/v20200724/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCC/NorCPM1/historical/r5i1p1f1/Amon/ta/gn/v20200724/,lat,lat,rounding,96
+CMIP6 Amon,cmip6/CMIP6/CMIP/NCC/NorCPM1/historical/r5i1p1f1/Amon/ta/gn/v20200724/,lon,lon,exact,144
+CMIP6 Omon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM5A2-INCA/historical/r1i1p1f1/Omon/thetao/gn/v20200729/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM5A2-INCA/historical/r1i1p1f1/Omon/thetao/gn/v20200729/,deptht,other,monotone,31
+CMIP6 Omon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM5A2-INCA/historical/r1i1p1f1/Omon/thetao/gn/v20200729/,nav_lat,2-D,curvilinear,27118
+CMIP6 Amon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM5A2-INCA/historical/r1i1p1f1/Amon/ta/gr/v20200729/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM5A2-INCA/historical/r1i1p1f1/Amon/ta/gr/v20200729/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM5A2-INCA/historical/r1i1p1f1/Amon/ta/gr/v20200729/,lat,lat,linspace,96
+CMIP6 Amon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM5A2-INCA/historical/r1i1p1f1/Amon/ta/gr/v20200729/,lon,lon,exact,96
+CMIP6 Omon,cmip6/CMIP6/CMIP/NIMS-KMA/UKESM1-0-LL/historical/r13i1p1f2/Omon/thetao/gn/v20200805/,time,time,exact,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/NIMS-KMA/UKESM1-0-LL/historical/r13i1p1f2/Omon/thetao/gn/v20200805/,lev,vertical,monotone,75
+CMIP6 Omon,cmip6/CMIP6/CMIP/NIMS-KMA/UKESM1-0-LL/historical/r13i1p1f2/Omon/thetao/gn/v20200805/,j,grid index,exact,332
+CMIP6 Omon,cmip6/CMIP6/CMIP/NIMS-KMA/UKESM1-0-LL/historical/r13i1p1f2/Omon/thetao/gn/v20200805/,i,grid index,exact,362
+CMIP6 Omon,cmip6/CMIP6/CMIP/NIMS-KMA/UKESM1-0-LL/historical/r13i1p1f2/Omon/thetao/gn/v20200805/,latitude,2-D,curvilinear,120184
+CMIP6 Amon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-HR4/historical/r1i1p1f1/Amon/ta/gn/v20200904/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-HR4/historical/r1i1p1f1/Amon/ta/gn/v20200904/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-HR4/historical/r1i1p1f1/Amon/ta/gn/v20200904/,lat,lat,linspace,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-HR4/historical/r1i1p1f1/Amon/ta/gn/v20200904/,lon,lon,exact,288
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-HR4/historical/r1i1p1f1/Omon/thetao/gn/v20200904/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-HR4/historical/r1i1p1f1/Omon/thetao/gn/v20200904/,lev,vertical,monotone,50
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-HR4/historical/r1i1p1f1/Omon/thetao/gn/v20200904/,i,grid index,exact,1051
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-HR4/historical/r1i1p1f1/Omon/thetao/gn/v20200904/,j,grid index,exact,1442
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-HR4/historical/r1i1p1f1/Omon/thetao/gn/v20200904/,latitude,2-D,curvilinear,1515542
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg-LR/historical/r2i1p1f1/Omon/thetao/gn/v20200919/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg-LR/historical/r2i1p1f1/Omon/thetao/gn/v20200919/,lev,vertical,monotone,75
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg-LR/historical/r2i1p1f1/Omon/thetao/gn/v20200919/,j,grid index,exact,292
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg-LR/historical/r2i1p1f1/Omon/thetao/gn/v20200919/,i,grid index,exact,362
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg-LR/historical/r2i1p1f1/Omon/thetao/gn/v20200919/,latitude,2-D,curvilinear,105704
+CMIP6 Omon,cmip6/CMIP6/CMIP/CSIRO/ACCESS-ESM1-5/historical/r22i1p1f1/Omon/thetao/gn/v20200922/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/CSIRO/ACCESS-ESM1-5/historical/r22i1p1f1/Omon/thetao/gn/v20200922/,lev,vertical,monotone,50
+CMIP6 Omon,cmip6/CMIP6/CMIP/CSIRO/ACCESS-ESM1-5/historical/r22i1p1f1/Omon/thetao/gn/v20200922/,j,grid index,exact,300
+CMIP6 Omon,cmip6/CMIP6/CMIP/CSIRO/ACCESS-ESM1-5/historical/r22i1p1f1/Omon/thetao/gn/v20200922/,i,grid index,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/CSIRO/ACCESS-ESM1-5/historical/r22i1p1f1/Omon/thetao/gn/v20200922/,latitude,2-D,curvilinear,108000
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg/historical/r14i1p1f1/Omon/thetao/gn/v20200925/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg/historical/r14i1p1f1/Omon/thetao/gn/v20200925/,lev,vertical,monotone,75
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg/historical/r14i1p1f1/Omon/thetao/gn/v20200925/,j,grid index,exact,292
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg/historical/r14i1p1f1/Omon/thetao/gn/v20200925/,i,grid index,exact,362
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg/historical/r14i1p1f1/Omon/thetao/gn/v20200925/,latitude,2-D,curvilinear,105704
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-AerChem/historical/r4i1p1f1/Omon/thetao/gn/v20201214/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-AerChem/historical/r4i1p1f1/Omon/thetao/gn/v20201214/,lev,vertical,monotone,75
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-AerChem/historical/r4i1p1f1/Omon/thetao/gn/v20201214/,j,grid index,exact,292
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-AerChem/historical/r4i1p1f1/Omon/thetao/gn/v20201214/,i,grid index,exact,362
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-AerChem/historical/r4i1p1f1/Omon/thetao/gn/v20201214/,latitude,2-D,curvilinear,105704
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-AerChem/historical/r4i1p1f1/Amon/ta/gr/v20201214/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-AerChem/historical/r4i1p1f1/Amon/ta/gr/v20201214/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-AerChem/historical/r4i1p1f1/Amon/ta/gr/v20201214/,lat,lat,monotone,256
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-AerChem/historical/r4i1p1f1/Amon/ta/gr/v20201214/,lon,lon,exact,512
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAS/CAS-ESM2-0/historical/r4i1p1f1/Amon/ta/gn/v20201228/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAS/CAS-ESM2-0/historical/r4i1p1f1/Amon/ta/gn/v20201228/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAS/CAS-ESM2-0/historical/r4i1p1f1/Amon/ta/gn/v20201228/,lat,lat,monotone,128
+CMIP6 Amon,cmip6/CMIP6/CMIP/CAS/CAS-ESM2-0/historical/r4i1p1f1/Amon/ta/gn/v20201228/,lon,lon,exact,256
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-CC/historical/r1i1p1f1/Amon/ta/gr/v20210113/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-CC/historical/r1i1p1f1/Amon/ta/gr/v20210113/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-CC/historical/r1i1p1f1/Amon/ta/gr/v20210113/,lat,lat,monotone,256
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-CC/historical/r1i1p1f1/Amon/ta/gr/v20210113/,lon,lon,exact,512
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-CC/historical/r1i1p1f1/Omon/thetao/gn/v20210113/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-CC/historical/r1i1p1f1/Omon/thetao/gn/v20210113/,lev,vertical,monotone,75
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-CC/historical/r1i1p1f1/Omon/thetao/gn/v20210113/,j,grid index,exact,292
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-CC/historical/r1i1p1f1/Omon/thetao/gn/v20210113/,i,grid index,exact,362
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-CC/historical/r1i1p1f1/Omon/thetao/gn/v20210113/,latitude,2-D,curvilinear,105704
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-ESM2/historical/r1i1p1f1/Omon/thetao/gn/v20210114/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-ESM2/historical/r1i1p1f1/Omon/thetao/gn/v20210114/,lev,vertical,monotone,50
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-ESM2/historical/r1i1p1f1/Omon/thetao/gn/v20210114/,i,grid index,exact,292
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-ESM2/historical/r1i1p1f1/Omon/thetao/gn/v20210114/,j,grid index,exact,362
+CMIP6 Omon,cmip6/CMIP6/CMIP/CMCC/CMCC-ESM2/historical/r1i1p1f1/Omon/thetao/gn/v20210114/,latitude,2-D,curvilinear,105704
+CMIP6 Amon,cmip6/CMIP6/CMIP/CMCC/CMCC-ESM2/historical/r1i1p1f1/Amon/ta/gn/v20210114/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/CMCC/CMCC-ESM2/historical/r1i1p1f1/Amon/ta/gn/v20210114/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CMCC/CMCC-ESM2/historical/r1i1p1f1/Amon/ta/gn/v20210114/,lat,lat,linspace,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/CMCC/CMCC-ESM2/historical/r1i1p1f1/Amon/ta/gn/v20210114/,lon,lon,exact,288
+CMIP6 Amon,cmip6/CMIP6/CMIP/MIROC/MIROC-ES2H/historical/r1i1p1f2/Amon/ta/gn/v20210125/,time,time,monthly,12
+CMIP6 Amon,cmip6/CMIP6/CMIP/MIROC/MIROC-ES2H/historical/r1i1p1f2/Amon/ta/gn/v20210125/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/MIROC/MIROC-ES2H/historical/r1i1p1f2/Amon/ta/gn/v20210125/,lat,lat,monotone,128
+CMIP6 Amon,cmip6/CMIP6/CMIP/MIROC/MIROC-ES2H/historical/r1i1p1f2/Amon/ta/gn/v20210125/,lon,lon,exact,256
+CMIP6 Amon,cmip6/CMIP6/CMIP/MPI-M/ICON-ESM-LR/historical/r4i1p1f1/Amon/ta/gn/v20210215/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/MPI-M/ICON-ESM-LR/historical/r4i1p1f1/Amon/ta/gn/v20210215/,plev,vertical,monotone,39
+CMIP6 Amon,cmip6/CMIP6/CMIP/MPI-M/ICON-ESM-LR/historical/r4i1p1f1/Amon/ta/gn/v20210215/,i,grid index,exact,20480
+CMIP6 Amon,cmip6/CMIP6/CMIP/MPI-M/ICON-ESM-LR/historical/r4i1p1f1/Amon/ta/gn/v20210215/,latitude,2-D,unstructured,20480
+CMIP6 Omon,cmip6/CMIP6/CMIP/MPI-M/ICON-ESM-LR/historical/r1i1p1f1/Omon/thetao/gn/v20210215/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/MPI-M/ICON-ESM-LR/historical/r1i1p1f1/Omon/thetao/gn/v20210215/,lev,vertical,monotone,64
+CMIP6 Omon,cmip6/CMIP6/CMIP/MPI-M/ICON-ESM-LR/historical/r1i1p1f1/Omon/thetao/gn/v20210215/,i,grid index,exact,235403
+CMIP6 Omon,cmip6/CMIP6/CMIP/MPI-M/ICON-ESM-LR/historical/r1i1p1f1/Omon/thetao/gn/v20210215/,latitude,2-D,unstructured,235403
+CMIP6 Amon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM6A-LR-INCA/historical/r1i1p1f1/Amon/ta/gr/v20210216/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM6A-LR-INCA/historical/r1i1p1f1/Amon/ta/gr/v20210216/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM6A-LR-INCA/historical/r1i1p1f1/Amon/ta/gr/v20210216/,lat,lat,linspace,143
+CMIP6 Amon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM6A-LR-INCA/historical/r1i1p1f1/Amon/ta/gr/v20210216/,lon,lon,exact,144
+CMIP6 Omon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM6A-LR-INCA/historical/r1i1p1f1/Omon/thetao/gn/v20210216/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM6A-LR-INCA/historical/r1i1p1f1/Omon/thetao/gn/v20210216/,olevel,vertical,monotone,75
+CMIP6 Omon,cmip6/CMIP6/CMIP/IPSL/IPSL-CM6A-LR-INCA/historical/r1i1p1f1/Omon/thetao/gn/v20210216/,nav_lat,2-D,curvilinear,120184
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3/historical/r19i1p1f1/Omon/thetao/gn/v20210305/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3/historical/r19i1p1f1/Omon/thetao/gn/v20210305/,lev,vertical,monotone,75
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3/historical/r19i1p1f1/Omon/thetao/gn/v20210305/,j,grid index,exact,292
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3/historical/r19i1p1f1/Omon/thetao/gn/v20210305/,i,grid index,exact,362
+CMIP6 Omon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3/historical/r19i1p1f1/Omon/thetao/gn/v20210305/,latitude,2-D,curvilinear,105704
+CMIP6 Omon,cmip6/CMIP6/CMIP/MRI/MRI-ESM2-0/historical/r2i1p1f1/Omon/thetao/gn/v20210311/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/MRI/MRI-ESM2-0/historical/r2i1p1f1/Omon/thetao/gn/v20210311/,lev,vertical,monotone,61
+CMIP6 Omon,cmip6/CMIP6/CMIP/MRI/MRI-ESM2-0/historical/r2i1p1f1/Omon/thetao/gn/v20210311/,y,lat,monotone,363
+CMIP6 Omon,cmip6/CMIP6/CMIP/MRI/MRI-ESM2-0/historical/r2i1p1f1/Omon/thetao/gn/v20210311/,x,grid index,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/MRI/MRI-ESM2-0/historical/r2i1p1f1/Omon/thetao/gn/v20210311/,latitude,2-D,curvilinear,130680
+CMIP6 Amon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-LL/historical/r5i1p1f3/Amon/ta/gn/v20210315/,time,time,exact,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-LL/historical/r5i1p1f3/Amon/ta/gn/v20210315/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-LL/historical/r5i1p1f3/Amon/ta/gn/v20210315/,lat,lat,exact,144
+CMIP6 Amon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-LL/historical/r5i1p1f3/Amon/ta/gn/v20210315/,lon,lon,exact,192
+CMIP6 Omon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-LL/historical/r5i1p1f3/Omon/thetao/gn/v20210315/,time,time,exact,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-LL/historical/r5i1p1f3/Omon/thetao/gn/v20210315/,lev,vertical,monotone,75
+CMIP6 Omon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-LL/historical/r5i1p1f3/Omon/thetao/gn/v20210315/,j,grid index,exact,330
+CMIP6 Omon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-LL/historical/r5i1p1f3/Omon/thetao/gn/v20210315/,i,grid index,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/MOHC/HadGEM3-GC31-LL/historical/r5i1p1f3/Omon/thetao/gn/v20210315/,latitude,2-D,curvilinear,118800
+CMIP6 Amon,cmip6/CMIP6/CMIP/MIROC/MIROC-ES2L/historical/r25i1p1f2/Amon/ta/gn/v20210317/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/MIROC/MIROC-ES2L/historical/r25i1p1f2/Amon/ta/gn/v20210317/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/MIROC/MIROC-ES2L/historical/r25i1p1f2/Amon/ta/gn/v20210317/,lat,lat,monotone,64
+CMIP6 Amon,cmip6/CMIP6/CMIP/MIROC/MIROC-ES2L/historical/r25i1p1f2/Amon/ta/gn/v20210317/,lon,lon,exact,128
+CMIP6 Omon,cmip6/CMIP6/CMIP/MIROC/MIROC-ES2L/historical/r25i1p1f2/Omon/thetao/gr1/v20210317/,lat,lat,exact,180
+CMIP6 Omon,cmip6/CMIP6/CMIP/MIROC/MIROC-ES2L/historical/r25i1p1f2/Omon/thetao/gr1/v20210317/,lon,lon,exact,360
+CMIP6 Omon,cmip6/CMIP6/CMIP/MIROC/MIROC-ES2L/historical/r25i1p1f2/Omon/thetao/gr1/v20210317/,time,time,monthly,1980
+CMIP6 Omon,cmip6/CMIP6/CMIP/MIROC/MIROC-ES2L/historical/r25i1p1f2/Omon/thetao/gr1/v20210317/,lev,vertical,monotone,63
+CMIP6 Amon,cmip6/CMIP6/CMIP/AS-RCEC/TaiESM1/historical/r2i1p1f1/Amon/ta/gn/v20210416/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/AS-RCEC/TaiESM1/historical/r2i1p1f1/Amon/ta/gn/v20210416/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/AS-RCEC/TaiESM1/historical/r2i1p1f1/Amon/ta/gn/v20210416/,lat,lat,linspace,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/AS-RCEC/TaiESM1/historical/r2i1p1f1/Amon/ta/gn/v20210416/,lon,lon,exact,288
+CMIP6 Amon,cmip6/CMIP6/CMIP/NIMS-KMA/UKESM1-0-LL/historical/r15i1p1f2/Amon/ta/gn/v20210426/,time,time,exact,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/NIMS-KMA/UKESM1-0-LL/historical/r15i1p1f2/Amon/ta/gn/v20210426/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/NIMS-KMA/UKESM1-0-LL/historical/r15i1p1f2/Amon/ta/gn/v20210426/,lat,lat,exact,144
+CMIP6 Amon,cmip6/CMIP6/CMIP/NIMS-KMA/UKESM1-0-LL/historical/r15i1p1f2/Amon/ta/gn/v20210426/,lon,lon,exact,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/CSIRO/ACCESS-ESM1-5/historical/r34i1p1f1/Amon/ta/gn/v20210525/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/CSIRO/ACCESS-ESM1-5/historical/r34i1p1f1/Amon/ta/gn/v20210525/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CSIRO/ACCESS-ESM1-5/historical/r34i1p1f1/Amon/ta/gn/v20210525/,lat,lat,exact,144
+CMIP6 Amon,cmip6/CMIP6/CMIP/CSIRO/ACCESS-ESM1-5/historical/r34i1p1f1/Amon/ta/gn/v20210525/,lon,lon,exact,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3/historical/r23i1p1f1/Amon/ta/gr/v20210527/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3/historical/r23i1p1f1/Amon/ta/gr/v20210527/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3/historical/r23i1p1f1/Amon/ta/gr/v20210527/,lat,lat,monotone,256
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3/historical/r23i1p1f1/Amon/ta/gr/v20210527/,lon,lon,exact,512
+CMIP6 Amon,cmip6/CMIP6/CMIP/KIOST/KIOST-ESM/historical/r1i1p1f1/Amon/ta/gr1/v20210601/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/KIOST/KIOST-ESM/historical/r1i1p1f1/Amon/ta/gr1/v20210601/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/KIOST/KIOST-ESM/historical/r1i1p1f1/Amon/ta/gr1/v20210601/,lat,lat,rounding,96
+CMIP6 Amon,cmip6/CMIP6/CMIP/KIOST/KIOST-ESM/historical/r1i1p1f1/Amon/ta/gr1/v20210601/,lon,lon,rounding,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/CSIRO-ARCCSS/ACCESS-CM2/historical/r4i1p1f1/Amon/ta/gn/v20210607/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/CSIRO-ARCCSS/ACCESS-CM2/historical/r4i1p1f1/Amon/ta/gn/v20210607/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CSIRO-ARCCSS/ACCESS-CM2/historical/r4i1p1f1/Amon/ta/gn/v20210607/,lat,lat,exact,144
+CMIP6 Amon,cmip6/CMIP6/CMIP/CSIRO-ARCCSS/ACCESS-CM2/historical/r4i1p1f1/Amon/ta/gn/v20210607/,lon,lon,exact,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-0/historical/r5i1p1f1/Amon/ta/gr/v20210621/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-0/historical/r5i1p1f1/Amon/ta/gr/v20210621/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-0/historical/r5i1p1f1/Amon/ta/gr/v20210621/,lat,lat,exact,180
+CMIP6 Amon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-0/historical/r5i1p1f1/Amon/ta/gr/v20210621/,lon,lon,exact,360
+CMIP6 Amon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1/historical/r1i1p1f1/Amon/ta/gr/v20210805/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1/historical/r1i1p1f1/Amon/ta/gr/v20210805/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1/historical/r1i1p1f1/Amon/ta/gr/v20210805/,lat,lat,exact,180
+CMIP6 Amon,cmip6/CMIP6/CMIP/E3SM-Project/E3SM-1-1/historical/r1i1p1f1/Amon/ta/gr/v20210805/,lon,lon,exact,360
+CMIP6 Amon,cmip6/CMIP6/CMIP/MRI/MRI-ESM2-0/historical/r6i1p1f1/Amon/ta/gn/v20210907/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/MRI/MRI-ESM2-0/historical/r6i1p1f1/Amon/ta/gn/v20210907/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/MRI/MRI-ESM2-0/historical/r6i1p1f1/Amon/ta/gn/v20210907/,lat,lat,monotone,160
+CMIP6 Amon,cmip6/CMIP6/CMIP/MRI/MRI-ESM2-0/historical/r6i1p1f1/Amon/ta/gn/v20210907/,lon,lon,exact,320
+CMIP6 Amon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-SR5/historical/r2i1p2f1/Amon/ta/gn/v20211109/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-SR5/historical/r2i1p2f1/Amon/ta/gn/v20211109/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-SR5/historical/r2i1p2f1/Amon/ta/gn/v20211109/,lat,lat,linspace,192
+CMIP6 Amon,cmip6/CMIP6/CMIP/CMCC/CMCC-CM2-SR5/historical/r2i1p2f1/Amon/ta/gn/v20211109/,lon,lon,exact,288
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg/historical/r1i1p1f1/Amon/ta/gr/v20211207/,time,time,monthly,1980
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg/historical/r1i1p1f1/Amon/ta/gr/v20211207/,plev,vertical,monotone,19
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg/historical/r1i1p1f1/Amon/ta/gr/v20211207/,lat,lat,monotone,256
+CMIP6 Amon,cmip6/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg/historical/r1i1p1f1/Amon/ta/gr/v20211207/,lon,lon,exact,512

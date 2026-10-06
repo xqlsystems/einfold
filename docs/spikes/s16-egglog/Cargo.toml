@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "s16-egglog"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike S16: einfold's algebraic rewrites in egglog, with a hybrid contraction planner"
+
+[dependencies]
+egglog = "=3.0.0"

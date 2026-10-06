@@ -1,0 +1,71 @@
+; SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+;
+; SPDX-License-Identifier: Apache-2.0
+
+; Spike S16: einfold's algebraic rewrites as egglog rules.
+;
+; The IR is the sum-product core of an einsum, in relational terms:
+;   (T name)      an operand: one variable over its own dimensions
+;   (Mul a b)     pointwise product = natural join on shared dimensions
+;   (Add a b)     pointwise sum over the same dimensions
+;   (Sum i a)     sum out dimension i = GROUP BY the remaining dimensions
+;   (Scale i a)   multiply by the extent of dimension i (from summing a term
+;                 that does not depend on i)
+;
+; Simplification for the spike: Scale uses the extent of i, which is exact only
+; for complete dense arrays. The design doc's rule uses a row count after filters.
+
+(datatype Expr
+  (T String)
+  (Mul Expr Expr)
+  (Add Expr Expr)
+  (Sum String Expr)
+  (Scale String Expr))
+
+(sort Dims (Set String))
+
+; Analysis: the free dimensions of each e-class. Equal expressions have equal
+; dimensions, so the merge keeps the old value.
+(function dims (Expr) Dims :merge old)
+
+(ruleset analysis)
+(rule ((= e (Mul a b)) (= da (dims a)) (= db (dims b)))
+      ((set (dims e) (set-union da db))) :ruleset analysis)
+(rule ((= e (Add a b)) (= da (dims a)) (= db (dims b)))
+      ((set (dims e) (set-union da db))) :ruleset analysis)
+(rule ((= e (Sum i a)) (= da (dims a)))
+      ((set (dims e) (set-remove da i))) :ruleset analysis)
+(rule ((= e (Scale i a)) (= da (dims a)))
+      ((set (dims e) da)) :ruleset analysis)
+
+(ruleset algebra)
+
+; The product is commutative. Commutativity alone at most doubles each class.
+(rewrite (Mul a b) (Mul b a) :ruleset algebra)
+
+; Distributivity, in both directions. Extraction picks per case (SPORES, Galley).
+(rewrite (Mul a (Add b c)) (Add (Mul a b) (Mul a c)) :ruleset algebra)
+(rewrite (Add (Mul a b) (Mul a c)) (Mul a (Add b c)) :ruleset algebra)
+
+; Eager aggregation: push a sum into the factor that owns the dimension, and
+; pull it back out. Valid because multiplication distributes over addition.
+(rule ((= e (Sum i (Mul a b))) (= da (dims a)) (set-not-contains da i))
+      ((union e (Mul a (Sum i b)))) :ruleset algebra)
+(rule ((= e (Mul a (Sum i b))) (= da (dims a)) (set-not-contains da i))
+      ((union e (Sum i (Mul a b)))) :ruleset algebra)
+
+; A sum distributes over addition.
+(rewrite (Sum i (Add a b)) (Add (Sum i a) (Sum i b)) :ruleset algebra)
+
+; Broadcast factoring: summing a term that does not depend on i.
+(rule ((= e (Sum i a)) (= da (dims a)) (set-not-contains da i))
+      ((union e (Scale i a))) :ruleset algebra)
+
+; The order of sums does not matter.
+(rewrite (Sum i (Sum j a)) (Sum j (Sum i a)) :ruleset algebra)
+
+; Associativity: kept separate, because with commutativity it enumerates every
+; bracketing of a product. The hybrid design leaves ordering to a planner.
+(ruleset assoc)
+(rewrite (Mul (Mul a b) c) (Mul a (Mul b c)) :ruleset assoc)
+(rewrite (Mul a (Mul b c)) (Mul (Mul a b) c) :ruleset assoc)

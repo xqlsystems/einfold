@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # einfold: Fast Tensor Contractions for the XQL Model
 
-Status: draft v7. Author: Alex Merose. Last updated: 2026-10-04. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
+Status: draft v8. Author: Alex Merose. Last updated: 2026-10-05. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
 
 ## 1. Summary
 
@@ -151,6 +151,9 @@ einfold sits where three vocabularies meet: XQL and Xarray, einsum notation, and
 | **Reader** | A project that turns arrays into tables (section 2.1) | — | A table provider |
 | **Host** | The engine that runs einfold's output (section 2.3) | — | — |
 | **Target profile** | Data describing what a host supports (section 7.4) | — | — |
+| **E-graph** | A data structure that stores many equivalent versions of an expression compactly, by grouping equal subexpressions into classes (section 7.6) | — | Like the "memo" of a Cascades-style query optimizer |
+| **Equality saturation** | Applying rewrite rules to an e-graph until no new equivalent forms appear, or a limit is reached | — | — |
+| **Extraction** | Choosing the cheapest expression in an e-graph under a cost model | — | Choosing the cheapest plan |
 
 This doc says **dimension** wherever einsum literature says "index". "Index" appears only in the einsum column above, in titles of cited work, and in einsum strings. That avoids collisions with database indexes and with Xarray's indexes (pandas index objects attached to coordinates).
 
@@ -188,7 +191,7 @@ These are facts about the data model that einfold's rewrites must respect.
 
 - **Rel IR.** einfold's internal representation of relational plans, kept close to Substrait. Frontends convert into it and writers convert out of it.
 - **EinsumIR.** einfold's internal representation of an einsum (operands, dimensions, output dimensions, and the pair of operations used for "add" and "multiply", which section 14 calls the semiring), with facts attached to each operand (section 8.1).
-- **Logical optimizer** (section 9). Rewrites einsums: detection and normalization, pruning, choosing the order of contractions, tiling, and sharing work across einsums.
+- **Logical optimizer** (section 9). Rewrites einsums: detection and normalization, pruning, choosing the order of contractions, tiling, and sharing work across einsums. Its algebraic rewrites run on the egglog engine, and contraction order and tiling run on specialized planners (section 7.6).
 - **Physical realization** (section 10). Turns each node of the contraction tree into something a host can run.
 
 ### 7.2 Output forms and executors
@@ -227,7 +230,7 @@ einfold is written in Rust, organized as several crates (Rust packages), with Py
 | Crate / package | Role | Depends on |
 |---|---|---|
 | `einfold-ir` | Rel IR, EinsumIR, facts, tiles, partial-aggregate states | nothing engine-specific |
-| `einfold-plan` | Logical optimizer and physical realization | `einfold-ir` |
+| `einfold-plan` | Logical optimizer (egglog rules in `.egg` files, plus planners) and physical realization | `einfold-ir`, `egglog` |
 | `einfold-substrait` | Substrait in and out; `Einsum` relation definition | `einfold-ir`, `substrait` |
 | `einfold-sql` | SQL writers per dialect (DuckDB, DataFusion, Postgres) | `einfold-ir` |
 | `einfold-datafusion` | `LogicalPlan` frontend, optimizer rule, reference `EinsumExec` | `einfold-plan`, DataFusion |
@@ -235,6 +238,38 @@ einfold is written in Rust, organized as several crates (Rust packages), with Py
 | `einfold-py` | Python bindings | the above |
 
 Only `einfold-datafusion` depends on an engine. The core can be used from DuckDB, GQE, Sirius, or a client library without pulling in DataFusion's executor.
+
+### 7.6 Rewrite engine: egglog, in a hybrid design
+
+The logical optimizer's algebra runs on **egglog** (Zhang et al., 2023), an open-source equality-saturation engine written in Rust. egglog is the successor to **egg** (Willsey et al., 2021), and adds Datalog-style rules for deriving facts. An e-graph stores many equivalent versions of a plan at once. Saturation fills it by applying rewrite rules, and extraction then picks the cheapest version under a cost model.
+
+**Why.** Hand-written rewrite passes must be applied in some order, and an early pass can destroy an opportunity a later pass needed. Hand-written heuristics also have to pick one direction for rules that help in either direction. An e-graph keeps all versions and lets the cost model choose. The strongest precedent is SPORES (Wang et al., 2020). It translates linear algebra into relational algebra, which is close to einfold's own IR, then optimizes with egg, and translates back. It ran 1.2–5× faster than SystemML, a production ML system. Its wins came from algebraic choices like einfold's: distributing a product over a sum when that exploits sparsity, and factoring it back when that is cheaper.
+
+**The hybrid split.**
+
+| Work | Where it runs |
+|---|---|
+| Facts such as each class's dimensions (section 8.1) | egglog analyses, written as Datalog rules |
+| Normalization (9.1), eager aggregation (10.1), pruning (9.2) | egglog rewrite rules, with their side conditions written as queries |
+| Cost-based algebraic choices, such as distributivity (9.1) | egglog extraction, with einfold's cost model (section 9.3) plugged in through egglog's `CostModel` interface |
+| Common subexpressions (9.5) | Free: the e-graph stores each distinct subexpression once |
+| Contraction order (9.3) and tiling (9.4) | Specialized Rust planners, applied to each sum-product region of the extracted plan |
+| Physical realization (section 10) | Rust |
+
+**Evidence.** Spike S16 ([`spikes/s16-egglog`](spikes/s16-egglog/README.md)) encoded einfold's rewrites in egglog 3.0:
+
+- egglog found SPORES's rewrite `sum(WH) = Σₖ (Σᵢ W)(Σⱼ H)` (50,000× cheaper by the cost model). It expanded `X·(A + B)` only when `X` was sparse, factored a repeated weight out of a sum, turned a sum over a missing dimension into a scale factor, and fixed a badly ordered ddx gradient (64× cheaper).
+- With associativity left to egglog, the e-graph grew about 3.7× per extra matrix in a chain: 1.6 million tuples and 24 s for 11 matrices. At 12 it hit the size limit before finishing, and extraction returned a plan 800,000× worse than the hybrid's. The hybrid matched the full search wherever that search finished.
+- Every result was identical across repeated runs and across 1 and 4 threads.
+
+**Design rules from the spike.**
+
+1. **No associativity rules over products.** Contraction order belongs to the planner.
+2. **One n-ary node per sum-product region.** Even without associativity, commutativity and reordering of nested sums grew the e-graph about 2.2× per operand. A region should be a single node holding a multiset of operands and a set of summed dimensions. egglog has multisets built in, and its own examples use them in place of associativity and commutativity rules.
+3. **Bounded, deterministic schedules.** Use a fixed rule order with iteration and size limits, and no random sampling of rule matches. If a limit is hit, keep the best plan found by the rules that did finish. Never rely on an unfinished associativity search.
+4. **Planners and rules share tests.** In the spike, the hand-written planner first dropped a sum over a dimension that no operand has, a case the egglog rule handled correctly. The equivalence tests of section 11 run on both.
+
+**Risks.** egglog 3.0 is young (released August 2026), so egg is the fallback. RisingWave found that a SQL optimizer built on egg planned a 6-table join in 39 ms, where DuckDB took 5 ms, and that cost functions were hard to debug. For einfold, plan caching (section 8.5) absorbs repeated planning, but one-off queries pay the cost. An earlier egg-based optimizer for DataFusion's expressions, datafusion-tokomak, has been inactive since 2022, for reasons not yet investigated.
 
 ## 8. Core abstractions
 
@@ -280,6 +315,8 @@ A **fact** is something known about an operand, tagged with how it is known. Eve
 - **Degree statistics.** `D(X | Y)` is the maximum number of rows for any one value of `Y`. For dense arrays these follow from extents. Missing chunks give them at chunk granularity. Sparse tables need the reader to compute them. DataFusion's column statistics have no field for them.
 - **The user.** Declared facts.
 - **The executor.** Measured facts.
+
+**Inside the optimizer,** facts are egglog analyses: Datalog rules derive them, and egglog's merge functions combine them, keeping the most precise value (section 7.6).
 
 **How facts reach the plan is not settled.** Spikes S1–S3 (section 13) decide the carrier: Arrow field metadata (key-value pairs attached to a column's schema), a Substrait extension attached to the read, or a side channel.
 
@@ -390,7 +427,7 @@ einfold follows JAX's split.
 
 **1. Guaranteed by design: einfold never adds nondeterminism.**
 
-- A rewritten plan is never less deterministic than the plan einfold received. einfold's own decisions (the contraction tree, the choice of algorithm, run-time switching in section 10.4) depend only on the plan, the facts, and the data, never on timing.
+- A rewritten plan is never less deterministic than the plan einfold received. einfold's own decisions (the contraction tree, the choice of algorithm, run-time switching in section 10.4) depend only on the plan, the facts, and the data, never on timing. The rewrite engine follows the same rule: fixed schedules and no random sampling (section 7.6). Spike S16 found identical results across repeated runs and thread counts.
 - Rewrites still change *which* numbers are added together and when, so a rewritten plan's bits can differ from the original plan's. "Equivalent" in principle 4 means mathematically equivalent. Distributing a product over a sum can also change overflow behavior: `a·Σbⱼ` can overflow when every `a·bⱼ` does not.
 
 **2. Determinism is a scoped setting, off by default on hosts.**
@@ -426,7 +463,7 @@ einfold follows JAX's split.
 
 ## 9. Logical optimization
 
-The logical optimizer rewrites einsums without choosing how each node will run.
+The logical optimizer rewrites einsums without choosing how each node will run. Sections 9.1, 9.2 and 9.5 are egglog rules and analyses. Sections 9.3 and 9.4 are specialized planners, applied to each sum-product region of the plan that egglog extracts (section 7.6).
 
 ```
 detect & normalize ─► prune ─► plan contraction tree ─► choose tiling ─► share across einsums
@@ -467,7 +504,9 @@ Aggregate(group by G; SUM(e))
 
 **Correctness.** Every rewrite in section 9 holds under bag semantics, so detection does not require unique coordinate tuples. Dense execution does (section 10.2). An equi-join drops rows whose key is NULL, and `GROUP BY` keeps NULL as its own group. The relational form keeps these semantics because it is relational, and dense execution requires non-NULL dimensions, which Zarr guarantees. Anything detection cannot prove is left unchanged.
 
-**Prior work.** Blacher et al.'s four rules, read in reverse; Galley's logical normalization (Deeds et al., §4).
+**In egglog.** Steps 2–5 are rewrite rules and analyses. Dimension classes (step 4) come from the e-graph's built-in union-find. The decision whether to expand a product (step 3) needs no separate search: the e-graph holds both forms, and extraction picks the cheaper one.
+
+**Prior work.** Blacher et al.'s four rules, read in reverse; Galley's logical normalization (Deeds et al., §4); SPORES (Wang et al., 2020).
 
 ### 9.2 Prune the support
 
@@ -512,6 +551,8 @@ The order of contractions matters as much as join order does. For `ij,jk,k->i`, 
 4. **Memory.** If no tree fits the memory limit, hand the best tree to tiling (section 9.4) to slice.
 5. **Cache** the tree (section 8.5).
 
+**Why not search orders in the e-graph.** Associativity and commutativity rules would let egglog enumerate contraction orders itself, but spike S16 showed that search growing exponentially, and returning poor plans when cut short (section 7.6). The planners here are faster and, within their size limits, exact.
+
 **Why einfold plans inside the engine.** Blacher et al. chose contraction orders outside the database. They note the trade-off: an outside planner knows the contraction structure, while the engine knows sizes and sparsity. They conclude that for sparse tensors, the order is better chosen by the database's optimizer. einfold's in-engine mode gets both: the structure from detection and the facts from the host. In SQL-to-SQL mode, einfold relies on reader facts and supplied statistics instead.
 
 **Protecting the plan from the host optimizer.** A decomposed einsum is a deep tree of small queries, and some host optimizers cost more than they save on it. Blacher et al. measured a query encoding a satisfiability problem with 952 clauses. HyPer, a fast research database from TU Munich, spent 0.87 s planning it and 0.08 s executing it. DuckDB had not finished planning after five hours. With its optimizer disabled, DuckDB planned in 0.20 s and ran in 0.97 s. So the output must stop the host from flattening or reordering the tree again. The target profile picks the mechanism: CTEs that the host must materialize, turning off specific optimizer passes, or, in DataFusion, handing over a physical plan directly. Spike S10 checks which mechanisms each host honors.
@@ -545,7 +586,7 @@ To change tilings, einfold borrows from rechunker, a tool from the Pangeo commun
 ### 9.5 Share work across einsums
 
 - **Shared scans.** ddx's two gradient contractions from section 3, `X̄[n,d] = Σ_h Ȳ[n,h]·W[d,h]` and `W̄[d,h] = Σ_n X[n,d]·Ȳ[n,h]`, both read `Ȳ`. Both can stream `Ȳ` against a hash table: one on `W` keyed by `h`, one on `X` keyed by `n`. One scan of `Ȳ` then feeds both results. Each row `(n, h, ȳ)` adds to row `n` of `X̄` through the `W` table, and to column `h` of `W̄` through the `X` table. In general, group the einsums in one plan (or one ddx training step) that share an operand, and stream the shared operand. This is multiple-query optimization (Sellis, 1988), the classic technique of sharing work among queries run together, applied to einsums.
-- **Common subexpressions.** Put every node of every contraction tree in a canonical form, hash it, and compute identical nodes once (Deeds et al., §5.4).
+- **Common subexpressions.** Put every node of every contraction tree in a canonical form, hash it, and compute identical nodes once (Deeds et al., §5.4). In egglog this comes for free: the e-graph stores each distinct subexpression once, so einsums placed in the same e-graph share them automatically.
 - **Realization.** Reference executor: an `EinsumExec` with several outputs. Relational form: the shared operand is emitted once as a CTE that both einsums reference. Whether the host then scans it once is recorded in the target profile.
 
 ## 10. Physical realization
@@ -724,13 +765,13 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 
 ## 13. Spikes and literature review
 
-A spike is a short, time-boxed experiment that answers one design question.
+A spike is a short, time-boxed experiment that answers one design question. Spike code and reports live in [`docs/spikes/`](spikes/).
 
 ### 13.1 Facts
 
 - **S1: Zarr → table → plan.** For each of xarray-sql, duckdb-zarr, and zarr-datafusion: what Zarr metadata survives into the table schema, and how is it exposed (Arrow metadata, a side table like duckdb-zarr's `read_zarr_metadata()`, or not at all)?
 - **S2: Carrier survival.** Does Arrow field metadata survive DataFusion projections, filters, and joins? Can a Substrait read relation carry it through an extension? Does DuckDB keep it?
-- **S3: Propagation rules.** Validate the layout rules in section 13.4 against real plans.
+- **S3: Propagation rules.** Validate the layout rules in section 13.5 against real plans.
 - **S4: Coordinate maps.** How often are coordinates affine in real datasets, such as ERA5 (ECMWF's hourly global atmospheric reanalysis) and CMIP6 (the latest round of coordinated global climate-model runs)? How should irregular coordinates be represented?
 - **S13: Variable separation.** For each reader, are a variable's dimensions exposed to the plan? When a reader dictionary-encodes a column, does it guarantee that the dictionary comes from the variable's coordinates?
 - **S14: Fill values.** For each reader, how are fill values and CF-masked values emitted: no rows, 0, NULL, or NaN? Is that exposed as a fact?
@@ -747,17 +788,25 @@ A spike is a short, time-boxed experiment that answers one design question.
 - **S12: Reader aggregate pushdown.** How can a DataFusion table provider take over the `Partial` phase of an aggregation, and is there an equivalent for duckdb-zarr? What partial-state format do the engines expect?
 - **S15: Sirius.** Does DuckDB's optimizer reorder einfold's contraction tree before Sirius's hook sees the plan? Which relational-form shapes stay on GPU, and which fall back to CPU? Is the float `SUM` in Sirius (via libcudf) deterministic (section 8.6)? Can a Substrait extension relation reach Sirius through its hook? Does `pin_table` keep ddx's weights in GPU memory across training steps?
 
-### 13.3 Literature still to read
+### 13.3 Optimizer engine
+
+- **S16: egglog as the rewrite engine. Done.** Report: [`spikes/s16-egglog`](spikes/s16-egglog/README.md). Outcome: adopt egglog for the algebraic layer, in the hybrid design of section 7.6.
+- **S17: n-ary sum-product nodes.** Re-run S16 with each sum-product region as one node over a multiset of operands. Measure e-graph growth on the Einsum Benchmark's largest expressions.
+- **S18: Planning time.** Measure egglog's saturation and extraction time on ddx's training plans and on TPC-H, against DataFusion's own planner.
+
+### 13.4 Literature still to read
 
 - Factorized databases (Olteanu and colleagues), which store and compute on joins without materializing them, and FAQ (Abo Khamis, Ngo and Rudra): the general semiring theory behind eager aggregation.
 - Fent and Neumann, *A practical approach to groupjoin and nested aggregates* (VLDB 2021): groupjoins beyond key/foreign-key joins.
 - Eich, Fender and Moerkotte (2018): generating plans that contain group-by, join, and groupjoin.
 - Systems that run tensor or ML computations inside databases: tensor relational algebra (TRA), LMFAO (in-database learning over joins), and SystemDS (Apache's declarative ML system).
 - Sparse tensor compilers (TACO).
+- Tensat (Yang et al., MLSys 2021): equality saturation for tensor computation graphs.
+- Why datafusion-tokomak, an egg-based optimizer for DataFusion, went inactive.
 - Reproducible floating-point summation (Demmel and Nguyen, ReproBLAS; exact superaccumulators).
 - Substrait's extension mechanisms.
 
-### 13.4 Reference: layout propagation rules
+### 13.5 Reference: layout propagation rules
 
 To be validated by spike S3. Each rule follows from CuTe's layout algebra (section 8.2).
 
@@ -796,9 +845,9 @@ Each benchmark runs with einfold off and on, on the same host. That is the measu
 
 ### 16.1 Milestones
 
-1. **M0: Spikes S1–S15.** Output: a decision on how facts travel, and a target-profile schema.
+1. **M0: Spikes S1–S18** (S16 done). Output: a decision on how facts travel, and a target-profile schema.
 2. **M1: EinFold.** Detection and EinFold's hash algorithm as a DataFusion rule and `EinsumExec`, for two-operand contractions over sparse tables. Verified as in section 11, and benchmarked on ddx's `matmul` and `attn`.
-3. **M2: Relational form.** Eager aggregation and the greedy contraction planner, written as DataFusion plans, Substrait, and DuckDB SQL. Variable separation and distributivity (9.1), shared scans (9.5), and support pruning (9.2). Same benchmarks on DuckDB, DuckDB+gpudb, DuckDB+Sirius, and GQE. Plan protection per S10.
+3. **M2: Relational form.** The egglog rule set for normalization, eager aggregation, and pruning, plus the greedy contraction planner, written as DataFusion plans, Substrait, and DuckDB SQL. Variable separation and distributivity (9.1), shared scans (9.5), and support pruning (9.2). Same benchmarks on DuckDB, DuckDB+gpudb, DuckDB+Sirius, and GQE. Plan protection per S10.
 4. **M3: Facts.** `einfold-zarr`, layouts, fill-value rules, Bounds and degree statistics, and EinFold's dense and block-sparse algorithms. Reduction at the source (10.5). Integration with xarray-sql, zarr-datafusion, and duckdb-zarr. ERA5 benchmarks.
 5. **M4: Einsum form.** The `Einsum` relation's spec and conformance tests. Run-time switching (10.4) in the reference executor.
 6. **M5: Tiling.** Execution tiling and slicing (9.4), dynamic-programming and exhaustive contraction planners, retiling cost in contraction planning, and output order (10.3).
@@ -825,6 +874,7 @@ Agreed priority, highest first. Each lives in the section that owns it:
 - **The einsum form is never adopted.** Then einfold's ceiling on GPU hosts is the relational form, which cannot speed up two-operand contractions. Mitigation: keep the relational form valuable on its own; keep the `Einsum` relation small and well tested; show results with the reference executor.
 - **Host optimizers undo or choke on einfold's plans.** Mitigation: plan protection in the target profile (S10).
 - **Host behavior drift.** Hosts change what they fuse and accelerate. Mitigation: target profiles are data, plus a benchmark suite per host.
+- **Rewrite-engine dependency.** egglog is young, and saturation can blow up. Mitigation: the hybrid design and bounded schedules (section 7.6); egg as a fallback.
 - **Facts lost in transit.** If no carrier survives the path from reader to plan, variable separation and EinFold's dense algorithms have nothing to use. Mitigation: spikes S1–S2 and S13–S14 come first.
 - **Float sums on GPU hosts.** Deterministic float sums on GPU need host support. Mitigation: determinism is a setting, not a default, on hosts (section 8.6).
 
@@ -862,12 +912,19 @@ Papers:
 - Sellis, T. K. (1988). Multiple-Query Optimization. *ACM Trans. Database Syst.* 13(1), 23–52.
 - Smith, D. G. A., Gray, J. (2018). opt_einsum: A Python package for optimizing contraction order for einsum-like expressions. *Journal of Open Source Software* 3(26), 753.
 - Staudt, C., Blacher, M., Hoffmann, T., Kasche, K., Beyersdorff, O., Giesen, J. (2025). Exploiting Dynamic Sparsity in Einsum. *NeurIPS 2025.* https://openreview.net/forum?id=ixOpURt7wC. Code: https://github.com/ti2-group/dynamic-sparsity-einsum
+- Wang, Y. R., Hutchison, S., Leang, J., Howe, B., Suciu, D. (2020). SPORES: Sum-Product Optimization via Relational Equality Saturation for Large Scale Linear Algebra. *PVLDB* 13(12), 1919–1932. http://www.vldb.org/pvldb/vol13/p1919-wang.pdf
 - Wang, Y. R., Willsey, M., Suciu, D. (2023). Free Join: Unifying Worst-Case Optimal and Traditional Joins. *Proc. ACM Manag. Data* 1(2), Article 150. https://doi.org/10.1145/3589295
+- Willsey, M., Nandi, C., Wang, Y. R., Flatt, O., Tatlock, Z., Panchekha, P. (2021). egg: Fast and Extensible Equality Saturation. *Proc. ACM Program. Lang.* 5(POPL). https://arxiv.org/abs/2004.03082
 - Yan, W. P., Larson, P.-Å. (1995). Eager Aggregation and Lazy Aggregation. *VLDB 1995*, 345–357. https://www.vldb.org/conf/1995/P345.PDF
 - Yang, Y., Zhao, H., Yu, X., Koutris, P. (2024). Predicate Transfer: Efficient Pre-Filtering on Multi-Join Queries. *CIDR 2024.* https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf
 - Yannakakis, M. (1981). Algorithms for Acyclic Database Schemes. *VLDB 1981*, 82–94.
+- Zhang, Y., Wang, Y. R., Flatt, O., Cao, D., Zucker, P., Rosenthal, E., Tatlock, Z., Willsey, M. (2023). Better Together: Unifying Datalog and Equality Saturation. *Proc. ACM Program. Lang.* 7(PLDI), Article 125. https://doi.org/10.1145/3591239
 
 Software and documentation:
+
+- egg: https://github.com/egraphs-good/egg; egglog: https://github.com/egraphs-good/egglog; overview of e-graphs: https://egraphs-good.github.io
+- RisingWave, "Incubate Your SQL Optimizer Using Egg": https://risingwave.com/blog/incubate-your-sql-optimizer-using-egg/
+- datafusion-tokomak, an egg-based optimizer for DataFusion: https://github.com/datafusion-contrib/datafusion-tokomak
 - DuckDB discussion #12693, "sum of double not deterministic": https://github.com/duckdb/duckdb/discussions/12693
 - DuckDB issue #26143, on how `fsum` combines partial sums: https://github.com/duckdb/duckdb/issues/26143
 - PostgreSQL mailing list, "Non-deterministic behavior with floating point in parallel mode" (2017): https://www.postgresql.org/message-id/CAFRJ5K0%2BZZaUz0-ihX-aCj1h42H%3Ds-CLWO%2B2Fb6nHCvXx19Diw%40mail.gmail.com

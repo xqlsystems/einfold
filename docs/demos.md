@@ -53,7 +53,7 @@ GROUP BY w.i, v.d, n.z;
 | FlashAttention's idea | einfold's mechanism | Status in the design |
 |---|---|---|
 | Skip tiles above the diagonal | The predicate `q.t >= k.t` becomes a mask operand, and the block-sparse algorithm skips absent tiles and masks the diagonal ones | Designed (design.md §9.1, §10.2) |
-| Work tile by tile with bounded memory | Tiles in the algebra: block einsums with a per-task memory budget | Designed (§8.2, §9.4); spike S20 |
+| Work tile by tile with bounded memory | Tiles in the algebra: block einsums with a per-task memory budget | Designed (§8.2, §9.4); prototyped for matrix multiplication in spike S20 |
 | Never store join rows for `QKᵀ` or for the product with `V` | The EinFold join fuses each join with its sum | Designed (§10.2) |
 | Never store the `N×N` scores *between* the two products | Fuse the scores, the softmax and the product with `V` into one task over (query tile, key tile) pairs | **Gap:** fusion across einsums, with a nonlinear step between them |
 | The online softmax: a running maximum and sum, rescaled as larger scores arrive | The partial aggregate for each output row becomes the triple (maximum, normalizer, weighted sum), combined with `m = max(m₁, m₂)`, `z = z₁·e^(m₁−m) + z₂·e^(m₂−m)`, `a = a₁·e^(m₁−m) + a₂·e^(m₂−m)` | **Gap:** partial aggregates (§8.3) cover `SUM` only. This combine is associative, so it generalizes cleanly. It is the "log-sum-exp" semiring, which ties into the semiring open question (§14). |

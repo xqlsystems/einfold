@@ -18,18 +18,20 @@ The name joins *einsum* with *fold*, functional programming's word for a reducin
 
 ## Status
 
-Design phase. There is no code yet.
+Design phase. There is no product code yet. Sixteen of twenty design spikes are done; their code and reports are in [`docs/spikes/`](docs/spikes/README.md).
 
 ## Documents
 
-- [Design](docs/design.md): the architecture, core abstractions, optimizer, and roadmap.
+- [Design](docs/design.md): the problem, principles, architecture, core abstractions, optimizer, and roadmap.
+- [Design supplement](docs/supplement.md): the details behind the design: algorithms, rule tables, correctness arguments, and spike evidence. Its sections are numbered to match the design's.
+- [Spikes](docs/spikes/README.md): short experiments that settled design questions, each with code and a report.
 - [Target demos](docs/demos.md): three end-to-end demos that double as design checks: rediscovering FlashAttention from SQL attention, NanoGPT in SQL with a recent sparsity record as a small diff, and GraphCast weather forecasts that read only the data they need.
 - [Layout convention](docs/layout-convention.md): a draft XQL Systems convention that lets Zarr datasets declare how their data is ordered and summarized (curve orderings such as Z-order, chunk visit order, written-chunk records, and per-chunk min/max), so that query engines can scan less.
 
 ## Related projects
 
 - [xarray-sql](https://github.com/alxmrs/xarray-sql): query Xarray datasets with SQL.
-- [duckdb-zarr](https://github.com/xqlsystems/duckdb-zarr): query Zarr stores from DuckDB.
+- [duckdb-zarr](https://github.com/xqlsystems/duckdb-zarr): query Zarr stores from DuckDB (`INSTALL zarr FROM community`).
 - [ddx](https://github.com/xqlsystems/ddx): automatic differentiation of SQL queries. Its gradient computations are mostly tensor contractions, which motivated einfold.
 
 ## License

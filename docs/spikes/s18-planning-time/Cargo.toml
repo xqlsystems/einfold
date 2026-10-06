@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "s18-planning-time"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike S18: egglog planning time on ddx and TPC-H sum-product regions"
+
+[dependencies]
+egglog = "=3.0.0"

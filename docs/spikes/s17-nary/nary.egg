@@ -1,0 +1,91 @@
+; SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+;
+; SPDX-License-Identifier: Apache-2.0
+
+; Spike S17: einfold's algebra with one n-ary node per sum-product region.
+;
+;   (T name)          an operand
+;   (SP ops sums)     Σ_{sums} Π ops: a multiset of operands, joined on shared
+;                     dimensions, with a set of dimensions summed out
+;   (Add a b)         pointwise sum
+;   (Scale i a)       multiply by the extent of dimension i
+;
+; A multiset has no order and a set has no nesting, so commutativity,
+; associativity and reordering of sums need no rules: every ordering of a
+; region is the same term. Choosing the order is the planner's job, which runs
+; inside extraction's cost model.
+
+(datatype Expr
+  (T String)
+  (Add Expr Expr)
+  (Scale String Expr))
+(sort Ops (MultiSet Expr))
+(sort Dims (Set String))
+(constructor SP (Ops Dims) Expr)
+
+(sort DimsBag (MultiSet Dims))
+(sort DimsOf (UnstableFn (Expr) Dims))
+(sort DimsUnion (UnstableFn (Dims Dims) Dims))
+
+; Analysis: the free dimensions of each e-class.
+; Rules that call `dims` through unstable-fn must be evaluated naively (every
+; match, every iteration), which egglog requires for function-valued lookups.
+(function dims (Expr) Dims :merge old)
+
+(ruleset analysis)
+(rule ((= e (SP ops s))
+       (= d (unstable-multiset-reduce (unstable-fn "set-union") (set-empty)
+              (unstable-multiset-map (unstable-fn "dims") ops))))
+      ((set (dims e) (set-diff d s))) :ruleset analysis :naive)
+(rule ((= e (Add a b)) (= da (dims a)) (= db (dims b)))
+      ((set (dims e) (set-union da db))) :ruleset analysis)
+(rule ((= e (Scale i a)) (= da (dims a)))
+      ((set (dims e) da)) :ruleset analysis)
+
+(ruleset algebra)
+
+; Flattening: a region nested in another is one region, provided the inner
+; summed dimensions appear nowhere else in the outer region. (Detection emits
+; regions flat; distributivity can create nested ones.)
+(rule ((= e (SP ops s))
+       (= x (SP inner t))
+       (multiset-contains ops x)
+       (= rest (multiset-remove ops x))
+       (= drest (unstable-multiset-reduce (unstable-fn "set-union") (set-empty)
+                  (unstable-multiset-map (unstable-fn "dims") rest)))
+       (= 0 (set-length (set-intersect t (set-union drest s)))))
+      ((union e (SP (multiset-sum rest inner) (set-union s t)))) :ruleset algebra :naive)
+
+; Distributivity, expanding: Σ Π (ops, b + c) = Σ Π (ops, b) + Σ Π (ops, c).
+(rule ((= e (SP ops s))
+       (= x (Add b c))
+       (multiset-contains ops x)
+       (= rest (multiset-remove ops x)))
+      ((union e (Add (SP (multiset-insert rest b) s) (SP (multiset-insert rest c) s))))
+      :ruleset algebra)
+
+; Distributivity, factoring: the reverse, for two regions with the same sums
+; that share some operands.
+(rule ((= e (Add (SP o1 s) (SP o2 s)))
+       (= common (multiset-intersection o1 o2))
+       (> (multiset-length common) 0)
+       (= r1 (multiset-subtract o1 common))
+       (= r2 (multiset-subtract o2 common)))
+      ((union e (SP (multiset-insert common (Add (SP r1 (set-empty)) (SP r2 (set-empty)))) s)))
+      :ruleset algebra)
+
+; Broadcast factoring: a summed dimension that no operand has is a scale.
+(rule ((= e (SP ops s))
+       (= d (unstable-multiset-reduce (unstable-fn "set-union") (set-empty)
+              (unstable-multiset-map (unstable-fn "dims") ops)))
+       (= missing (set-diff s d))
+       (> (set-length missing) 0)
+       (= i (set-get missing 0)))
+      ((union e (Scale i (SP ops (set-remove s i))))) :ruleset algebra :naive)
+
+; A region of one operand with nothing summed is that operand.
+(rule ((= e (SP ops s))
+       (= 1 (multiset-length ops))
+       (= 0 (set-length s))
+       (= x (multiset-pick ops)))
+      ((union e x)) :ruleset algebra)

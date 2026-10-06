@@ -4,7 +4,7 @@
 
 # einfold: fast tensor contractions for the XQL model. See docs/design.md.
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/einfold-ir",
     "crates/einfold-datafusion",

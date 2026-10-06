@@ -9,6 +9,12 @@
 //! output's coordinates. This crate finds such queries in DataFusion's plans
 //! and runs them with a fused join-and-sum operator. It is the only einfold
 //! crate that depends on a query engine.
+//!
+//! [`mod@detect`] finds them: it reads an aggregate over joins as an einsum.
+
+pub mod detect;
+
+pub use detect::{detect, Detected, OperandInput};
 
 /// The DataFusion version this crate is built against. ddx must link the same.
 pub const DATAFUSION_VERSION: &str = datafusion::DATAFUSION_VERSION;

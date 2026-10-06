@@ -1,0 +1,64 @@
+; SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+;
+; SPDX-License-Identifier: Apache-2.0
+
+; Spike S20: execution tilings as e-graph terms, for C[i,j] = Σ_k A[i,k]·B[k,j].
+;
+; Each e-class is one array *at one tiling*. Different tilings of the same
+; values are different e-classes, linked by Retile terms, so that a parent that
+; needs a tiling can always find it, and extraction never confuses two.
+;
+;   (Stored a)                 array a as stored, in its storage tiling
+;   (View a r c)               array a, tiled (r, c)
+;   (Retile x r c)             change x's tiling to (r, c)            Cubed: rechunk
+;   (BlockMM x y)              one task per block triple (i, j, k):   Cubed: blockwise
+;                              partial products, one per k block
+;   (PartialSum x s)           sum each group of s partials along k:  Cubed: partial_reduce
+;   (Partials a b ti tk tj m)  the partial products of a·b at tiles (ti, tk, tj),
+;                              with m blocks left along k
+;   (Result a b ti tj)         a·b, tiled (ti, tj)
+;   (MatMul a b)               a·b at any tiling: the query's root
+;
+; Tile sizes are numbers, so the space is infinite. A planner proposes
+; candidates for each dimension as (cand dim t) facts; the rules build every
+; combination of them.
+
+(datatype P
+  (Stored String)
+  (View String i64 i64)
+  (Retile P i64 i64)
+  (BlockMM P P)
+  (PartialSum P i64)
+  (Partials String String i64 i64 i64 i64)
+  (Result String String i64 i64)
+  (MatMul String String))
+
+(relation cand (String i64))     ; proposed tile sizes, per dimension
+(relation arrdims (String String String))   ; an array's two dimensions
+(relation split (i64))           ; proposed fan-ins for each round of partial sums
+(relation storage (String i64 i64))
+(function extent () i64 :no-merge)
+
+(ruleset tiles)
+
+; An array as stored is its view at the storage tiling; any other candidate
+; tiling is one rechunk away from storage.
+(rule ((storage a r c)) ((union (View a r c) (Stored a))) :ruleset tiles)
+(rule ((storage a r c) (arrdims a d1 d2) (cand d1 r2) (cand d2 c2)
+       (!= (+ (* r2 100000) c2) (+ (* r 100000) c)))
+      ((union (View a r2 c2) (Retile (Stored a) r2 c2))) :ruleset tiles)
+
+; Blockwise products need the shared dimension k tiled the same on both sides.
+(rule ((= root (MatMul a b)) (cand "i" ti) (cand "k" tk) (cand "j" tj) (= n (extent)))
+      ((union (Partials a b ti tk tj (/ (+ n (- tk 1)) tk))
+              (BlockMM (View a ti tk) (View b tk tj)))) :ruleset tiles)
+
+; One round of partial sums with fan-in s.
+(rule ((= x (Partials a b ti tk tj m)) (> m 1) (split s))
+      ((union (Partials a b ti tk tj (/ (+ m (- s 1)) s)) (PartialSum x s))) :ruleset tiles)
+
+; One block left along k: that is the result.
+(rule ((= x (Partials a b ti tk tj 1)))
+      ((union (Result a b ti tj) x)) :ruleset tiles)
+(rule ((= root (MatMul a b)) (= r (Result a b ti tj)))
+      ((union root r)) :ruleset tiles)

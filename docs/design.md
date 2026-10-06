@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # einfold: Fast Tensor Contractions for the XQL Model
 
-Status: draft v10. Author: Alex Merose. Last updated: 2026-10-06. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
+Status: draft v11. Author: Alex Merose. Last updated: 2026-10-06. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
 
 ## 1. Summary
 
@@ -29,11 +29,13 @@ einfold aims to be a maximally composable data system. Every part (plan readers 
 
 **Key decisions.**
 
-- The optimizer is a hybrid. Algebraic rewrites run on egglog, an engine that explores many equivalent versions of a plan at once. Contraction order runs on a specialized planner, and tilings are proposed by a planner and chosen in the e-graph (section 7.6, backed by spike S16).
+- The optimizer is a hybrid. Algebraic rewrites run on egglog, an engine that explores many equivalent versions of a plan at once. Contraction order runs on a specialized planner called from inside extraction, and tilings are proposed by a planner and chosen in the e-graph (section 7.6, backed by spikes S16–S18 and S20).
 - einfold optimizes either one plan at a time, or a whole program of plans that read each other's results, such as a ddx training step (section 7.3).
 - einfold never adds nondeterminism, and keeps exactly computed values exact. Bit-for-bit repeatable float results are a setting on hosts, and the default where einfold itself executes (section 8.6).
 - Users declare anything that changes results, such as filters, masks and approximations, in plain SQL. einfold exploits those declarations, and infers only optimizations it can prove exact, such as skipping exact zeros ("matmul pushdown", section 9.2).
 - Tiling is part of the algebra. Following Cubed, every tiled computation is a block-level einsum or a change of tiling, and plans that exceed a memory budget are rejected at planning time (sections 8.2 and 9.4).
+- Facts travel in einfold's own fact table, filled by a provider per reader, not in Arrow or Substrait metadata, which hosts drop or keep past the point where they hold (section 8.1, spikes S1–S3).
+- In SQL-to-SQL mode, einfold rewrites the host's unoptimized plan and leaves optimization to the target engine, protecting its contraction tree with materialized CTEs where the host needs them (sections 7.3 and 9.3).
 
 **Origin.** einfold grew out of [ddx](https://github.com/xqlsystems/ddx), an XQL Systems project for automatic differentiation of SQL queries. Given a query that computes a function (for example a small neural network written as joins and aggregates), ddx produces the queries that compute its gradients. Training a model this way is mostly contractions, and their slowness motivated einfold. ddx's notes on the problem ([`fast-linalg-notes.md`](https://github.com/xqlsystems/ddx/blob/main/docs/fast-linalg-notes.md)) are the starting point for this design, but everything needed is restated here. ddx benefits from einfold but does not depend on it.
 
@@ -47,12 +49,20 @@ The data lives in **Zarr**, a storage format for large N-dimensional arrays. Zar
 
 | Reader | Engine | How arrays become tables |
 |---|---|---|
-| [xarray-sql](https://github.com/alxmrs/xarray-sql) (XQL Systems) | DataFusion; also DuckDB, Polars (a DataFrame library), and any database reachable through ADBC or Flight SQL (Apache Arrow's standard database connectors) | Converts each chunk of an Xarray dataset into an Arrow record batch (Arrow is a standard in-memory columnar format) inside a DataFusion table provider |
-| [duckdb-zarr](https://github.com/xqlsystems/duckdb-zarr) (XQL Systems) | DuckDB | A native DuckDB extension. Reads Zarr v2 and v3, decodes CF metadata (section 6.2), and reads only the columns a query needs |
-| [zarr-datafusion](https://github.com/jayendra13/zarr-datafusion) | DataFusion | A Rust table provider. Infers the table schema from Zarr metadata and dictionary-encodes coordinate columns (stores each distinct value once and refers to it by number) |
+| [xarray-sql](https://github.com/alxmrs/xarray-sql) (XQL Systems) | DataFusion; also DuckDB, Polars (a DataFrame library), and any database reachable through ADBC or Flight SQL (Apache Arrow's standard database connectors) | Converts each chunk of an Xarray dataset into an Arrow record batch (Arrow is a standard in-memory columnar format) inside a DataFusion table provider. Gives each group of variables that share dimensions its own table, and reports exact row counts and dimension ranges, which DataFusion uses to skip partitions |
+| [duckdb-zarr](https://github.com/xqlsystems/duckdb-zarr) (XQL Systems) | DuckDB | A DuckDB extension, distributed as the `zarr` community extension (`INSTALL zarr FROM community`). Reads Zarr v2 and v3, gives each group of variables that share dimensions its own table, and reads only the columns a query needs. Times come back in their stored CF units (section 6.2); decoding them is deferred |
+| [zarr-datafusion](https://github.com/stratoscale-io/zarr-datafusion) | DataFusion | A Rust table provider. Infers the table schema from Zarr metadata, dictionary-encodes coordinate columns (stores each distinct value once and refers to it by number), pushes filters into its scan, and computes `SUM`, `COUNT`, `MIN`, `MAX` and `AVG` itself when they sit directly over its scan |
 | [Zax-SQL](https://docs.earthmover.io/compute/sql) | DataFusion, as a hosted service reached over the Postgres wire protocol or Flight SQL | Built by Earthmover, a company that hosts Zarr data. Reads from Icechunk, Earthmover's versioned, transactional storage layer for Zarr. Flattens each group of arrays like Xarray's `Dataset.to_dataframe()`, repeating lower-dimensional variables across missing dimensions without copying them, and turns filters on dimensions into slices before reading chunks |
 
-All of them flatten a chunked array into rows. einfold needs the structure they flatten away (section 8.1).
+All of them flatten a chunked array into rows. einfold needs the structure they flatten away (section 8.1). Spike S1 ([`spikes/s01-readers`](spikes/s01-readers/README.md)) read one small dataset through the first three and found they disagree on almost everything einfold needs to know:
+
+- how missing data appears: NULL in xarray-sql and duckdb-zarr, NaN in zarr-datafusion;
+- how a lower-dimensional variable is handled. zarr-datafusion pairs a 1-D data variable with its dimension wrongly, a silent wrong result;
+- which statistics reach the engine;
+- whether filters reach the scan;
+- how times are typed.
+
+None of them puts Zarr metadata into the Arrow schema.
 
 ### 2.2 Einsums and their relational form
 
@@ -80,7 +90,7 @@ einfold's output must run on engines we do not control. Hosts take plans in one 
 - **Apache DataFusion** (CPU). A query engine written in Rust, built on Arrow, and designed to be extended. xarray-sql, zarr-datafusion, and Zax-SQL all use it. It lets extensions add optimizer rules and physical operators, and it can write plans back out as SQL (through its `Unparser`) and as Substrait.
 - **NVIDIA GPU Query Engine (GQE)**. NVIDIA's GPU query engine, built on libcudf, the CUDA library behind NVIDIA's GPU DataFrames. It accepts Substrait, Flight SQL, and SQL, and uses DataFusion for planning.
 - **DuckDB** (CPU). An in-process analytical SQL database, like SQLite for analytics. It reads SQL, and reads Substrait through its `substrait` extension.
-- **DuckDB + [`gpudb`](https://github.com/singhpratech/duckdbgpumetaldbram)** (Apple Metal and NVIDIA CUDA). A community DuckDB extension that rewrites SQL statements before DuckDB plans them, and runs parts of them on the GPU. It does not read Substrait. It runs GROUP BY, joins, and expressions inside `SUM` on the GPU, and for some shapes it fuses join and aggregate without producing join output. It keeps `SUM` and `AVG` over floating-point columns on the CPU, because floating-point sums depend on the order of addition (section 8.6).
+- **DuckDB + [`gpudb`](https://github.com/singhpratech/duckdbgpumetaldbram)** (Apple Metal and NVIDIA CUDA). A DuckDB extension that rewrites SQL statements before DuckDB plans them, and runs parts of them on the GPU. It does not read Substrait. It runs GROUP BY, joins, and expressions inside `SUM` on the GPU, and for some shapes it fuses join and aggregate without producing join output. It never rewrites `SUM` and `AVG` over floating-point columns, because floating-point sums depend on the order of addition (section 8.6), and it leaves tables under 1 million rows to DuckDB. Its CUDA build needs an NVIDIA GPU of compute capability 7.5 or newer (Turing and later), and comes from `pip install duckdb-gpudb`; the community extension is CPU-only on Linux (spike S5).
 - **DuckDB + [Sirius](https://github.com/sirius-db/sirius)** (NVIDIA CUDA). A GPU query engine built on libcudf that plugs into DuckDB as an extension. It intercepts every query through a hook in DuckDB's optimizer, converts it to Substrait, and runs it on the GPU. Operators it does not support fall back to DuckDB on the CPU. It supports filters, projections, hash and nested-loop joins, GROUP BY, aggregation, ORDER BY, top-N, LIMIT, and common table expressions (CTEs, the SQL `WITH` clause), over integer, floating-point, decimal, string, date, and timestamp types. Its `pin_table` function keeps a table resident in GPU memory between queries. Support for StarRocks, another analytical database, is announced.
 
 Because of this, einfold must write both **Substrait and SQL**.
@@ -179,7 +189,13 @@ Notation: `dims(T)` is the set of dimensions of operand `T`. `O` is the set of o
 
 These are facts about the data model that einfold's rewrites must respect.
 
-- **Coordinates are not positions.** Dimension columns hold coordinates (latitudes, timestamps), not integer offsets. Dense execution needs a map from coordinates to positions: affine `(start, step)` for regular coordinates, a lookup table otherwise. Times decoded from CF metadata (below) are coordinates too.
+- **Coordinates are not positions.** Dimension columns hold coordinates (latitudes, timestamps), not integer offsets. Dense execution needs a map from coordinates to positions. Spike S4 ([`spikes/s04-coords`](spikes/s04-coords/README.md)) classified the coordinates of 127 ERA5 and CMIP6 stores:
+  - Almost every one-dimensional coordinate is strictly monotone, so a **sorted lookup table** is the general exact map. A range filter on coordinates becomes a range of positions by binary search.
+  - **Affine** maps (`start + k·step`) are common but must reproduce the stored values *bitwise*. Nine grids, including three of four ERA5 stores tested, are affine only up to rounding.
+  - Monthly times are affine in **calendar months**, not in their stored days.
+  - Vertical levels are never affine. Curvilinear and unstructured grids (most ocean models) have no coordinate map: their dimensions are positions, and latitude and longitude are data.
+
+  Section 8.1 lists the resulting forms. Times decoded from CF metadata (below) are coordinates too, and readers type them differently, so a map is exact only for the representation a reader emits.
 - **Joins compare coordinates exactly.** Two operands align on a shared dimension only where their coordinates are equal. Float coordinates that differ in the last bit do not join. That matches what the query says, so einfold preserves it. Dense alignment additionally requires that both operands map coordinates to positions the same way. Otherwise EinFold uses its hash algorithm.
 - **The fill value decides what a missing chunk means.** Zarr arrays are logically dense: every position has a value, and chunks that were never written read as the array's fill value. The fill value may be 0, NaN, or something else. Many climate datasets follow the CF (Climate and Forecast) metadata conventions, a standard for describing units, time encodings, scaling, and missing data. Readers that decode CF metadata may turn missing data into NULL. The fill value (what unwritten chunks return) is also distinct from a missing-data sentinel, which the `missing_value` Zarr convention declares (section 8.1). They are often equal, but need not be. Which of these a reader emits decides whether skipping a missing chunk is exact (section 8.1).
 - **SQL semantics, not Xarray semantics.** SQL `SUM` skips NULL but propagates NaN, while Xarray's `sum` skips NaN by default. Whether missing data reaches the plan as NULL or as NaN is the reader's decision. einfold preserves whatever the plan means.
@@ -246,7 +262,12 @@ einfold produces two output forms. The planner picks per subplan, based on the t
 
 - **In-engine rule.** In DataFusion, einfold runs as an optimizer rule. xarray-sql, zarr-datafusion, and ddx enable it with one call.
 - **Plan-to-plan service.** Given a Substrait plan and a target profile, return a Substrait plan. This is how GQE is fed.
-- **SQL-to-SQL rewrite.** Given SQL, a dialect, and a target profile, return SQL. This is how DuckDB, `gpudb`, and Sirius are fed, how duckdb-zarr users would use einfold, and how a client can use einfold with Zax-SQL today.
+- **SQL-to-SQL rewrite.** Given SQL, a dialect, and a target profile, return SQL. This is how DuckDB, `gpudb`, and Sirius are fed, how duckdb-zarr users would use einfold, and how a client can use einfold with Zax-SQL today. einfold parses the SQL into DataFusion's *unoptimized* logical plan, applies only its own rewrites, and writes SQL with DataFusion's `Unparser`. The target engine then optimizes the result itself. Spike S7 ([`spikes/s07-unparser`](spikes/s07-unparser/README.md)) found this the only safe order:
+  - Unparsed from unoptimized plans, all 34 queries tested (12 of einfold's shapes and all of TPC-H) ran in DuckDB with correct results.
+  - Unparsed from DataFusion's *optimized* plans, 31 were rejected by DuckDB, and TPC-H Q22 silently returned a wrong answer. The Unparser had dropped two of its predicates.
+  - Everything einfold unparses is therefore checked, by re-parsing and comparing plans, and by the shared equivalence suite run through each dialect (section 11).
+  - The DuckDB dialect must be able to write `MATERIALIZED` CTEs (section 9.3), which the Unparser does not do today.
+  - Result types can differ between engines even for correct SQL. For example, DuckDB's `AVG` over a `DECIMAL` returns `DOUBLE`, where DataFusion's returns a `DECIMAL`. To keep a result's shape unchanged (principle 2), einfold casts wherever the source and target engines type an expression differently.
 - **Program mode.** Given a batch of named plans, where some plans read the results of others by name, optimize them together and return the batch. A ddx `BackwardProgram` has exactly this shape: a list of steps, each of which may read earlier steps. An optimizer rule sees one plan at a time, so only program mode can share work across steps (section 9.5) and cache plans for a whole program (section 8.5). Program mode works with any of the output forms above.
 
 ### 7.4 Target profiles
@@ -297,16 +318,25 @@ The logical optimizer's algebra runs on **egglog** (Zhang et al., 2023), an open
 - With associativity left to egglog, the e-graph grew about 3.7× per extra matrix in a chain: 1.6 million tuples and 24 s for 11 matrices. At 12 it hit the size limit before finishing, and extraction returned a plan 800,000× worse than the hybrid's. The hybrid matched the full search wherever that search finished.
 - Every result was identical across repeated runs and across 1 and 4 threads.
 
-**Design rules from the spike.**
+Three follow-up spikes tested the hybrid at scale:
+
+- **N-ary nodes** (S17, [`spikes/s17-nary`](spikes/s17-nary/README.md)). With each sum-product region as one node over a multiset of operands, a pure region saturates in one iteration, and the e-graph grows linearly: about 4 tuples per operand, up to 1000 operands drawn from the Einsum Benchmark's instance families. The binary form stopped saturating at 16 to 26 operands. Distributivity is still exponential: `k` operands that are sums give `2^k` expansions, and saturation timed out at `k = 8`.
+- **Planning time** (S18, [`spikes/s18-planning-time`](spikes/s18-planning-time/README.md)). On TPC-H's join-and-`SUM` queries and on ddx's training einsums, egglog plans in 0.5–1.2 ms, starting from an e-graph that already holds the rules. That is less than DataFusion's or DuckDB's own planning time for the same queries (0.7–4.6 ms). Parsing the rules costs about 1.5 ms, so a session loads them once and clones the e-graph per query.
+- **Tiles** (S20, [`spikes/s20-tiles`](spikes/s20-tiles/README.md)). Retiling, blockwise products and partial-sum trees, encoded as terms with Cubed's memory model in the cost function, reproduce Cubed's matrix-multiplication plans exactly, and never extract a plan over the memory budget (section 9.4).
+
+**Design rules from the spikes.**
 
 1. **No associativity rules over products.** Contraction order belongs to the planner.
-2. **One n-ary node per sum-product region.** Even without associativity, commutativity and reordering of nested sums grew the e-graph about 2.2× per operand. A region should be a single node holding a multiset of operands and a set of summed dimensions. egglog has multisets built in, and its own examples use them in place of associativity and commutativity rules.
-3. **Bounded, deterministic schedules.** Use a fixed rule order with iteration and size limits, and no random sampling of rule matches. If a limit is hit, keep the best plan found by the rules that did finish. Never rely on an unfinished associativity search.
-4. **Planners and rules share tests.** In the spike, the hand-written planner first dropped a sum over a dimension that no operand has, a case the egglog rule handled correctly. The equivalence tests of section 11 run on both.
+2. **One n-ary node per sum-product region.** Even without associativity, commutativity and reordering of nested sums grew the e-graph about 2.2× per operand (S16). A region is a single node, `SP(ops, sums)`, holding a multiset of operands and a set of summed dimensions, built on egglog's multisets. S17 confirmed linear growth. Rules that compute over a multiset's elements must run in egglog's naive mode (rematching everything each iteration), which is cheap only while iterations are few.
+3. **The planner runs inside extraction.** egglog's cost model receives each `SP` node's operands, and runs the contraction planner on them, so extraction compares algebraic alternatives by their *planned* cost (S17). With a greedy planner that matches opt_einsum's, this takes milliseconds up to about 100 operands, and seconds at 1000. Large regions need an incremental planner and a cache of planned costs.
+4. **Guard distributivity.** Expand an operand that is a sum only when a sparsity fact says the expansion can pay (S16's sparse case), and cap the number of such operands per region.
+5. **Bounded, deterministic schedules.** Use a fixed rule order with iteration and size limits, and no random sampling of rule matches. If a limit is hit, keep the best plan found by the rules that did finish. Never rely on an unfinished associativity search. S16 to S18 found identical results across repeated runs and thread counts.
+6. **Planners and rules share tests.** In S16, the hand-written planner first dropped a sum over a dimension that no operand has, a case the egglog rule handled correctly. The equivalence tests of section 11 run on both.
+7. **Load rules once per session.** Clone the loaded e-graph for each query (S18).
 
 **Out of scope, and future work.** Two uses of e-graphs stay in ddx: simplifying the scalar derivative expressions inside projections (`tanh`, `exp`, `CASE`, ddx's NULL handling), which are not sum-products, and choices specific to automatic differentiation, such as saving a region versus recomputing it, or where to checkpoint a deep expression. After milestone M1 (section 16), einfold's e-graph could accept non-einsum regions as opaque nodes whose costs the caller supplies. ddx could then share einfold's e-graph instead of building a second one.
 
-**Risks.** egglog 3.0 is young (released August 2026), so egg is the fallback. RisingWave, a company that builds a streaming SQL database, found that a SQL optimizer built on egg planned a 6-table join in 39 ms, where DuckDB took 5 ms, and that cost functions were hard to debug. For einfold, plan caching (section 8.5) absorbs repeated planning, but one-off queries pay the cost. An earlier egg-based optimizer for DataFusion's expressions, datafusion-tokomak, has been inactive since 2022, for reasons not yet investigated.
+**Risks.** egglog 3.0 is young (released August 2026), so egg is the fallback. RisingWave, a company that builds a streaming SQL database, found that a SQL optimizer built on egg planned a 6-table join in 39 ms, where DuckDB took 5 ms, and that cost functions were hard to debug. einfold's e-graphs are much smaller than a SQL optimizer's, since only sum-product regions enter them: S18 measured about 1 ms per query once the rules are loaded. Plan caching (section 8.5) absorbs repeated planning. An earlier egg-based optimizer for DataFusion's expressions, datafusion-tokomak, has been inactive since 2022, for reasons not yet investigated.
 
 ## 8. Core abstractions
 
@@ -322,7 +352,7 @@ A **fact** is something known about an operand, tagged with how it is known. Eve
 |---|---|---|
 | Dimensions of each variable | `w` depends only on `lat` | Variable separation (9.1) |
 | Extents | `lat` has 721 positions | Contraction-tree cost (9.3), memory (9.4) |
-| Coordinate map | `lat = 90 − 0.25·position` | Dense alignment (10.2) |
+| Coordinate map | `lat = 90 − 0.25·position`, or a sorted table of latitudes | Dense alignment (10.2), slicing and masks (9.1) |
 | Layout | row order within a chunk | Dense kernels and streaming (10.2, 10.3) |
 | Tiling | chunk shape, shard shape, chunk grid | Tiling (9.4), reduction at the source (10.5) |
 | Support | which chunks exist; which rows exist | Pruning (9.2), block-sparse algorithm (10.2) |
@@ -351,9 +381,9 @@ A **fact** is something known about an operand, tagged with how it is known. Eve
 - **Zarr metadata.** Shape, chunk grid, shards, dimension names (v3's `dimension_names` field, or v2's `_ARRAY_DIMENSIONS` attribute), memory order, fill value, and which chunks exist.
 - **Zarr conventions.** A Zarr convention is a published, named set of metadata attributes that gives arrays extra meaning without changing how they are stored. The `spatial` convention gives affine maps from positions to X/Y coordinates. The `missing_value` convention names the value that marks missing data. XQL Systems' proposed `layout:` convention ([`layout-convention.md`](layout-convention.md)) gives curve orderings, chunk visit order, records of which chunks were written, and per-chunk summaries, each marked exact or not. It is useful to readers and engines without einfold.
 - **The reader.** How it flattens: which variables depend on which dimensions, whether it dictionary-encodes a column and how, and how it emits fill values and missing data.
-- **Table statistics.** Readers already pass Zarr dimension bounds to the engine as table statistics, which engines use to skip data and estimate costs. In DataFusion these are per-column `min`, `max`, and `distinct_count` in its `Statistics` structure. Statistics alone cannot prove density or functional dependencies, so they yield Estimates unless a reader marks them Exact.
-- **SQL constraints.** A declared primary key or unique constraint says that a table's dimensions identify its rows. `NOT NULL` says a dimension is never NULL. A `CHECK` constraint such as `CHECK (i >= j)` describes where rows can exist. Like a primary key in any database, these change no results; they are Exact facts the optimizer may use. Whether each host exposes them to einfold (DataFusion records primary-key and unique constraints without enforcing them; DuckDB supports `CHECK`) is part of spike S1.
-- **Per-chunk statistics.** Databases keep minimum, maximum and null counts per block of data: Parquet (a columnar file format) per row group, and Iceberg (a table format for data lakes) per data file. Engines such as DataFusion use them to skip blocks a filter rules out. Readers report the same statistics per Zarr chunk, from `layout:summaries` where present, so engines skip chunks without einfold's help. A zero count per chunk, next to the null count, makes "this chunk is all zeros" provable.
+- **Table statistics.** Readers can pass Zarr dimension bounds to the engine as table statistics, which engines use to skip data and estimate costs. Today only xarray-sql does: exact row counts, and exact minimum, maximum and null count for dimension columns, none for data variables (spike S1). In DataFusion these are per-column `min`, `max`, and `distinct_count` in its `Statistics` structure. Statistics alone cannot prove density or functional dependencies, so they yield Estimates unless a reader marks them Exact.
+- **SQL constraints.** A declared primary key or unique constraint says that a table's dimensions identify its rows. `NOT NULL` says a dimension is never NULL. A `CHECK` constraint such as `CHECK (i >= j)` describes where rows can exist. Like a primary key in any database, these change no results; they are Exact facts the optimizer may use. DataFusion records primary-key and unique constraints without enforcing them, and DuckDB supports `CHECK`. No reader declares its dimension columns as a key today, and only zarr-datafusion marks coordinates `NOT NULL` (spike S1). So for Zarr data these facts come from the providers, and declared constraints matter mostly for tables users create.
+- **Per-chunk statistics.** Databases keep minimum, maximum and null counts per block of data: Parquet (a columnar file format) per row group, and Iceberg (a table format for data lakes) per data file. Engines such as DataFusion use them to skip blocks a filter rules out. Readers should report the same statistics per Zarr chunk, from `layout:summaries` where present, so engines skip chunks without einfold's help. None of the three readers tested does yet for data variables (spike S1). A zero count per chunk, next to the null count, makes "this chunk is all zeros" provable.
 - **Degree statistics.** `D(X | Y)` is the maximum number of rows for any one value of `Y`. For dense arrays these follow from extents. Missing chunks give them at chunk granularity. Sparse tables need the reader to compute them. DataFusion's column statistics have no field for them.
 - **The user.** Declared facts.
 - **Producers of plans, such as ddx.** ddx proves facts that einfold's dense algorithms need. Every ddx program checks that each input table's dimensions identify its rows, and that each derivative table has one row per key; [ddx PR #120](https://github.com/xqlsystems/ddx/pull/120) records these as a `Verified` set that callers keep across runs. ddx also knows which columns are dimensions and which are values, and the keys of every step in its program. ddx hands these over as Exact facts on its steps, through the same carrier as reader facts.
@@ -361,7 +391,29 @@ A **fact** is something known about an operand, tagged with how it is known. Eve
 
 **Inside the optimizer,** facts are egglog analyses: Datalog rules derive them, and egglog's merge functions combine them, keeping the most precise value (section 7.6).
 
-**How facts reach the plan is not settled.** Spikes S1–S3 (section 13) decide the carrier: Arrow field metadata (key-value pairs attached to a column's schema), a Substrait extension attached to the read, or a side channel.
+**How facts reach the plan: a side channel.** Spikes S1–S3 compared the candidate carriers: Arrow field metadata (key-value pairs attached to a column's schema), a Substrait extension attached to the read, and a side channel.
+
+- *No reader writes facts into Arrow metadata today* (S1).
+- *Arrow metadata does not survive the trip* (S2, [`spikes/s02-carrier`](spikes/s02-carrier/README.md)). DuckDB drops all field and schema metadata at its Arrow boundary. Substrait's schema has no metadata field, so a plan carries none: metadata seemed to survive a round trip only because the consumer looked the table up again in its own catalog.
+- *Inside DataFusion, metadata is kept by column name, not by meaning.* It survives filters, limits, joins and casts, which change the rows or values a fact describes. Where a union's inputs disagree, the left input's metadata silently wins.
+
+So facts travel in einfold's own **fact table**, keyed by table and column, and filled by **per-reader fact providers**. xarray-sql's provider reads its Python context, duckdb-zarr's its metadata table functions (`read_zarr_metadata()`, `read_zarr_groups()`), and zarr-datafusion's its extended `DESCRIBE`. Arrow metadata can still be one *input* to a provider, read at the scan, and nowhere above it. For the einsum form, facts that the host needs at run time travel as fields of the `Einsum` relation itself.
+
+Two rules follow:
+
+- **A fact names the plan node where it holds.** A fact about a column's meaning (its dimensions, layout or coordinate map) holds above a filter, sort or rename. A fact about its rows or values (density, zero count, minimum and maximum, "every chunk written") does not hold above any operator that changes the rows or values. Facts are re-derived above such operators, and at every union, never inherited by name.
+- **How a reader emits missing data is itself a per-reader fact.** The same store reads as NULL through one reader and NaN through another (S1). The fill-value table below needs to know which.
+
+**Forms of coordinate map** (spike S4). A provider tries these in order, and records the first that reproduces the stored values exactly:
+
+| Form | Exact when | Size |
+|---|---|---|
+| Affine: start, step, stored type | `cast(start + k·step)` equals every stored value, bitwise | constant |
+| Calendar: start month, calendar, day rule | times are consecutive calendar months | constant |
+| Sorted table of stored values | always, for a strictly monotone coordinate | one value per position |
+| None | the coordinate is not monotone, or is 2-D or per-cell | — |
+
+A grid that is affine only up to rounding gets an Estimate-level affine fact for costing, and its sorted table as the Exact map.
 
 **Support and the fill value.** Support, meaning which coordinate tuples have rows, is where sparsity reasoning and cardinality estimation (a database optimizer's estimate of how many rows an operator produces) meet. For a product, the support of the result is the join of the supports of the factors. For a sum over a dimension, it is the projection that drops that dimension (Deeds et al., §6.1). Pruning (9.2), block-sparse execution (10.2), and density measurement (10.4) all reason about support. A missing Zarr chunk may be skipped only as far as its fill value allows:
 
@@ -421,6 +473,14 @@ The order in which rows arrive is a layout: which dimensions vary slowest and wh
 
 Within a Zarr chunk, row order comes from the chunk's memory order (section 6.2). CuTe's `coalesce` operation tells whether a set of dimensions forms one contiguous run in memory. That decides whether a dense kernel can read a buffer directly, and whether a matrix-multiply call must treat an input as transposed.
 
+**A layout is two facts: the coordinate map and the row order.** Spike S3 ([`spikes/s02-carrier`](spikes/s02-carrier/README.md)) ran the layout rules of section 13.5 on a 1000 × 1000 array in DataFusion and DuckDB.
+
+- *The rules correctly predicted which coordinates every operator outputs, on both hosts.* That part of a layout, the map from coordinates, propagates as section 13.5 says.
+- *Row order did not follow the rules, and the two hosts fail in opposite ways.* DataFusion knows a declared order: it tracks it through filters, projections and unions, and answers `ORDER BY` with a merge rather than a sort. But without `ORDER BY` it spreads rows across partitions, so they arrive scrambled. DuckDB keeps insertion order through every operator except an aggregate, but its planner doesn't know the order, and always sorts for `ORDER BY`.
+- *Neither keeps order through a hash aggregate,* which is what a contraction node in the relational form is.
+
+So row order is a fact only where a host promises it. On DataFusion, einfold asks for the order it needs: the operator declares a required input ordering, which costs a merge, not a sort, when the scan's order is declared. On DuckDB, einfold relies on order only if it adds the `ORDER BY` and pays for the sort. The output order of a contraction node is whatever EinFold emits (section 10.3), which only the einsum form can promise.
+
 ### 8.5 Structure and values
 
 Most of what einfold computes depends only on **structure**: the einsum, the extents, the tilings, and the support. Only the final arithmetic depends on **values**. Separating the two lets structure be computed once and reused:
@@ -463,8 +523,14 @@ einfold follows JAX's split.
 
 - The reference executor (`EinsumExec`) and the `Einsum` relation's specification are deterministic by default, and the conformance suite checks that repeated runs give identical bits. einfold controls these, and conformance testing needs repeatability, much as JAX on TPU is deterministic in practice.
 - Ways to accumulate `value` deterministically, in order of preference:
-  1. **An order-independent accumulator.** Reproducible summation gives the same bits in any order. It works either by binning values by exponent, as the ReproBLAS library (Demmel and Nguyen) does, or with an exact "superaccumulator" wide enough to hold any sum without rounding. Results are then deterministic, parallel, and accurate, and a rewrite that only reorders sums gives the original plan's exact bits. Cost: slower than a plain sum (spike S8).
-  2. **A fixed combine order** (section 8.3). Deterministic on one host but not across hosts, harder to make fast on GPU, and only as accurate as its order.
+  1. **An order-independent accumulator.** Reproducible summation gives the same bits in any order. It works either by binning values by exponent, as the ReproBLAS library (Demmel and Nguyen) does, or with an exact "superaccumulator" wide enough to hold any sum without rounding. Results are then deterministic, parallel, and accurate, and a rewrite that only reorders sums gives the original plan's exact bits. Spike S8 ([`spikes/s08-deterministic-sums`](spikes/s08-deterministic-sums/README.md)) measured the cost:
+     - A **binned sum** gave identical bits under every order, thread count, and GPU atomic schedule tried, and on the test data equaled the correctly rounded sum.
+     - On CPU it cost 3× a parallel plain sum for one long sum, and 4.4× for grouped sums, with 24 bytes of state per group. On a GTX 1080 Ti it cost 3.5×.
+     - It needs the largest absolute value in advance: from per-chunk statistics (section 8.1), or a second pass.
+     - A **superaccumulator** suits one large parallel sum (2× a parallel plain sum), but its 576-byte state makes it 11× slower for grouped sums, and 83× slower on GPU.
+
+     einfold's executors use the binned sum.
+  2. **A fixed combine order** (section 8.3). Free on CPU and GPU (S8), but deterministic only for a fixed input order, which hosts don't guarantee through parallel scans (spike S3). Useful inside einfold's own executor, and only as accurate as its order.
   3. **Fixed-point values** (SQL `DECIMAL` or scaled integers) where the value range allows. Exact, and `gpudb` already sums these on the GPU. Costly to prove safe.
 - Users who want maximum speed in the reference executor, for example when training models, can turn determinism off.
 
@@ -474,7 +540,7 @@ einfold follows JAX's split.
 |---|---|---|
 | `fast` | the host's default | may use reduced-precision formats where the host offers them, such as bfloat16 or TF32 (NVIDIA's reduced-precision format for matrix multiplication) |
 | `default` | 64-bit for 32-bit and 64-bit floats | full input precision |
-| `highest` | an exact or reproducible accumulator | full input precision |
+| `highest` | a reproducible (binned) accumulator; exact where the type allows | full input precision |
 
 `default` follows SQL's convention of 64-bit sums, and Gustavson's advice to accumulate in higher precision and round once (section 10.2). Precision and determinism are set independently, except that `highest` is also deterministic.
 
@@ -515,7 +581,7 @@ The second shape is a sum of einsums, which ddx produces when a table is read in
 2. **Separate variables.** A dataset table holds many variables, each repeated across the dimensions it lacks. Split each referenced variable into its own operand over its own dimensions, using the Exact fact "this variable depends only on these dimensions" (section 8.1). That fact can come from three places:
    - the reader's dimension metadata;
    - a dimension with stride 0 in the variable's layout, meaning the value does not change along it;
-   - an Arrow dictionary-encoded column whose dictionary the reader built from the variable's coordinates. In that case the dictionary's list of distinct values *is* the variable at its true shape, so the operand is read without scanning the repeated column. zarr-datafusion already dictionary-encodes coordinates this way.
+   - an Arrow dictionary-encoded column whose dictionary the reader built from the variable's coordinates. In that case the dictionary's list of distinct values *is* the variable at its true shape, so the operand is read without scanning the repeated column. zarr-datafusion already dictionary-encodes coordinates this way, with 16-bit keys. Its dictionaries hold coordinates, though, not lower-dimensional data variables, which it mishandles (spike S1). So this source is usable only for coordinates, and only with the provider's Exact confirmation.
 
    *Example.* In `SUM(w*x) GROUP BY time` over a dataset table `T(time, lat, lon, w, x)`, the weight `w` depends only on `lat`, so it becomes an operand over `{lat}`. Eager aggregation (section 10.1) then computes `Σ_lat w(lat) · (Σ_lon x(time, lat, lon))`, which does `n_lon` times fewer multiplications. A term over repeated values alone collapses entirely, since a value that does not depend on `i` gives `Σᵢ B = nᵢ · B` (Deeds et al., §4.4). A normalizer `Σ_{time,lat,lon} w(lat)` becomes `n_time · n_lon · Σ_lat w(lat)`.
 
@@ -528,7 +594,7 @@ The second shape is a sum of einsums, which ddx produces when a table is read in
 6. **Classify filters.**
    - A range or equality on a dimension column stays with its operand as a slice. An equality to a constant removes that dimension.
    - A predicate on a value column stays with its operand. It shrinks the operand's support, and the contraction is still an einsum.
-   - A predicate that relates *dimension* columns of different operands and is not an equality, such as a causal mask `q.t >= k.t` or a sliding window `abs(q.t - k.t) < w`, becomes a **mask operand**: the set of allowed coordinate pairs, joined in like any other operand. That is exactly what the SQL predicate means, including which groups exist. A mask computable from coordinates has a known support, so each tile is Exact-known to be fully allowed, fully masked, or partly masked. Turning a predicate on coordinates into one on positions needs an Exact fact that the coordinate map is monotonic, which Zarr's regular coordinates provide. A stored table of allowed pairs, such as a graph's edges, is a mask too. In the e-graph a mask is one more leaf, so every rewrite applies to it. Users never write mask operands; they write SQL predicates, and the mask is einfold's internal representation (principle 8).
+   - A predicate that relates *dimension* columns of different operands and is not an equality, such as a causal mask `q.t >= k.t` or a sliding window `abs(q.t - k.t) < w`, becomes a **mask operand**: the set of allowed coordinate pairs, joined in like any other operand. That is exactly what the SQL predicate means, including which groups exist. A mask computable from coordinates has a known support, so each tile is Exact-known to be fully allowed, fully masked, or partly masked. Turning a predicate on coordinates into one on positions needs an Exact fact that the coordinate map is monotonic, which nearly all one-dimensional coordinates satisfy (spike S4). A stored table of allowed pairs, such as a graph's edges, is a mask too. In the e-graph a mask is one more leaf, so every rewrite applies to it. Users never write mask operands; they write SQL predicates, and the mask is einfold's internal representation (principle 8).
    - A predicate that compares *values* of different operands, other than through equality on dimensions, does not match. Detection stops.
 7. **Map group keys.** Each group key must be a column in some dimension class. The classes it names form `O`.
 8. **Check the semiring.** A semiring is the pair of operations an einsum uses for "add" and "multiply". `SUM` over `*` is the default. `MIN` or `MAX` over `+` (tropical semirings, used for shortest paths) are recognized but left unmatched until section 14 decides on semirings.
@@ -598,7 +664,14 @@ The order of contractions matters as much as join order does. For `ij,jk,k->i`, 
 
 **Why einfold plans inside the engine.** Blacher et al. chose contraction orders outside the database. They note the trade-off: an outside planner knows the contraction structure, while the engine knows sizes and sparsity. They conclude that for sparse tensors, the order is better chosen by the database's optimizer. einfold's in-engine mode gets both: the structure from detection and the facts from the host. In SQL-to-SQL mode, einfold relies on reader facts and supplied statistics instead.
 
-**Protecting the plan from the host optimizer.** A decomposed einsum is a deep tree of small queries, and some host optimizers cost more than they save on it. Blacher et al. measured a query encoding a satisfiability problem with 952 clauses. HyPer, a fast research database from TU Munich, spent 0.87 s planning it and 0.08 s executing it. DuckDB had not finished planning after five hours. With its optimizer disabled, DuckDB planned in 0.20 s and ran in 0.97 s. So the output must stop the host from flattening or reordering the tree again. The target profile picks the mechanism: CTEs that the host must materialize, turning off specific optimizer passes, or, in DataFusion, handing over a physical plan directly. Spike S10 checks which mechanisms each host honors.
+**Protecting the plan from the host optimizer.** A decomposed einsum is a deep tree of small queries, and some host optimizers cost more than they save on it. Blacher et al. measured a query encoding a satisfiability problem with 952 clauses. HyPer, a fast research database from TU Munich, spent 0.87 s planning it and 0.08 s executing it. DuckDB had not finished planning after five hours. With its optimizer disabled, DuckDB planned in 0.20 s and ran in 0.97 s. So the output must stop the host from flattening or reordering the tree again, and from spending minutes planning it. The target profile picks the mechanism.
+
+Spike S10 ([`spikes/s10-plan-protection`](spikes/s10-plan-protection/README.md)) reproduced the satisfiability example on current hosts, with banded 3-SAT formulas of 91 and 218 clauses:
+
+- *Both hosts keep a contraction order written as CTEs.* Every decomposed plan kept one aggregation per step, because neither optimizer moves joins across a `GROUP BY`. The danger is planning cost, not reordering.
+- *DuckDB plans inlined CTEs very slowly:* 56 s at 91 steps, and over 3 minutes at 218. Written `AS MATERIALIZED`, the same CTEs planned in 0.09–0.39 s and ran in 0.06–0.22 s. So DuckDB's mechanism is `MATERIALIZED` CTEs.
+- *DataFusion plans plain CTEs quickly* (0.41 s at 218 steps). Its mechanism is plain CTEs, or a physical plan in the in-engine mode.
+- *The flat form fails on both.* One query joining every operand ran past 3 minutes at 218 clauses on both hosts, and DuckDB spilled 16 GB doing it. einfold never emits the flat form for more than a few operands.
 
 **Prior work.** Blacher et al.; opt_einsum; Pfeifer et al.; cotengra; rechunker (IO model).
 
@@ -635,7 +708,19 @@ To change tilings, einfold borrows from rechunker, a tool from the Pangeo commun
 | Fusing operations, with limits on how many arrays and blocks one task reads | Merging adjacent contraction-tree nodes that share a tiling into one task, under the same kind of limits |
 | Reading a task's chunks all at once, or one at a time | Hash versus streaming execution (sections 8.4 and 10.2) |
 
-Tile sizes are numbers, so the space of tilings is infinite. As with contraction order, the planner above proposes a few candidates (the storage chunk sizes, their least common multiples, rechunker's consolidated sizes), and the e-graph holds them as alternatives. Extraction then chooses among them, with the memory budget as a hard limit. Spike S20 tests this.
+Tile sizes are numbers, so the space of tilings is infinite. As with contraction order, the planner above proposes a few candidates (the storage chunk sizes, their least common multiples, rechunker's consolidated sizes), and the e-graph holds them as alternatives. Extraction then chooses among them, with the memory budget as a hard limit.
+
+**Evidence** (spike S20, [`spikes/s20-tiles`](spikes/s20-tiles/README.md)). Matrix multiplication of two 20,000 × 20,000 matrices, with retiling, blockwise products and rounds of partial sums as egglog terms, and Cubed's projected-memory formulas in the cost model:
+
+- **Reproduces Cubed.** Restricted to the storage tilings, extraction returned Cubed's own plan: the same operations, task counts and projected memory, to the megabyte.
+- **The budget is a hard limit.** In 200 random configurations, no extracted plan exceeded its budget, and every extracted cost equaled the brute-force minimum over the same space. Where no plan fits (512 MB storage chunks under a 1 GB budget), extraction says so at planning time. Cubed builds a plan that fails when run.
+- **Finds cheaper plans.** With proposed tile sizes, extraction found plans 40–50% cheaper than Cubed's, mostly by rechunking the inputs once rather than writing one full-size partial product per block of `k`.
+- **Cheap.** At most 12,000 tuples and 16 ms per case.
+
+Two design rules come from it:
+
+- **A tiling is part of an e-class's identity.** Each e-class is one array *at one tiling*, and `Retile` terms link the tilings. If different tilings of the same values shared an e-class, extraction could choose a child tiling its parent cannot use. This is the "physical property" pattern of Cascades-style optimizers (which plan for properties such as sort order alongside the plan itself), written as terms.
+- **The proposer decides what is reachable.** Every extracted plan used only proposed sizes. Proposing too few sizes is the main way this design can miss a good plan.
 
 **Why it fits XQL.** When `t(s)` matches the Zarr chunk size, partitions map one-to-one onto chunks. Each partition reads its own chunks, and xarray-sql's partition pruning applies.
 
@@ -742,7 +827,12 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 
 - **Dense.** When both operands are dense over `S` and their free dimensions, with Exact coordinate maps that agree and unique coordinate tuples, skip hashing. View each tile through its layout and call a GEMM, batched over `Kₛ`. The layout's strides decide whether an input must be treated as transposed (section 8.4).
 - **Block-sparse.** When an operand's support is known by tile (for example, from missing Zarr chunks or a mask operand), run Gustavson's algorithm over tiles instead of rows. Hash the present tiles of `B` by their tile coordinates along `S`. For each present tile of `A`, call a dense GEMM against each matching tile of `B`. A tile has one of three states: absent (skipped), fully present (a dense kernel), or partly present (a masked kernel, which applies the mask within the tile). For a causal mask, the tiles above the diagonal are absent, those below are fully present, and only the diagonal tiles need masking, which is how FlashAttention tiles causal attention (Dao et al., 2022). Skipped tiles still contribute their partial aggregate, as the fill-value rules in section 8.1 require.
-- **Choosing.** Dense when both sides are dense with Exact extents. Block-sparse when support is known by tile. Otherwise hash. Thresholds come from spike S11, and can change while running (section 10.4).
+- **Choosing.** Dense when both sides are dense with Exact extents. Block-sparse when support is known by tile. Otherwise hash. Spike S11 ([`spikes/s11-thresholds`](spikes/s11-thresholds/README.md)) measured the thresholds on CPU, for matrix products at uniform density:
+  - dense GEMM overtakes Gustavson's algorithm at about **20% density**, at every size tested;
+  - Gustavson's array-indexed algorithm is 2.5–17× faster than a hash join followed by a hash aggregate, so the hash-map variant is only a fallback for free dimensions without a known extent;
+  - knowing which output groups exist costs the dense algorithm a second, 0/1 GEMM, about 2×. An Exact fact that both inputs are complete removes it.
+
+  Thresholds can change while running (section 10.4).
 
 #### Correctness
 
@@ -769,7 +859,7 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 - **Measuring is free.** EinFold knows exactly how many groups each intermediate has, and facts give the extents of its kept dimensions. So the density of each intermediate is a Measured fact before the next node runs (section 8.1).
 - **Policy** (Staudt et al.):
   - track the average density of the tensors still to be contracted;
-  - switch from dense to sparse when it falls below a threshold (they found 5% empirically; einfold's comes from spike S11);
+  - switch from dense to sparse when it falls below a threshold. They found 5% empirically. Spike S11 puts einfold's crossover near 20% against Gustavson's algorithm, and near 5–10% against a hash join and aggregate, which matches theirs;
   - measure only before expensive contractions, and stop measuring once density exceeds 95%.
 - **Beyond the paper.** Staudt et al. only switch from dense to sparse. EinFold has both algorithms, so einfold can switch both ways, and can use the block-sparse algorithm for nodes that mix dense and sparse operands. Their other stated limitation is a fixed contraction order. With Measured facts and Bounds, the planner can re-plan the rest of the tree while it runs.
 - **Scope.** Inside an `EinsumExec` (or a host's `Einsum` relation) that runs a whole contraction tree. The relational form is unaffected, since hosts already run it as a sparse form.
@@ -778,7 +868,10 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 ### 10.5 Reduction at the source
 
 - **Idea.** When a dimension is summed within a single operand, the reader can compute each storage tile's partial aggregate with a dense kernel on the decoded chunk, before the chunk is flattened into rows. The engine then only combines partial aggregates. This follows directly from principle 6.
-- **Mechanism.** Engines already split aggregation into a partial phase per partition and a final merge. In DataFusion, `AggregateExec` runs in `Partial` and `Final` modes. A reader whose target profile says it accepts aggregate pushdown replaces "partial aggregate over scan" with a scan that emits partial aggregates, one per chunk. This is the same kind of pushdown as the projection pushdown (reading only needed columns) and filter pushdown (reading only needed rows) that xarray-sql, zarr-datafusion, and duckdb-zarr already do.
+- **Mechanism.** Engines already split aggregation into a partial phase per partition and a final merge. Spike S12 ([`spikes/s12-aggregate-pushdown`](spikes/s12-aggregate-pushdown/README.md)) worked out the route on each host:
+  - *DataFusion.* `AggregateExec` runs in `Partial` and then `FinalPartitioned` mode, with a hash repartition between them. `TableProvider` has no aggregate hook, so the reader installs a physical optimizer rule that replaces only the `Partial` aggregate and its scan with a scan that emits partial aggregates, one per chunk. DataFusion's repartition and final phase stay, with their parallelism and spilling. The scan emits DataFusion's partial-state schema, which each aggregate function defines through its `state_fields`. For example, `SUM(double)` is one nullable `[sum]`, whose NULL is exactly the `matched` flag of section 8.3, and `AVG` is `[count, sum]`.
+  - *DuckDB.* Its extension C API, which duckdb-zarr uses through Rust, offers projection pushdown only: no filters and no aggregates. So einfold's SQL-to-SQL mode rewrites the statement to call a reader-provided aggregating table function, such as a `read_zarr_reduce`, which returns plain partial columns that ordinary SQL then combines. This is the relational form of partial aggregates (section 8.3), and it works on any engine that can call a table function.
+- **Precedent.** zarr-datafusion's `ZarrAggregateExec` already computes `SUM`, `COUNT`, `MIN`, `MAX` and `AVG` itself when they sit directly over its scan. It replaces the whole aggregate, though, not only its partial phase. It folds rows rather than whole chunks. And it accumulates in `f64`, which loses exactness for integers beyond 2⁵³ and breaks the exactness invariant (section 8.6). einfold's version should replace the partial phase, reduce chunks with dense kernels, and accumulate integers exactly.
 - **Scope.** Contractions local to one operand, including those that variable separation (section 9.1) isolates. Also products of variables in the same Zarr group that share a chunk grid: an element-wise product plus a private sum is local to each chunk.
 - **Correctness.** Partial aggregates carry `matched` and `value` (section 8.3) and are combined in chunk order.
 - **Why it matters.** For single-array reductions (time means, spatial averages, applying regridding weights), this attacks problem 3 at its source: the data is reduced before it is ever flattened.
@@ -810,7 +903,7 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 |---|---|---|
 | xarray-sql | In-engine rule (DataFusion), or SQL-to-SQL for other engines | Xarray dimensions, chunks, and variables |
 | zarr-datafusion | In-engine rule | Zarr metadata; dictionary-encoded coordinates |
-| duckdb-zarr | SQL-to-SQL; later, a DuckDB extension that calls `einfold-plan` | Zarr metadata |
+| duckdb-zarr | SQL-to-SQL, including rewrites to a reader-provided aggregating table function for reduction at the source (section 10.5); later, a DuckDB extension that calls `einfold-plan` | Zarr metadata, through `read_zarr_metadata()` and `read_zarr_groups()` |
 | Zax-SQL | Today: SQL-to-SQL on the client before sending over the Postgres wire protocol or Flight SQL (relational form only). With Earthmover: in-engine rule in their DataFusion | Icechunk and Zarr metadata, which Zax-SQL already uses for pushdown |
 | ddx | Program mode, or the in-engine rule | Facts ddx proves: unique keys (its `Verified` set), which columns are dimensions, and the keys of every step (section 8.1) |
 | NVIDIA GQE | Plan-to-plan (Substrait) | from the reader |
@@ -828,34 +921,39 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 
 A spike is a short, time-boxed experiment that answers one design question. Spike code and reports live in [`docs/spikes/`](spikes/).
 
+Status as of v11: 16 of 20 spikes done, one partly done, and three blocked on access. The index [`docs/spikes/README.md`](spikes/README.md) lists every spike with its report.
+
 ### 13.1 Facts
 
-- **S1: Zarr → table → plan.** For each of xarray-sql, duckdb-zarr, and zarr-datafusion: what Zarr metadata survives into the table schema, and how is it exposed (Arrow metadata, a side table like duckdb-zarr's `read_zarr_metadata()`, or not at all)?
-- **S2: Carrier survival.** Does Arrow field metadata survive DataFusion projections, filters, and joins? Can a Substrait read relation carry it through an extension? Does DuckDB keep it?
-- **S3: Propagation rules.** Validate the layout rules in section 13.5 against real plans.
-- **S4: Coordinate maps.** How often are coordinates affine in real datasets, such as ERA5 (ECMWF's hourly global atmospheric reanalysis) and CMIP6 (the latest round of coordinated global climate-model runs)? How should irregular coordinates be represented?
-- **S13: Variable separation.** For each reader, are a variable's dimensions exposed to the plan? When a reader dictionary-encodes a column, does it guarantee that the dictionary comes from the variable's coordinates?
-- **S14: Fill values.** For each reader, how are fill values and CF-masked values emitted: no rows, 0, NULL, or NaN? Is that exposed as a fact?
+| Spike | Question | Outcome |
+|---|---|---|
+| **S1** Zarr → table → plan; **S13** variable separation; **S14** fill values. Done: [`s01-readers`](spikes/s01-readers/README.md) | What Zarr metadata reaches the plan through each reader? Are a variable's dimensions exposed? How are fill values emitted? | No reader writes facts into Arrow metadata. Readers disagree on missing data (NULL vs. NaN), lower-dimensional variables, statistics, filter pushdown and time types. Facts come from per-reader providers (section 8.1). |
+| **S2** Carrier survival; **S3** propagation rules. Done: [`s02-carrier`](spikes/s02-carrier/README.md) | Does Arrow metadata survive plans and Substrait? Do the layout rules hold? | Metadata is lost in DuckDB and Substrait, and kept too eagerly in DataFusion, so facts use a side channel. The layout rules predict coordinates correctly, but row order is a separate, host-specific fact (sections 8.1 and 8.4). |
+| **S4** Coordinate maps. Done: [`s04-coords`](spikes/s04-coords/README.md) | How often are ERA5 (ECMWF's hourly global reanalysis) and CMIP6 (the latest coordinated climate-model runs) coordinates affine? | Affine is common but must be bitwise; monthly times are calendar maps; sorted tables are the general exact form (sections 6.2 and 8.1). |
 
 ### 13.2 Hosts
 
-- **S5: gpudb shapes.** Which relational-form shapes `gpudb` fuses on GPU, measured on matrix multiplication and attention. How to handle its float-sum rule (section 8.6).
-- **S6: GQE Substrait.** Does GQE accept extension relations, reject plans that contain them, or ignore them? Which operators run on GPU?
-- **S7: DataFusion unparser.** Is the SQL that DataFusion's `Unparser` writes for DuckDB good enough to round-trip rewritten plans?
-- **S8: Cost of deterministic sums.** Measure reproducible summation against a plain sum on CPU and GPU, for matrix-multiply-sized reductions (section 8.6). Also measure a fixed combine order, and the cost of the precision levels.
-- **S9: Zax-SQL.** Which rewritten SQL shapes does Zax-SQL's DataFusion run well, and does its Icechunk metadata appear in `information_schema` (the standard SQL catalog of tables and columns)?
-- **S10: Plan protection.** For each host, which mechanism stops the optimizer from undoing the contraction tree (materialized CTEs, disabled passes, physical plans), and what does planning cost on a large decomposed einsum? Reproduce Blacher et al.'s satisfiability example on current DuckDB and DataFusion.
-- **S11: Algorithm thresholds.** At what density and size does EinFold's dense algorithm beat its hash algorithm on CPU? This also sets the switching threshold in section 10.4.
-- **S12: Reader aggregate pushdown.** How can a DataFusion table provider take over the `Partial` phase of an aggregation, and is there an equivalent for duckdb-zarr? What partial-state format do the engines expect?
-- **S15: Sirius.** Does DuckDB's optimizer reorder einfold's contraction tree before Sirius's hook sees the plan? Which relational-form shapes stay on GPU, and which fall back to CPU? Is the float `SUM` in Sirius (via libcudf) deterministic (section 8.6)? Can a Substrait extension relation reach Sirius through its hook? Does `pin_table` keep ddx's weights in GPU memory across training steps?
-- **S19: Float sums in hosts. Done.** Report: [`spikes/s19-float-sums`](spikes/s19-float-sums/README.md). Outcome: hosts do not guarantee repeatable float sums in parallel, so determinism became a setting on hosts (section 8.6).
+| Spike | Question | Outcome |
+|---|---|---|
+| **S5** gpudb shapes. Partly done: [`s05-gpudb`](spikes/s05-gpudb/README.md) | Which relational-form shapes does `gpudb` run on GPU? How does its float-sum rule interact with einfold? | gpudb needs compute capability 7.5+, never rewrites float `SUM`, and leaves tables under 1 million rows to DuckDB. The GPU measurements are a ready-to-run Colab notebook. |
+| **S6** GQE Substrait. **Blocked** | Does GQE accept, reject, or ignore extension relations? Which operators run on GPU? | Needs access to NVIDIA's GPU Query Engine (offered through build.nvidia.com) and an NVIDIA GPU it supports. Not attempted. |
+| **S7** DataFusion unparser. Done: [`s07-unparser`](spikes/s07-unparser/README.md) | Can DataFusion's `Unparser` hand rewritten plans to DuckDB? | Yes, from unoptimized plans (34 of 34 correct). Not from optimized plans: 31 of 34 rejected, and one silently wrong (section 7.3). |
+| **S8** Cost of deterministic sums. Done: [`s08-deterministic-sums`](spikes/s08-deterministic-sums/README.md) | What do reproducible sums cost on CPU and GPU? | A binned sum is deterministic and accurate, at 3–4.4× a plain sum on CPU and 3.5× on GPU (section 8.6). |
+| **S9** Zax-SQL. **Blocked** | Which rewritten shapes does Zax-SQL run well? Does its Icechunk metadata appear in `information_schema`? | Needs an Earthmover account with Zax-SQL access. |
+| **S10** Plan protection. Done: [`s10-plan-protection`](spikes/s10-plan-protection/README.md) | Which mechanism protects the contraction tree on each host, and what does planning cost? | Both hosts keep CTE orders. DuckDB needs `MATERIALIZED` CTEs to plan in under a second; DataFusion plans plain CTEs quickly (section 9.3). |
+| **S11** Algorithm thresholds. Done: [`s11-thresholds`](spikes/s11-thresholds/README.md) | When does EinFold's dense algorithm win? | Above about 20% density against Gustavson's algorithm, and 5–10% against a hash join and aggregate (sections 10.2 and 10.4). |
+| **S12** Reader aggregate pushdown. Done: [`s12-aggregate-pushdown`](spikes/s12-aggregate-pushdown/README.md) | How does a reader take over the partial phase of an aggregation? | In DataFusion, through a physical optimizer rule that replaces the `Partial` aggregate and emits its state schema. In DuckDB, through a SQL rewrite to a reader table function (section 10.5). |
+| **S15** Sirius. **Blocked** | Does DuckDB's optimizer reorder einfold's tree before Sirius sees it? Which shapes stay on GPU? Are its float sums deterministic? Can a Substrait extension relation reach it? Does `pin_table` keep ddx's weights resident? | Needs an NVIDIA GPU of compute capability 7.5 or newer (per gpudb's comparison table), and a long build against libcudf. The local GTX 1080 Ti (6.1) is too old. A Colab T4 or a cloud VM would do. |
+| **S19** Float sums in hosts. Done: [`s19-float-sums`](spikes/s19-float-sums/README.md) | Are float sums repeatable in SQL engines and JAX? | No mainstream SQL engine guarantees it, so determinism is a setting on hosts (section 8.6). |
 
 ### 13.3 Optimizer engine
 
-- **S16: egglog as the rewrite engine. Done.** Report: [`spikes/s16-egglog`](spikes/s16-egglog/README.md). Outcome: adopt egglog for the algebraic layer, in the hybrid design of section 7.6.
-- **S17: n-ary sum-product nodes.** Re-run S16 with each sum-product region as one node over a multiset of operands. Measure e-graph growth on the Einsum Benchmark's largest expressions.
-- **S20: Tiles in egglog.** Encode splitting, retiling, block einsums and the per-task memory analysis (section 9.4) as egglog terms. Reproduce Cubed's plan for a large matrix multiplication, and check that extraction never picks a plan over the memory budget.
-- **S18: Planning time.** Measure egglog's saturation and extraction time on ddx's training plans and on TPC-H (the standard decision-support SQL benchmark), against DataFusion's own planner.
+| Spike | Question | Outcome |
+|---|---|---|
+| **S16** egglog as the rewrite engine. Done: [`s16-egglog`](spikes/s16-egglog/README.md) | Can egglog find einfold's rewrites? | Yes, in the hybrid design (section 7.6). |
+| **S17** n-ary sum-product nodes. Done: [`s17-nary`](spikes/s17-nary/README.md) | Does one node per region fix e-graph growth? | Yes: one iteration and linear size up to 1000 operands. Distributivity still needs a guard (section 7.6). |
+| **S18** Planning time. Done: [`s18-planning-time`](spikes/s18-planning-time/README.md) | How long does egglog take on real plans? | 0.5–1.2 ms per query with rules preloaded, less than the hosts' own planning (section 7.6). |
+| **S20** Tiles in egglog. Done: [`s20-tiles`](spikes/s20-tiles/README.md) | Can tilings and a memory budget live in the e-graph? | Yes. It reproduces Cubed's plans exactly, never exceeds the budget, and finds cheaper plans (section 9.4). |
 
 ### 13.4 Literature still to read
 
@@ -871,7 +969,7 @@ A spike is a short, time-boxed experiment that answers one design question. Spik
 
 ### 13.5 Reference: layout propagation rules
 
-To be validated by spike S3. Each rule follows from CuTe's layout algebra (section 8.2).
+Each rule follows from CuTe's layout algebra (section 8.2). Spike S3 confirmed every rule's prediction of which coordinates come out, on DataFusion and DuckDB. The rules describe the coordinate map only: row order is a separate fact that holds only where the host promises it (section 8.4).
 
 | Operator | Effect on layout |
 |---|---|
@@ -887,7 +985,9 @@ To be validated by spike S3. Each rule follows from CuTe's layout algebra (secti
 ## 14. Open questions
 
 - **Semirings.** Support min-plus and max-times semirings for graph workloads such as shortest paths, and the log-sum-exp semiring behind softmax? Eager aggregation's distributivity argument holds for any commutative semiring, so the relational form extends easily. Dense kernels may not.
-- **Coupling extraction and planning.** In the hybrid design, egglog's extraction picks algebraic forms before the planner chooses contraction orders, so extraction cannot see the order each form would get. Spike S16 found no case where this mattered, but did not look for one. Options: call the planner from inside extraction's cost model, or extract several candidates and plan each. For tiling, section 9.4 takes the second route: the planner proposes candidates and extraction chooses; spike S20 tests it.
+- **Scaling the planner inside extraction.** Spike S17 settled how extraction and planning couple: egglog's cost model runs the contraction planner on each region's operands, so extraction sees planned costs (section 7.6). What remains is speed for large regions. egglog calls the cost function again whenever a child's cost improves, so it needs a cache of planned costs per operand multiset, and an incremental planner beyond a few hundred operands.
+- **The tile-size proposer.** Extraction can only choose sizes the proposer offers (spike S20). Which sizes to propose for general einsums, beyond storage sizes, their least common multiples and halvings, is open.
+- **Upstream reports.** Bugs found by the spikes, not yet filed: DataFusion's `Unparser` drops predicates of a decorrelated subquery (TPC-H Q22) and refers to tables outside unaliased subqueries (S7); zarr-datafusion pairs a lower-dimensional data variable with its dimension wrongly (S1), and its pushed-down aggregates accumulate integers in `f64` (S12). Each needs the maintainers, and the author's go-ahead.
 - **Gaps found by the demos** ([`demos.md`](demos.md)): partial aggregates with associative combines beyond `SUM`, such as the online softmax's (maximum, normalizer, weighted sum); fusion across einsums with a nonlinear step between them; detecting window functions such as `MAX(s) OVER (PARTITION BY i)`; and semi-join reduction through plans many layers deep.
 - **Explicit API.** Offer an `einsum(...)` table function next to automatic detection? Useful for users and tests.
 - **Extension governance.** Where does the `Einsum` relation's spec live, and is it proposed upstream to Substrait?
@@ -912,9 +1012,9 @@ Each benchmark runs with einfold off and on, on the same host. That is the measu
 
 ### 16.1 Milestones
 
-1. **M0: Spikes S1–S20** (S16 and S19 done). Output: a decision on how facts travel, and a target-profile schema.
+1. **M0: Spikes S1–S20.** Done except S5 (GPU half ready on Colab), S6, S9 and S15 (blocked on access). Outcome: facts travel in a side channel filled by per-reader providers (section 8.1); target profiles record plan protection (section 9.3), unparsing rules (section 7.3) and aggregate pushdown routes (section 10.5). The target-profile schema itself is the first task of M1.
 2. **M1: EinFold.** Detection (including single-operand factors, `IS NOT DISTINCT FROM` joins, and sums over `UNION ALL`) and EinFold's hash algorithm as a DataFusion rule and `EinsumExec`, for two-operand contractions over sparse tables. Verified as in section 11, and benchmarked on ddx's `matmul` and `attn`.
-3. **M2: Relational form and program mode.** The egglog rule set for normalization, eager aggregation, and pruning, plus the greedy contraction planner, and program mode with program-level caching, written as DataFusion plans, Substrait, and DuckDB SQL. Variable separation and distributivity (9.1), mask operands (9.1), shared scans (9.5), and support pruning, including exact zeros (9.2). Same benchmarks on DuckDB, DuckDB+gpudb, DuckDB+Sirius, and GQE. Plan protection per S10.
+3. **M2: Relational form and program mode.** The egglog rule set for normalization, eager aggregation, and pruning, plus the greedy contraction planner, and program mode with program-level caching, written as DataFusion plans, Substrait, and DuckDB SQL. Variable separation and distributivity (9.1), mask operands (9.1), shared scans (9.5), and support pruning, including exact zeros (9.2). Same benchmarks on DuckDB, DuckDB+gpudb, DuckDB+Sirius, and GQE. Plan protection per S10: `MATERIALIZED` CTEs on DuckDB, plain CTEs on DataFusion.
 4. **M3: Facts.** `einfold-zarr`, layouts, fill-value rules, SQL constraints and per-chunk value statistics, Bounds and degree statistics, and EinFold's dense and block-sparse algorithms. Reduction at the source (10.5). Integration with xarray-sql, zarr-datafusion, and duckdb-zarr. ERA5 benchmarks.
 5. **M4: Einsum form.** The `Einsum` relation's spec and conformance tests. Run-time switching (10.4) in the reference executor.
 6. **M5: Tiling.** Execution tiling and slicing as e-graph terms with a memory budget (9.4), partly masked tiles (10.2), dynamic-programming and exhaustive contraction planners, retiling cost in contraction planning, and output order (10.3).
@@ -939,11 +1039,14 @@ Agreed priority, highest first. Each lives in the section that owns it:
 
 - **Wrong rewrites.** Mitigation: conservative detection; the partial-aggregate and fill-value rules (sections 8.1 and 8.3); the tests in section 11.
 - **The einsum form is never adopted.** Then einfold's ceiling on GPU hosts is the relational form, which cannot speed up two-operand contractions. Mitigation: keep the relational form valuable on its own; keep the `Einsum` relation small and well tested; show results with the reference executor.
-- **Host optimizers undo or choke on einfold's plans.** Mitigation: plan protection in the target profile (S10).
+- **Host optimizers undo or choke on einfold's plans.** S10 found that hosts keep the written order but DuckDB can spend minutes planning it. Mitigation: plan protection in the target profile (`MATERIALIZED` CTEs on DuckDB), and never emitting flat einsums.
 - **Host behavior drift.** Hosts change what they fuse and accelerate. Mitigation: target profiles are data, plus a benchmark suite per host.
 - **Rewrite-engine dependency.** egglog is young, and saturation can blow up. Mitigation: the hybrid design and bounded schedules (section 7.6); egg as a fallback.
-- **Facts lost in transit.** If no carrier survives the path from reader to plan, variable separation and EinFold's dense algorithms have nothing to use. Mitigation: spikes S1–S2 and S13–S14 come first.
-- **Float sums on GPU hosts.** Deterministic float sums on GPU need host support. Mitigation: determinism is a setting, not a default, on hosts (section 8.6).
+- **Facts lost in transit, or stale.** S2 found that no in-plan carrier survives every host, and that DataFusion keeps metadata above operators that invalidate it. Mitigation: the side-channel fact table, and facts tied to the plan node where they hold (section 8.1).
+- **Readers disagree.** The same store reads differently through each reader (S1). Mitigation: per-reader fact providers, and the shared equivalence suite run through every reader.
+- **Unparser bugs.** DataFusion's `Unparser` can write SQL that silently changes results (S7). Mitigation: unparse only unoptimized plans, and check every unparsed plan.
+- **GPU hosts need recent GPUs.** gpudb and Sirius need compute capability 7.5+ (S5), so einfold's GPU testing needs cloud GPUs.
+- **Float sums on GPU hosts.** Deterministic float sums on GPU need host support. gpudb avoids the question by never rewriting float `SUM`, which also keeps float einsums off its GPU path. Mitigation: determinism is a setting, not a default, on hosts (section 8.6); S8's binned sum is a concrete proposal for hosts, cheap even with GPU atomics.
 
 ## 18. References
 
@@ -953,7 +1056,7 @@ Project and systems:
 - XQL Systems: https://xql.systems
 - xarray-sql: https://github.com/alxmrs/xarray-sql
 - duckdb-zarr: https://github.com/xqlsystems/duckdb-zarr
-- zarr-datafusion: https://github.com/jayendra13/zarr-datafusion
+- zarr-datafusion: https://github.com/stratoscale-io/zarr-datafusion (formerly jayendra13/zarr-datafusion)
 - Zax-SQL: https://www.earthmover.io/blog/compute-roadmap, https://docs.earthmover.io/compute/sql
 - NVIDIA GPU Query Engine: https://build.nvidia.com/nvidia/gpu-query-engine
 - gpudb DuckDB extension: https://github.com/duckdb/community-extensions/blob/main/extensions/gpudb/description.yml, https://github.com/singhpratech/duckdbgpumetaldbram

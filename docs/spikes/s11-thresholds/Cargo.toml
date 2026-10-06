@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "s11-thresholds"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike S11: when does EinFold's dense algorithm beat its hash algorithm on CPU?"
+
+[dependencies]
+matrixmultiply = "0.3"
+
+[profile.release]
+debug = false

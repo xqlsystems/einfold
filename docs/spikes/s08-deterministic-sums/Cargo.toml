@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "s08-deterministic-sums"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike S8: the cost of deterministic floating-point sums on CPU"
+
+[dependencies]

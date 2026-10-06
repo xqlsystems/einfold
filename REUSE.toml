@@ -6,3 +6,10 @@ path = "docs/spikes/*/fixture/**"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Alexander Merose <al@merose.com> & einfold Authors"
 SPDX-License-Identifier = "Apache-2.0"
+
+# Cargo's generated lockfile.
+[[annotations]]
+path = "Cargo.lock"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Alexander Merose <al@merose.com> & einfold Authors"
+SPDX-License-Identifier = "Apache-2.0"

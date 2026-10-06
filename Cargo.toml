@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# einfold: fast tensor contractions for the XQL model. See docs/design.md.
+[workspace]
+resolver = "2"
+members = [
+    "crates/einfold-ir",
+    "crates/einfold-datafusion",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/xqlsystems/einfold"
+authors = ["Alexander Merose <al@merose.com>", "einfold Authors"]
+# MSRV, matching ddx. Enforced by the CI `msrv` matrix entry.
+rust-version = "1.88"
+
+[workspace.dependencies]
+# Pinned exactly, and in lockstep with ddx (xqlsystems/ddx Cargo.toml).
+# einfold-datafusion's public API takes and returns DataFusion's own types, and
+# ddx links einfold-datafusion, so both must resolve the identical `datafusion`.
+# A bump is a deliberate change made together with ddx.
+datafusion = { version = "=54.1.0" }
+
+einfold-ir = { path = "crates/einfold-ir", version = "0.0.0" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"

@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # einfold: Fast Tensor Contractions for the XQL Model
 
-Status: draft v8. Author: Alex Merose. Last updated: 2026-10-05. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
+Status: draft v9. Author: Alex Merose. Last updated: 2026-10-06. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
 
 ## 1. Summary
 
@@ -97,7 +97,7 @@ Three more problems come from the XQL setting:
 1. **einfold rewrites, hosts execute.** einfold's product is a better plan. Hardware is the host's job.
 2. **The XQL logical model is the contract.** A dataset is a table with one row per coordinate tuple, its dimensions as key columns and its variables as value columns. einfold never changes what a query means or the shape of its result. Layouts, tiles, and partial states are physical, and they live inside operators.
 3. **Every rewrite has a portable fallback.** If a host cannot run a richer form, einfold still gives it a plan made of standard relational operators.
-4. **Never wrong.** A rewrite is applied only when it is proven equivalent under SQL semantics, including NULLs and bag semantics (SQL tables may hold duplicate rows, and aggregates count every duplicate). Missing a speedup is acceptable; changing a result is not.
+4. **Never wrong.** A rewrite is applied only when it is proven equivalent under SQL semantics, including NULLs and bag semantics (SQL tables may hold duplicate rows, and aggregates count every duplicate). Values computed exactly (integers, `DECIMAL`, `COUNT`, `MIN`, `MAX`) stay exact (section 8.6). Missing a speedup is acceptable; changing a result is not.
 5. **Never add nondeterminism.** einfold never makes a plan less repeatable than the plan it received. Bit-for-bit determinism is a setting users can request, and the default wherever einfold itself executes (section 8.6).
 6. **A chunk is a partition.** Storage tiles are the natural unit of reading, pruning, parallelism, and partial aggregation (section 8.2).
 7. **Composable by default.** Readers, writers, fact providers, and planners are plugins behind narrow interfaces. Nothing in the core knows which engine or device is downstream.
@@ -216,10 +216,13 @@ einfold produces two output forms. The planner picks per subplan, based on the t
 - **In-engine rule.** In DataFusion, einfold runs as an optimizer rule. xarray-sql, zarr-datafusion, and ddx enable it with one call.
 - **Plan-to-plan service.** Given a Substrait plan and a target profile, return a Substrait plan. This is how GQE is fed.
 - **SQL-to-SQL rewrite.** Given SQL, a dialect, and a target profile, return SQL. This is how DuckDB, `gpudb`, and Sirius are fed, how duckdb-zarr users would use einfold, and how a client can use einfold with Zax-SQL today.
+- **Program mode.** Given a batch of named plans, where some plans read the results of others by name, optimize them together and return the batch. A ddx `BackwardProgram` has exactly this shape: a list of steps, each of which may read earlier steps. An optimizer rule sees one plan at a time, so only program mode can share work across steps (section 9.5) and cache plans for a whole program (section 8.5). Program mode works with any of the output forms above.
 
 ### 7.4 Target profiles
 
 A **target profile** describes a host: Substrait or SQL dialect, whether it implements the `Einsum` relation (and for which value types and forms), which join and aggregate shapes it fuses, its deterministic mechanisms and supported precision levels (section 8.6), how to stop it from reordering einfold's plan (section 9.3), whether its readers accept aggregate pushdown (section 10.5), and whether it scans a shared CTE once (section 9.5).
+
+A profile also records quirks of the host's plan reader that the writers must respect. For example, DuckDB's Substrait reader honors a relation's `emit` field (which selects and reorders output columns) only on projections. On joins, filters, sorts, fetches, cross joins and set operations it silently ignores `emit` and returns the leading columns (found by ddx, ddx#117). So einfold's Substrait writer puts `emit` only on projection relations for every host, and adds an explicit projection where it needs to reorder columns.
 
 Profiles are data, not code, so new hosts need no einfold release. Fallback is per subplan. If a host runs the `Einsum` relation for dense 64-bit floats but not for sparse integers, einfold emits the einsum form for the first subplan and the relational form for the second, in the same plan.
 
@@ -269,6 +272,8 @@ The logical optimizer's algebra runs on **egglog** (Zhang et al., 2023), an open
 3. **Bounded, deterministic schedules.** Use a fixed rule order with iteration and size limits, and no random sampling of rule matches. If a limit is hit, keep the best plan found by the rules that did finish. Never rely on an unfinished associativity search.
 4. **Planners and rules share tests.** In the spike, the hand-written planner first dropped a sum over a dimension that no operand has, a case the egglog rule handled correctly. The equivalence tests of section 11 run on both.
 
+**Out of scope, and future work.** Two uses of e-graphs stay in ddx: simplifying the scalar derivative expressions inside projections (`tanh`, `exp`, `CASE`, ddx's NULL handling), which are not sum-products, and choices specific to automatic differentiation, such as saving a region versus recomputing it, or where to checkpoint a deep expression. After milestone M1, einfold's e-graph could accept non-einsum regions as opaque nodes whose costs the caller supplies. ddx could then share einfold's e-graph instead of building a second one.
+
 **Risks.** egglog 3.0 is young (released August 2026), so egg is the fallback. RisingWave found that a SQL optimizer built on egg planned a 6-table join in 39 ms, where DuckDB took 5 ms, and that cost functions were hard to debug. For einfold, plan caching (section 8.5) absorbs repeated planning, but one-off queries pay the cost. An earlier egg-based optimizer for DataFusion's expressions, datafusion-tokomak, has been inactive since 2022, for reasons not yet investigated.
 
 ## 8. Core abstractions
@@ -314,6 +319,7 @@ A **fact** is something known about an operand, tagged with how it is known. Eve
 - **Table statistics.** Readers already pass Zarr dimension bounds to the engine as table statistics, which engines use to skip data and estimate costs. In DataFusion these are per-column `min`, `max`, and `distinct_count` in its `Statistics` structure. Statistics alone cannot prove density or functional dependencies, so they yield Estimates unless a reader marks them Exact.
 - **Degree statistics.** `D(X | Y)` is the maximum number of rows for any one value of `Y`. For dense arrays these follow from extents. Missing chunks give them at chunk granularity. Sparse tables need the reader to compute them. DataFusion's column statistics have no field for them.
 - **The user.** Declared facts.
+- **Producers of plans, such as ddx.** ddx proves facts that einfold's dense algorithms need. Every ddx program checks that each input table's dimensions identify its rows, and that each derivative table has one row per key; ddx#120 records these as a `Verified` set that callers keep across runs. ddx also knows which columns are dimensions and which are values, and the keys of every step in its program. ddx hands these over as Exact facts on its steps, through the same carrier as reader facts.
 - **The executor.** Measured facts.
 
 **Inside the optimizer,** facts are egglog analyses: Datalog rules derive them, and egglog's merge functions combine them, keeping the most precise value (section 7.6).
@@ -380,7 +386,7 @@ Within a Zarr chunk, row order comes from the chunk's memory order (section 6.2)
 
 Most of what einfold computes depends only on **structure**: the einsum, the extents, the tilings, and the support. Only the final arithmetic depends on **values**. Separating the two lets structure be computed once and reused:
 
-- **Plan caching.** Contraction trees are cached, keyed by the einsum in a canonical form plus extents rounded into buckets. Blacher et al. note that repeated einsums should not be re-planned. ddx caches each training step's physical plan for the same reason.
+- **Plan caching.** Contraction trees are cached, keyed by the einsum in a canonical form plus extents rounded into buckets. Blacher et al. note that repeated einsums should not be re-planned. In program mode (section 7.3) the cache key covers the whole program. Keys never include table names: a step that reads another step is identified by its position in the program, not its name. ddx gives every step a fresh name per program (`__ddx_{id}_…`), so name-based keys would miss on every training step.
 - **Symbolic–numeric split.** When the support is fixed and only values change, Gustavson computes the output's structure once (the symbolic pass), then runs only a numeric pass with no hashing and no "already touched?" tests (section 10.2). ddx's training steps fit this exactly: each step runs the same contractions on new values.
 - **Measured facts.** Densities measured in one run (section 10.4) remain valid for later runs over the same support.
 
@@ -430,6 +436,10 @@ einfold follows JAX's split.
 - A rewritten plan is never less deterministic than the plan einfold received. einfold's own decisions (the contraction tree, the choice of algorithm, run-time switching in section 10.4) depend only on the plan, the facts, and the data, never on timing. The rewrite engine follows the same rule: fixed schedules and no random sampling (section 7.6). Spike S16 found identical results across repeated runs and thread counts.
 - Rewrites still change *which* numbers are added together and when, so a rewritten plan's bits can differ from the original plan's. "Equivalent" in principle 4 means mathematically equivalent. Distributing a product over a sum can also change overflow behavior: `a·Σbⱼ` can overflow when every `a·bⱼ` does not.
 
+**Exactness invariant.** einfold never turns an exactly computed value into a rounded one, and never changes an exact value that a comparison, filter, join key, ordering or `LIMIT` depends on. `COUNT`, `MIN`, `MAX`, and integer and `DECIMAL` arithmetic stay exact. Only floating-point sums may change in their last bits, as section 8.6's policy describes. ddx relies on exactly this split: it already assumes that a float `SUM` can differ between a saved result and its recomputation, and that the exact operations do not.
+
+- **Integer and `DECIMAL` overflow.** Eager aggregation, distributivity and reordering can create intermediate values the original plan never computed. For example, `a·Σbⱼ` can overflow when every `a·bⱼ` does not, and reordering additions can overflow a partial sum. In SQL, integer overflow is usually an error, so such a rewrite could turn a correct result into a failed query. einfold applies these rewrites to exact types only when Exact facts or Bounds prove that no intermediate value can exceed its type. Otherwise it leaves that part of the plan unchanged.
+
 **2. Determinism is a scoped setting, off by default on hosts.**
 
 - By default, einfold emits the fastest forms the host supports, with the host's usual float behavior, as every SQL engine above does.
@@ -472,14 +482,19 @@ detect & normalize ─► prune ─► plan contraction tree ─► choose tilin
 
 ### 9.1 Detect and normalize
 
-**Matches.** This plan shape:
+**Matches.** These plan shapes, wherever they occur in a plan, not only at its root:
 
 ```
 Aggregate(group by G; SUM(e))
-  over a tree of inner equi-joins, filters, and projections over scans
+  over a tree of inner joins on equal dimensions, filters, and projections over scans
+
+Aggregate(group by G; SUM(v))
+  over a UNION ALL of branches, each of which matches the shape above
 ```
 
-**Produces.** One or more einsums, plus the rest of the plan above them (outer projections, `HAVING`, `ORDER BY`, `LIMIT`).
+The second shape is a sum of einsums, which ddx produces when a table is read in several places (for example, a weight used by every layer gets one gradient contribution per read). Adding einsum results means what SQL means here: union all the branches, then sum per group. A group that appears in only one branch keeps that branch's value. Each branch is planned on its own, and branches share work through section 9.5.
+
+**Produces.** One or more einsums, plus the rest of the plan around them. That includes outer projections, `HAVING`, `ORDER BY` and `LIMIT`, and also joins above the aggregate: ddx, for example, left-joins each gradient back onto its input table so that rows no gradient reached get 0.
 
 **Algorithm.**
 
@@ -492,19 +507,21 @@ Aggregate(group by G; SUM(e))
    *Example.* In `SUM(w*x) GROUP BY time` over a dataset table `T(time, lat, lon, w, x)`, the weight `w` depends only on `lat`, so it becomes an operand over `{lat}`. Eager aggregation (section 10.1) then computes `Σ_lat w(lat) · (Σ_lon x(time, lat, lon))`, which does `n_lon` times fewer multiplications. A term over repeated values alone collapses entirely, since a value that does not depend on `i` gives `Σᵢ B = nᵢ · B` (Deeds et al., §4.4). A normalizer `Σ_{time,lat,lon} w(lat)` becomes `n_time · n_lon · Σ_lat w(lat)`.
 
    *Correctness.* The repetition factor is the number of surviving rows per group, not the extent. They are equal for a complete dense array. After filters, use a count: what Yan and Larson (1995), who introduced pre-aggregating before joins, call "eager count".
-3. **Normalize the aggregated expression.** Rewrite `e` as a sum of monomials `Σ cⱼ · Π vₖ` (constants times products of value columns). A single monomial is one einsum. Several monomials are several einsums whose results are added, since `SUM` is linear. Each operand contributes at most one factor per monomial. Anything else, such as `SUM(exp(a*b))`, does not match.
+3. **Group each operand's expressions into factors.** Any expression that reads only one operand's columns becomes a *derived value column* of that operand, and so counts as one factor. For example, a gradient contribution for a layer `y = tanh(Σ x·w)` is `Σₙ x · ȳ · (1 − tanh(z)²)`, where `z` is a column of a saved aggregate. The factor `(1 − tanh(z)²)` reads only that aggregate's columns, so it is one factor of that operand. This is still exactly an einsum, since the factor is constant within the operand's row. A derived column has its operand's dimensions, so variable separation and eager aggregation treat it like any other value column. Without this step, detection would miss most of ddx's gradient contractions.
+4. **Normalize the aggregated expression.** Rewrite `e` as a sum of monomials `Σ cⱼ · Π fₖ` (constants times products of factors). A single monomial is one einsum. Several monomials are several einsums whose results are added, since `SUM` is linear. Each operand contributes at most one factor per monomial. An expression that mixes columns of different operands in some way other than a product, such as `SUM(exp(a*b))` with `a` and `b` from different operands, does not match.
    - *Whether to expand.* Expanding a product over a sum can be much better or much worse, depending on sparsity. Consider the matrix-factorization loss `Σ(X − UV)²`. With sparse `X` it is far cheaper expanded, because every term then runs in time linear in `X`'s nonzeros. With dense `X`, the unexpanded form is cheaper. einfold uses Galley's greedy search: try each single application of distributivity, re-plan with section 9.3, keep it if the cost drops, and also try the fully expanded form (Deeds et al., §4.1). Galley's analysis classifies each operator in an expression as distributive, commutative with the aggregate, or blocking. It also covers expressions that mix addition and multiplication inside the sum, such as `Σⱼ A_ik·(B_ij + C_jk)`, a variant of sampled dense-dense matrix multiplication (Deeds et al., §4.4).
-4. **Build dimension classes.** Run union-find over the join equalities `x.c = y.d`. Each class is one einsum dimension. Equality is transitive, so `u.i = v.i AND v.i = w.i` becomes a single dimension shared by three operands (rule 4 of Blacher et al.). An equality between two columns of the same table is a diagonal (`ii->i`).
-5. **Classify filters.**
+5. **Build dimension classes.** Run union-find over the join conditions `x.c = y.d` and `x.c IS NOT DISTINCT FROM y.d`. Each class is one einsum dimension. Equality is transitive, so `u.i = v.i AND v.i = w.i` becomes a single dimension shared by three operands (rule 4 of Blacher et al.). An equality between two columns of the same table is a diagonal (`ii->i`).
+   - *The two kinds of equality.* `=` never matches NULL, so it drops rows whose key is NULL. `IS NOT DISTINCT FROM` treats NULL as one more coordinate, which matches how `GROUP BY` already treats NULL. Both define an einsum dimension. Detection records which kind each join uses, and the SQL einfold writes keeps that kind, so NULL keys behave as before. ddx joins dimensions with `IS NOT DISTINCT FROM`. Only the dense algorithms need more: an Exact fact that the dimension is never NULL (which Zarr dimensions guarantee), because a dense layout has no position for NULL.
+6. **Classify filters.**
    - A range or equality on a dimension column stays with its operand as a slice. An equality to a constant removes that dimension.
    - A predicate on a value column stays with its operand. It shrinks the operand's support, and the contraction is still an einsum.
    - A predicate that spans two operands and is not an equality (for example `x.i < y.j`) does not match. Detection stops.
-6. **Map group keys.** Each group key must be a column in some dimension class. The classes it names form `O`.
-7. **Check the semiring.** A semiring is the pair of operations an einsum uses for "add" and "multiply". `SUM` over `*` is the default. `MIN` or `MAX` over `+` (tropical semirings, used for shortest paths) are recognized but left unmatched until section 14 decides on semirings.
+7. **Map group keys.** Each group key must be a column in some dimension class. The classes it names form `O`.
+8. **Check the semiring.** A semiring is the pair of operations an einsum uses for "add" and "multiply". `SUM` over `*` is the default. `MIN` or `MAX` over `+` (tropical semirings, used for shortest paths) are recognized but left unmatched until section 14 decides on semirings.
 
-**Correctness.** Every rewrite in section 9 holds under bag semantics, so detection does not require unique coordinate tuples. Dense execution does (section 10.2). An equi-join drops rows whose key is NULL, and `GROUP BY` keeps NULL as its own group. The relational form keeps these semantics because it is relational, and dense execution requires non-NULL dimensions, which Zarr guarantees. Anything detection cannot prove is left unchanged.
+**Correctness.** Every rewrite in section 9 holds under bag semantics, so detection does not require unique coordinate tuples. Dense execution does (section 10.2). A join on `=` drops rows whose key is NULL, a join on `IS NOT DISTINCT FROM` matches NULL to NULL, and `GROUP BY` keeps NULL as its own group. The relational form keeps these semantics because it is relational, and dense execution requires non-NULL dimensions, which Zarr guarantees. Anything detection cannot prove is left unchanged.
 
-**In egglog.** Steps 2–5 are rewrite rules and analyses. Dimension classes (step 4) come from the e-graph's built-in union-find. The decision whether to expand a product (step 3) needs no separate search: the e-graph holds both forms, and extraction picks the cheaper one.
+**In egglog.** Steps 2–6 are rewrite rules and analyses. Dimension classes (step 5) come from the e-graph's built-in union-find. The decision whether to expand a product (step 4) needs no separate search: the e-graph holds both forms, and extraction picks the cheaper one.
 
 **Prior work.** Blacher et al.'s four rules, read in reverse; Galley's logical normalization (Deeds et al., §4); SPORES (Wang et al., 2020).
 
@@ -585,7 +602,7 @@ To change tilings, einfold borrows from rechunker, a tool from the Pangeo commun
 
 ### 9.5 Share work across einsums
 
-- **Shared scans.** ddx's two gradient contractions from section 3, `X̄[n,d] = Σ_h Ȳ[n,h]·W[d,h]` and `W̄[d,h] = Σ_n X[n,d]·Ȳ[n,h]`, both read `Ȳ`. Both can stream `Ȳ` against a hash table: one on `W` keyed by `h`, one on `X` keyed by `n`. One scan of `Ȳ` then feeds both results. Each row `(n, h, ȳ)` adds to row `n` of `X̄` through the `W` table, and to column `h` of `W̄` through the `X` table. In general, group the einsums in one plan (or one ddx training step) that share an operand, and stream the shared operand. This is multiple-query optimization (Sellis, 1988), the classic technique of sharing work among queries run together, applied to einsums.
+- **Shared scans.** ddx's two gradient contractions from section 3, `X̄[n,d] = Σ_h Ȳ[n,h]·W[d,h]` and `W̄[d,h] = Σ_n X[n,d]·Ȳ[n,h]`, both read `Ȳ`. Both can stream `Ȳ` against a hash table: one on `W` keyed by `h`, one on `X` keyed by `n`. One scan of `Ȳ` then feeds both results. Each row `(n, h, ȳ)` adds to row `n` of `X̄` through the `W` table, and to column `h` of `W̄` through the `X` table. In ddx these are two separate steps that each read the stored `Ȳ` step, so an optimizer rule seeing one plan at a time cannot share the scan. Program mode (section 7.3) can: it sees every step of the program. In general, group the einsums in one plan, or one program, that share an operand, and stream the shared operand. Holding all of a program's steps in one e-graph also shares their common subexpressions automatically. This is multiple-query optimization (Sellis, 1988), the classic technique of sharing work among queries run together, applied to einsums.
 - **Common subexpressions.** Put every node of every contraction tree in a canonical form, hash it, and compute identical nodes once (Deeds et al., §5.4). In egglog this comes for free: the e-graph stores each distinct subexpression once, so einsums placed in the same e-graph share them automatically.
 - **Realization.** Reference executor: an `EinsumExec` with several outputs. Relational form: the shared operand is emitted once as a CTE that both einsums reference. Whether the host then scans it once is recorded in the target profile.
 
@@ -738,7 +755,7 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 
 ## 11. Verification
 
-- **Equivalence on random inputs.** For every rewrite, compare the rewritten plan with the original on random einsums with NULLs, NaNs, duplicate coordinate tuples, ties, empty groups, and all-NULL groups. Do this on every host. ddx already has a "soak" test generator that produces random contractions with NULLs and ties.
+- **Equivalence on random inputs.** For every rewrite, compare the rewritten plan with the original on random einsums with NULLs, NaNs, duplicate coordinate tuples, ties, empty groups, and all-NULL groups. Do this on every host. ddx's "soak" test generator already produces random queries with NULLs, ties and duplicates, and checks them against JAX. einfold reuses it as its shared equivalence suite across hosts.
 - **Fill values.** For each row of the fill-value table in section 8.1, check that skipping missing chunks matches a full scan.
 - **Gradients.** With einfold enabled, ddx's gradients still match those of JAX, Google's numerical computing library, computed with `jax.grad` (ddx's `tests/test_v2_jax.py`).
 - **Speed.** ddx's `matmul` and `attn` (attention) benchmark families (`crates/ddx-datafusion/tests/ad_perf.rs`), forward and backward, with einfold on and off. Measure the symbolic–numeric split separately: the first training step against later steps.
@@ -752,16 +769,17 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 | zarr-datafusion | In-engine rule | Zarr metadata; dictionary-encoded coordinates |
 | duckdb-zarr | SQL-to-SQL; later, a DuckDB extension that calls `einfold-plan` | Zarr metadata |
 | Zax-SQL | Today: SQL-to-SQL on the client before sending over the Postgres wire protocol or Flight SQL (relational form only). With Earthmover: in-engine rule in their DataFusion | Icechunk and Zarr metadata, which Zax-SQL already uses for pushdown |
-| ddx | In-engine rule | from its inputs |
+| ddx | Program mode, or the in-engine rule | Facts ddx proves: unique keys (its `Verified` set), which columns are dimensions, and the keys of every step (section 8.1) |
 | NVIDIA GQE | Plan-to-plan (Substrait) | from the reader |
 | DuckDB + gpudb | SQL-to-SQL | from the reader |
 | DuckDB + Sirius | SQL-to-SQL today. Later, the `Einsum` relation inside Sirius's Substrait pipeline | from the reader |
 
 **What stays in ddx:**
 
-- Caching each training step's physical plan. Plans don't change between steps, so they need planning once. Once contractions are fast, the roughly 3 ms of planning per step would otherwise dominate.
+- Caching each training step's physical plan. Plans don't change between steps, so they need planning once. Once contractions are fast, the roughly 3 ms of planning per step would otherwise dominate. einfold's program-level cache (section 8.5) complements this by caching its own rewrite decisions across steps.
 - Forward-mode differentiation inside long chains of row-by-row operations. Forward mode carries derivatives alongside values instead of working backward, which keeps plans growing linearly, not quadratically, in the chain's length.
 - Emitting gradient contributions in a canonical, einsum-shaped form, so detection recognizes them cleanly. Later, ddx could emit the `Einsum` relation directly, as an option in its `ddx_ad::Options` settings.
+- Simplifying scalar derivative expressions, and choices specific to automatic differentiation such as saving versus recomputing a region (section 7.6).
 
 ## 13. Spikes and literature review
 
@@ -846,8 +864,8 @@ Each benchmark runs with einfold off and on, on the same host. That is the measu
 ### 16.1 Milestones
 
 1. **M0: Spikes S1–S18** (S16 done). Output: a decision on how facts travel, and a target-profile schema.
-2. **M1: EinFold.** Detection and EinFold's hash algorithm as a DataFusion rule and `EinsumExec`, for two-operand contractions over sparse tables. Verified as in section 11, and benchmarked on ddx's `matmul` and `attn`.
-3. **M2: Relational form.** The egglog rule set for normalization, eager aggregation, and pruning, plus the greedy contraction planner, written as DataFusion plans, Substrait, and DuckDB SQL. Variable separation and distributivity (9.1), shared scans (9.5), and support pruning (9.2). Same benchmarks on DuckDB, DuckDB+gpudb, DuckDB+Sirius, and GQE. Plan protection per S10.
+2. **M1: EinFold.** Detection (including single-operand factors, `IS NOT DISTINCT FROM` joins, and sums over `UNION ALL`) and EinFold's hash algorithm as a DataFusion rule and `EinsumExec`, for two-operand contractions over sparse tables. Verified as in section 11, and benchmarked on ddx's `matmul` and `attn`.
+3. **M2: Relational form and program mode.** The egglog rule set for normalization, eager aggregation, and pruning, plus the greedy contraction planner, and program mode with program-level caching, written as DataFusion plans, Substrait, and DuckDB SQL. Variable separation and distributivity (9.1), shared scans (9.5), and support pruning (9.2). Same benchmarks on DuckDB, DuckDB+gpudb, DuckDB+Sirius, and GQE. Plan protection per S10.
 4. **M3: Facts.** `einfold-zarr`, layouts, fill-value rules, Bounds and degree statistics, and EinFold's dense and block-sparse algorithms. Reduction at the source (10.5). Integration with xarray-sql, zarr-datafusion, and duckdb-zarr. ERA5 benchmarks.
 5. **M4: Einsum form.** The `Einsum` relation's spec and conformance tests. Run-time switching (10.4) in the reference executor.
 6. **M5: Tiling.** Execution tiling and slicing (9.4), dynamic-programming and exhaustive contraction planners, retiling cost in contraction planning, and output order (10.3).

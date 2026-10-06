@@ -11,7 +11,7 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::MemTable;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
-use einfold_datafusion::detect::{detect, Detected};
+use einfold_datafusion::detect::{detect, Detected, MOVABLE_FUNCTIONS};
 use einfold_ir::{Dim, KeyEquality};
 
 fn table(cols: &[(&str, DataType)]) -> Arc<MemTable> {
@@ -35,6 +35,7 @@ fn context() -> SessionContext {
         ("act", vec![("n", I), ("o", I), ("z", F), ("g", F)]),
         ("inp", vec![("n", I), ("p", I), ("x", F)]),
         ("ints", vec![("i", I), ("k", I), ("x", I)]),
+        ("strs", vec![("k", I), ("s", DataType::Utf8)]),
     ];
     for (name, cols) in tables {
         ctx.register_table(name, table(&cols)).unwrap();
@@ -358,4 +359,77 @@ async fn declines_volatile_factor() {
 #[tokio::test]
 async fn declines_other_aggregate() {
     declined("SELECT a.i, MAX(a.v) FROM a GROUP BY a.i").await;
+}
+
+#[tokio::test]
+async fn allowlisted_function_in_factor() {
+    let det =
+        detected("SELECT a.i, SUM(tanh(a.v) * exp(b.v)) FROM a JOIN b ON a.k = b.k GROUP BY a.i")
+            .await;
+    assert_eq!(det.einsum.to_string(), "a[i,k] · b[k] -> [i]");
+}
+
+// A factor or filter moved onto its leaf runs on rows that may never join, so
+// anything that could raise an error must stay where it is (design §4).
+
+#[tokio::test]
+async fn declines_fallible_cast() {
+    declined(
+        "SELECT a.i, SUM(CAST(strs.s AS DOUBLE) * a.v) FROM a JOIN strs ON a.k = strs.k \
+         GROUP BY a.i",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn declines_integer_division() {
+    declined("SELECT a.i, SUM(a.v * b.v * (a.i / a.k)) FROM a JOIN b ON a.k = b.k GROUP BY a.i")
+        .await;
+}
+
+#[tokio::test]
+async fn declines_unlisted_function() {
+    declined("SELECT a.i, SUM(cos(a.v) * b.v) FROM a JOIN b ON a.k = b.k GROUP BY a.i").await;
+}
+
+/// Every function detection may move evaluates without error on awkward
+/// `Float64` inputs.
+#[tokio::test]
+async fn movable_functions_never_fail() {
+    use datafusion::arrow::array::Float64Array;
+    use datafusion::arrow::record_batch::RecordBatch;
+
+    let values = Float64Array::from(vec![
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        Some(f64::NEG_INFINITY),
+        Some(0.0),
+        Some(-0.0),
+        Some(-2.5),
+        Some(-3.0),
+        Some(0.5),
+        Some(2.0),
+        Some(f64::MAX),
+        Some(f64::MIN_POSITIVE),
+        None,
+    ]);
+    let n = 12;
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, true)]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+    let ctx = SessionContext::new();
+    let vals = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+    ctx.register_table("vals", Arc::new(vals)).unwrap();
+
+    for f in MOVABLE_FUNCTIONS {
+        let sql = format!("SELECT {f}(x) FROM vals");
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{sql} failed: {e}"));
+        let got: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(got, n, "{sql}");
+    }
 }

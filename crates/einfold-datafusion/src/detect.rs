@@ -458,19 +458,42 @@ fn slot_of(e: &Expr) -> Option<usize> {
     }
 }
 
-/// Whether detection can move `e` (evaluate it on the leaf's rows rather than
-/// on the joined rows): a deterministic, row-wise expression of known kind.
-fn movable(e: &Expr) -> bool {
+/// Scalar functions that detection may move onto a leaf, when every argument
+/// is `Float64`. Each returns NaN, ±inf or NULL rather than an error for any
+/// input, which `tests/detect.rs` checks over NaN, ±inf, ±0, negatives and NULL.
+/// `power` is left out: `power(0, -1)` raises an error in DataFusion.
+pub const MOVABLE_FUNCTIONS: &[&str] = &["abs", "exp", "ln", "sqrt", "tanh", "signum"];
+
+/// Whether detection can move `e`, an expression over `schema`: evaluate it on
+/// a leaf's rows rather than on the joined rows. That is safe only for
+/// deterministic, row-wise expressions that cannot raise an error, since a
+/// leaf row that never joins must not make the query fail (design §4).
+fn movable(e: &Expr, schema: &DFSchema) -> bool {
+    let ty = |e: &Expr| e.get_type(schema).ok();
+    let arithmetic = |e: &Expr| ty(e).is_some_and(|t| t.is_integer() || t.is_floating());
     !e.exists(|e| {
-        Ok(match e {
-            Expr::ScalarFunction(_) => e.is_volatile_node(),
-            Expr::Alias(_)
-            | Expr::Column(_)
-            | Expr::Literal(..)
-            | Expr::BinaryExpr(_)
-            | Expr::Like(_)
-            | Expr::SimilarTo(_)
-            | Expr::Not(_)
+        let ok = match e {
+            Expr::Alias(_) | Expr::Column(_) | Expr::Literal(..) => true,
+            // Integer arithmetic wraps in DataFusion; float arithmetic gives
+            // inf or NaN. `/` and `%` are declined until proven infallible.
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
+                Operator::Plus | Operator::Minus | Operator::Multiply => {
+                    arithmetic(left) && arithmetic(right)
+                }
+                Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+                | Operator::And
+                | Operator::Or
+                | Operator::IsDistinctFrom
+                | Operator::IsNotDistinctFrom => true,
+                _ => false,
+            },
+            Expr::Negative(inner) => arithmetic(inner),
+            Expr::Not(_)
             | Expr::IsNotNull(_)
             | Expr::IsNull(_)
             | Expr::IsTrue(_)
@@ -479,14 +502,21 @@ fn movable(e: &Expr) -> bool {
             | Expr::IsNotTrue(_)
             | Expr::IsNotFalse(_)
             | Expr::IsNotUnknown(_)
-            | Expr::Negative(_)
             | Expr::Between(_)
             | Expr::Case(_)
-            | Expr::Cast(_)
-            | Expr::TryCast(_)
-            | Expr::InList(_) => false,
-            _ => true,
-        })
+            | Expr::TryCast(_) => true,
+            Expr::InList(list) => list.list.iter().all(|e| matches!(e, Expr::Literal(..))),
+            // Integers and floats convert to Float64 without error.
+            Expr::Cast(cast) => {
+                *cast.field.data_type() == DataType::Float64 && arithmetic(&cast.expr)
+            }
+            Expr::ScalarFunction(f) => {
+                MOVABLE_FUNCTIONS.contains(&f.name())
+                    && f.args.iter().all(|a| ty(a) == Some(DataType::Float64))
+            }
+            _ => false,
+        };
+        Ok(!ok)
     })
     .expect("infallible")
 }
@@ -494,7 +524,7 @@ fn movable(e: &Expr) -> bool {
 /// Rewrite `e`, an expression over `schema`, into one over slots, given each
 /// column's expression `cols`. Aliases are dropped.
 fn inline(e: &Expr, schema: &DFSchema, cols: &[Expr]) -> Option<Expr> {
-    if !movable(e) {
+    if !movable(e, schema) {
         return None;
     }
     let mut missing = false;

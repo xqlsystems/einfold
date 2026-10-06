@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # einfold: Fast Tensor Contractions for the XQL Model
 
-Status: draft v9.2. Author: Alex Merose. Last updated: 2026-10-06. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
+Status: draft v10. Author: Alex Merose. Last updated: 2026-10-06. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
 
 ## 1. Summary
 
@@ -29,9 +29,11 @@ einfold aims to be a maximally composable data system. Every part (plan readers 
 
 **Key decisions.**
 
-- The optimizer is a hybrid. Algebraic rewrites run on egglog, an engine that explores many equivalent versions of a plan at once. Contraction order and tiling run on specialized planners (section 7.6, backed by spike S16).
+- The optimizer is a hybrid. Algebraic rewrites run on egglog, an engine that explores many equivalent versions of a plan at once. Contraction order runs on a specialized planner, and tilings are proposed by a planner and chosen in the e-graph (section 7.6, backed by spike S16).
 - einfold optimizes either one plan at a time, or a whole program of plans that read each other's results, such as a ddx training step (section 7.3).
 - einfold never adds nondeterminism, and keeps exactly computed values exact. Bit-for-bit repeatable float results are a setting on hosts, and the default where einfold itself executes (section 8.6).
+- Users declare anything that changes results, such as filters, masks and approximations, in plain SQL. einfold exploits those declarations, and infers only optimizations it can prove exact, such as skipping exact zeros ("matmul pushdown", section 9.2).
+- Tiling is part of the algebra. Following Cubed, every tiled computation is a block-level einsum or a change of tiling, and plans that exceed a memory budget are rejected at planning time (sections 8.2 and 9.4).
 
 **Origin.** einfold grew out of [ddx](https://github.com/xqlsystems/ddx), an XQL Systems project for automatic differentiation of SQL queries. Given a query that computes a function (for example a small neural network written as joins and aggregates), ddx produces the queries that compute its gradients. Training a model this way is mostly contractions, and their slowness motivated einfold. ddx's notes on the problem ([`fast-linalg-notes.md`](https://github.com/xqlsystems/ddx/blob/main/docs/fast-linalg-notes.md)) are the starting point for this design, but everything needed is restated here. ddx benefits from einfold but does not depend on it.
 
@@ -108,6 +110,7 @@ Three more problems come from the XQL setting:
 5. **Never add nondeterminism.** einfold never makes a plan less repeatable than the plan it received. Bit-for-bit determinism is a setting users can request, and the default wherever einfold itself executes (section 8.6).
 6. **A chunk is a partition.** Storage tiles are the natural unit of reading, pruning, parallelism, and partial aggregation (section 8.2).
 7. **Composable by default.** Readers, writers, fact providers, and planners are plugins behind narrow interfaces. Nothing in the core knows which engine or device is downstream.
+8. **Users declare semantics; einfold proves optimizations.** Anything that changes results (a filter on values, a mask, a top-k selection, an approximation such as sampling) is written by the user in SQL, and einfold keeps its meaning. Assertions that do not change results (constraints, statistics, layout metadata) are facts that einfold may exploit. einfold infers an optimization on its own only when it can prove it exact (section 9.2).
 
 ## 5. Goals and non-goals
 
@@ -149,6 +152,8 @@ einfold sits where three vocabularies meet: XQL and Xarray, einsum notation, and
 | **Layout** | A function from positions to row order within a tile (section 8.2) | A strided array view | Row order of a scan |
 | **Fact** | Something known about an operand, tagged with how it is known (section 8.1) | — | Statistics, metadata |
 | **Einsum** | A sum of products over operands, with output dimensions | `ik,kj->ij` | `Aggregate(SUM(product))` over joins on dimensions |
+| **Mask operand** | einfold's internal form of a predicate that relates dimensions of different operands, such as a causal mask `q.t >= k.t`: the set of allowed coordinate pairs (section 9.1) | A 0/1 tensor multiplied in | A join with the set of allowed pairs |
+| **Matmul pushdown** | Skipping rows whose value is exactly zero before the join of a contraction, whether the user writes the filter or einfold proves it safe (section 9.2) | Skipping zero entries | A filter pushed below a join |
 | **Derived factor** | An expression that reads only one operand's columns, treated as one of that operand's value columns (section 9.1) | One factor of a product | A computed column |
 | **Contraction tree** | A binary tree of pairwise contractions that evaluates an einsum | A contraction path | A tree of join-aggregates |
 | **EinFold join** (or **EinFold**) | The package's fused join-and-sum operator (section 10.2). The capitalized name is the operator; lowercase **einfold** is the package | One pairwise contraction | A groupjoin (a join fused with the group-by after it; section 10.1), generalized to groups that span both inputs |
@@ -217,7 +222,7 @@ flowchart LR
 
 - **Rel IR.** einfold's internal representation of relational plans, kept close to Substrait. Frontends convert into it and writers convert out of it.
 - **EinsumIR.** einfold's internal representation of an einsum (operands, dimensions, output dimensions, and the pair of operations used for "add" and "multiply", called the semiring; section 9.1, step 8), with facts attached to each operand (section 8.1).
-- **Logical optimizer** (section 9). Rewrites einsums: detection and normalization, pruning, choosing the order of contractions, tiling, and sharing work across einsums. Its algebraic rewrites run on the egglog engine, and contraction order and tiling run on specialized planners (section 7.6).
+- **Logical optimizer** (section 9). Rewrites einsums: detection and normalization, pruning, choosing the order of contractions, tiling, and sharing work across einsums. Its algebraic rewrites run on the egglog engine; contraction order runs on a specialized planner; tilings are proposed by a planner and chosen in the e-graph (section 7.6).
 - **Physical realization** (section 10). Turns each node of the contraction tree into something a host can run.
 
 ### 7.2 Output forms and executors
@@ -282,7 +287,8 @@ The logical optimizer's algebra runs on **egglog** (Zhang et al., 2023), an open
 | Normalization (9.1), eager aggregation (10.1), pruning (9.2) | egglog rewrite rules, with their side conditions written as queries |
 | Cost-based algebraic choices, such as distributivity (9.1) | egglog extraction, with einfold's cost model (section 9.3) plugged in through egglog's `CostModel` interface |
 | Common subexpressions (9.5) | Free: the e-graph stores each distinct subexpression once |
-| Contraction order (9.3) and tiling (9.4) | Specialized Rust planners, applied to each sum-product region of the extracted plan |
+| Contraction order (9.3) | A specialized Rust planner, applied to each sum-product region of the extracted plan |
+| Tiling (9.4) | The tiling planner proposes a few candidate tilings; the e-graph holds them as alternatives, and extraction chooses under a per-task memory budget |
 | Physical realization (section 10) | Rust |
 
 **Evidence.** Spike S16 ([`spikes/s16-egglog`](spikes/s16-egglog/README.md)) encoded einfold's rewrites in egglog 3.0:
@@ -322,6 +328,9 @@ A **fact** is something known about an operand, tagged with how it is known. Eve
 | Support | which chunks exist; which rows exist | Pruning (9.2), block-sparse algorithm (10.2) |
 | Fill value, and how the reader emits it | fill 0, written as no row | Support (below) |
 | Size and degree | number of entries; maximum rows per key | Contraction-tree cost (9.3), memory (9.4) |
+| Value statistics | minimum, maximum, null count, and zero count per chunk | Chunk skipping and zero elimination (9.2) |
+| Finiteness | no NaN or infinite values in a column | Zero elimination (9.2) |
+| Constraints | primary keys, uniqueness, `NOT NULL`, `CHECK` | Unique coordinate tuples (10.2), non-NULL dimensions (9.1), mask support (9.1) |
 
 **Precision.** Each fact is one of:
 
@@ -332,7 +341,7 @@ A **fact** is something known about an operand, tagged with how it is known. Eve
 
 **Rules.**
 
-- Correctness may depend only on Exact facts. Variable separation, dense alignment, and skipping missing chunks all need Exact facts.
+- Correctness may depend only on Exact facts. Variable separation, dense alignment, skipping missing chunks, mask support, and inferred zero elimination all need Exact facts.
 - Memory decisions use Exact facts or Bounds: slicing, and choosing which input EinFold holds in memory.
 - Cost decisions may use Estimates.
 - A Measured fact replaces an Estimate or Bound for the rest of the query.
@@ -343,6 +352,8 @@ A **fact** is something known about an operand, tagged with how it is known. Eve
 - **Zarr conventions.** A Zarr convention is a published, named set of metadata attributes that gives arrays extra meaning without changing how they are stored. The `spatial` convention gives affine maps from positions to X/Y coordinates. The `missing_value` convention names the value that marks missing data. XQL Systems' proposed `layout:` convention ([`layout-convention.md`](layout-convention.md)) gives curve orderings, chunk visit order, records of which chunks were written, and per-chunk summaries, each marked exact or not. It is useful to readers and engines without einfold.
 - **The reader.** How it flattens: which variables depend on which dimensions, whether it dictionary-encodes a column and how, and how it emits fill values and missing data.
 - **Table statistics.** Readers already pass Zarr dimension bounds to the engine as table statistics, which engines use to skip data and estimate costs. In DataFusion these are per-column `min`, `max`, and `distinct_count` in its `Statistics` structure. Statistics alone cannot prove density or functional dependencies, so they yield Estimates unless a reader marks them Exact.
+- **SQL constraints.** A declared primary key or unique constraint says that a table's dimensions identify its rows. `NOT NULL` says a dimension is never NULL. A `CHECK` constraint such as `CHECK (i >= j)` describes where rows can exist. Like a primary key in any database, these change no results; they are Exact facts the optimizer may use. Whether each host exposes them to einfold (DataFusion records primary-key and unique constraints without enforcing them; DuckDB supports `CHECK`) is part of spike S1.
+- **Per-chunk statistics.** Databases keep minimum, maximum and null counts per block of data: Parquet (a columnar file format) per row group, and Iceberg (a table format for data lakes) per data file. Engines such as DataFusion use them to skip blocks a filter rules out. Readers report the same statistics per Zarr chunk, from `layout:summaries` where present, so engines skip chunks without einfold's help. A zero count per chunk, next to the null count, makes "this chunk is all zeros" provable.
 - **Degree statistics.** `D(X | Y)` is the maximum number of rows for any one value of `Y`. For dense arrays these follow from extents. Missing chunks give them at chunk granularity. Sparse tables need the reader to compute them. DataFusion's column statistics have no field for them.
 - **The user.** Declared facts.
 - **Producers of plans, such as ddx.** ddx proves facts that einfold's dense algorithms need. Every ddx program checks that each input table's dimensions identify its rows, and that each derivative table has one row per key; [ddx PR #120](https://github.com/xqlsystems/ddx/pull/120) records these as a `Verified` set that callers keep across runs. ddx also knows which columns are dimensions and which are values, and the keys of every step in its program. ddx hands these over as Exact facts on its steps, through the same carrier as reader facts.
@@ -381,6 +392,8 @@ Because they are one abstraction, these optimizations share one mechanism:
 - **Reduction at the source** computes a partial aggregate per storage tile (section 10.5).
 - **Pruning** and **partition pruning** (skipping partitions whose statistics rule them out) remove whole tiles when their coordinate range cannot match (section 9.2).
 
+**Tiling is reindexing.** Splitting dimension `d` into tiles of size `c` writes each position as `d = c·d_blk + d_in`, so a sum over `d` becomes a nested sum, over the block index `d_blk` and then within the block. That identity is exact, which lets tiles live in the algebra (section 9.4). Cubed, a Python library that runs NumPy-style array programs within a fixed memory budget, builds everything from two such primitives: `blockwise`, which maps input chunks to output chunks, and `rechunk`, which changes the tiling. Its matrix multiplication is an einsum over blocks: one task per triple of blocks `(i, j, k)`, followed by a tree of partial sums over `k`.
+
 Slicing a summed dimension produces partial aggregates that must be combined (section 8.3). Slicing a kept dimension produces disjoint outputs that are concatenated. Ragged edges (a partial last chunk) break CuTe's requirement that tile sizes divide extents evenly. They are represented as a padded tile plus a bounds check, which is how CuTe handles leftovers. Irregular grids are represented as an explicit list of tiles.
 
 ### 8.3 Partial aggregates
@@ -414,7 +427,7 @@ Most of what einfold computes depends only on **structure**: the einsum, the ext
 
 - **Plan caching.** Contraction trees are cached, keyed by the einsum in a canonical form plus extents rounded into buckets. Blacher et al. note that repeated einsums should not be re-planned. In program mode (section 7.3) the cache key covers the whole program. Keys never include table names: a step that reads another step is identified by its position in the program, not its name. ddx gives every step a fresh name per program (`__ddx_{id}_…`), so name-based keys would miss on every training step.
 - **Symbolic–numeric split.** When the support is fixed and only values change, Gustavson computes the output's structure once (the symbolic pass), then runs only a numeric pass with no hashing and no "already touched?" tests (section 10.2). ddx's training steps fit this exactly: each step runs the same contractions on new values.
-- **Measured facts.** Densities measured in one run (section 10.4) remain valid for later runs over the same support.
+- **Measured facts.** Densities measured in one run (section 10.4) remain valid for later runs over the same support. In program mode, a backward step's support equals that of the forward step it differentiates, including the user's filters and masks, so the forward pass's measured support becomes a fact for the backward pass.
 
 ### 8.6 Numerics: determinism and precision
 
@@ -473,7 +486,7 @@ einfold follows JAX's split.
 
 ## 9. Logical optimization
 
-The logical optimizer rewrites einsums without choosing how each node will run. Sections 9.1, 9.2 and 9.5 are egglog rules and analyses. Sections 9.3 and 9.4 are specialized planners, applied to each sum-product region of the plan that egglog extracts (section 7.6).
+The logical optimizer rewrites einsums without choosing how each node will run. Sections 9.1, 9.2 and 9.5 are egglog rules and analyses. Section 9.3 is a specialized planner, applied to each sum-product region of the plan that egglog extracts. In section 9.4, a planner proposes candidate tilings and egglog's extraction chooses among them (section 7.6).
 
 ```mermaid
 flowchart LR
@@ -515,7 +528,8 @@ The second shape is a sum of einsums, which ddx produces when a table is read in
 6. **Classify filters.**
    - A range or equality on a dimension column stays with its operand as a slice. An equality to a constant removes that dimension.
    - A predicate on a value column stays with its operand. It shrinks the operand's support, and the contraction is still an einsum.
-   - A predicate that spans two operands and is not an equality (for example `x.i < y.j`) does not match. Detection stops.
+   - A predicate that relates *dimension* columns of different operands and is not an equality, such as a causal mask `q.t >= k.t` or a sliding window `abs(q.t - k.t) < w`, becomes a **mask operand**: the set of allowed coordinate pairs, joined in like any other operand. That is exactly what the SQL predicate means, including which groups exist. A mask computable from coordinates has a known support, so each tile is Exact-known to be fully allowed, fully masked, or partly masked. Turning a predicate on coordinates into one on positions needs an Exact fact that the coordinate map is monotonic, which Zarr's regular coordinates provide. A stored table of allowed pairs, such as a graph's edges, is a mask too. In the e-graph a mask is one more leaf, so every rewrite applies to it. Users never write mask operands; they write SQL predicates, and the mask is einfold's internal representation (principle 8).
+   - A predicate that compares *values* of different operands, other than through equality on dimensions, does not match. Detection stops.
 7. **Map group keys.** Each group key must be a column in some dimension class. The classes it names form `O`.
 8. **Check the semiring.** A semiring is the pair of operations an einsum uses for "add" and "multiply". `SUM` over `*` is the default. `MIN` or `MAX` over `+` (tropical semirings, used for shortest paths) are recognized but left unmatched until section 14 decides on semirings.
 
@@ -527,18 +541,30 @@ The second shape is a sum of einsums, which ddx produces when a table is read in
 
 ### 9.2 Prune the support
 
-**Idea.** Before contracting, remove rows that cannot find a join partner anywhere in the einsum.
+**Idea.** Before contracting, remove rows that cannot change the result: rows with no join partner anywhere in the einsum, and rows whose factor is exactly zero.
 
 - For acyclic joins, Yannakakis (1981) showed how to remove all such rows with semi-joins (filters that keep a row only if it has a partner in another table), passed up and then down a join tree. Afterwards no join does wasted work. Einsums are usually acyclic: chains, trees, and stars.
 - Predicate transfer (Yang et al., 2024) is a cheaper variant that passes Bloom filters (compact, approximate set-membership tests) along the join graph instead of exact semi-joins.
 - Gustavson's analysis of wasted work is the two-operand case. It traces waste to rows of `A` that are empty, entries of `A` whose column matches an empty row of `B`, and the reverse (Gustavson, 1978, §3.3).
-- At tile granularity this is partition pruning: a tile whose coordinate range cannot match is never read.
+- At tile granularity this is partition pruning: a tile whose coordinate range cannot match is never read. Per-chunk value statistics (section 8.1) extend this to filters on values: a filter `v <> 0` skips every chunk whose minimum and maximum are both 0.
+
+**Exact zeros ("matmul pushdown").** A row whose factor is exactly 0 contributes nothing to a sum of products. Skipping such rows before the join is a filter pushed below a matrix multiplication, which is how an audience member once described this trick, as "matmul pushdown". There are two ways it happens:
+
+- *Declared.* The user writes the filter, for example `WHERE x.v <> 0`, or ReLU as `WHERE z > 0`. That is the user's chosen semantics, including which groups exist. einfold keeps the filter at the operand, never moves it back above the join, and exploits the smaller support: EinFold measures the lower density (section 10.4), and per-chunk statistics skip chunks the filter rules out.
+- *Inferred.* einfold drops zero rows on its own only when all three of these hold, each of which it can check:
+  1. the zero factor feeds only a sum of products;
+  2. every other factor in those products is finite (an Exact fact), because in floating point `0 × NaN` and `0 × ∞` are `NaN`;
+  3. whether a group exists is not visible downstream. Either another operand guarantees every group, or, in program mode, the plan fills missing groups in later, as ddx's gradient step does with its left join that writes 0.
+
+  (Skipping zeros can also flip the sign of a result that is itself zero, from `−0.0` to `0.0`.) ReLU is the motivating case: `GREATEST(z, 0)` produces exact zeros, and its derivative is exactly zero in the same places, so the inferred filter `z > 0` applies to the forward and backward passes alike.
+
+Dropping values that are merely *small* is an approximation, not an exact rewrite. It stays the user's to write (principle 8).
 
 **When.** When facts predict a high miss rate. Dense arrays whose support is complete have no unmatched rows, so pruning is skipped for them. It matters most for sparse workloads such as graphs and triplestores (databases of subject–predicate–object facts).
 
-**Correctness.** A semi-join only removes rows that would not join, and never duplicates rows, so inner-join results and bag semantics are unchanged.
+**Correctness.** A semi-join only removes rows that would not join, and never duplicates rows, so inner-join results and bag semantics are unchanged. Exact zeros are covered by the three conditions above.
 
-**Realization.** Relational form: semi-joins (`WHERE EXISTS` or `IN`). Reference executor: a Bloom filter on the keys of the input held in memory, applied while scanning the other input.
+**Realization.** Relational form: semi-joins (`WHERE EXISTS` or `IN`), and filters such as `v <> 0` placed at the operand. Reference executor: a Bloom filter on the keys of the input held in memory, applied while scanning the other input.
 
 ### 9.3 Plan the contraction tree
 
@@ -596,9 +622,24 @@ To change tilings, einfold borrows from rechunker, a tool from the Pangeo commun
 3. **Slice for memory.** If an intermediate still exceeds the limit, pick dimensions to slice greedily, as cotengra does: prefer the dimension that most reduces the largest intermediate per unit of extra FLOPs. Prefer slice boundaries that coincide with storage tiles, since those cost no IO.
 4. **Realize.** A query has no "write" step, so retiling becomes a partition key. Each row gets the key `(⌊position_s / t(s)⌋ for each tiled s)`. The relational form emits a repartition (an exchange of rows between parallel workers) on that key and runs the contraction per partition. If the key includes a summed dimension, the per-partition results are partial aggregates, combined as in section 8.3. If it covers only kept dimensions, the outputs are disjoint and need no combine.
 
+**Tiles in the algebra.** Following Cubed (section 8.2), a tiled plan is built from two operations, both expressible as e-graph terms:
+
+| Cubed | einfold |
+|---|---|
+| A chunked array | An operand whose dimensions are split into block and within-block parts |
+| `blockwise`, with a function from each output chunk to the input chunks it needs | An einsum whose block dimensions are the outer loop (one task per combination) and whose within-block dimensions are the kernel. The input chunks a task needs follow from the einsum's dimensions. |
+| Aligning inputs' chunks before a `blockwise` | Shared dimensions must be split the same way |
+| `rechunk` | `Retile(d, c → t)`: the same values, at the IO cost counted in step 1 above |
+| A reduction as a tree of `partial_reduce` steps | The sum over a block dimension, as a fixed-order combine of partial aggregates (section 8.3) |
+| Projected memory per task, checked at planning time | An e-graph analysis: memory per task is the product of within-block extents over the operands the task touches, with a margin for decoding and encoding chunks (Cubed's rule of thumb is about 4× a chunk). Plans over the budget get infinite cost, so extraction cannot pick them. |
+| Fusing operations, with limits on how many arrays and blocks one task reads | Merging adjacent contraction-tree nodes that share a tiling into one task, under the same kind of limits |
+| Reading a task's chunks all at once, or one at a time | Hash versus streaming execution (sections 8.4 and 10.2) |
+
+Tile sizes are numbers, so the space of tilings is infinite. As with contraction order, the planner above proposes a few candidates (the storage chunk sizes, their least common multiples, rechunker's consolidated sizes), and the e-graph holds them as alternatives. Extraction then chooses among them, with the memory budget as a hard limit. Spike S20 tests this.
+
 **Why it fits XQL.** When `t(s)` matches the Zarr chunk size, partitions map one-to-one onto chunks. Each partition reads its own chunks, and xarray-sql's partition pruning applies.
 
-**Prior work.** rechunker; cotengra slicing.
+**Prior work.** rechunker; cotengra slicing; Cubed.
 
 ### 9.5 Share work across einsums
 
@@ -700,7 +741,7 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 #### Dense and block-sparse algorithms
 
 - **Dense.** When both operands are dense over `S` and their free dimensions, with Exact coordinate maps that agree and unique coordinate tuples, skip hashing. View each tile through its layout and call a GEMM, batched over `Kₛ`. The layout's strides decide whether an input must be treated as transposed (section 8.4).
-- **Block-sparse.** When an operand's support is known by tile (for example, from missing Zarr chunks), run Gustavson's algorithm over tiles instead of rows. Hash the present tiles of `B` by their tile coordinates along `S`. For each present tile of `A`, call a dense GEMM against each matching tile of `B`. Skipped tiles still contribute their partial aggregate, as the fill-value rules in section 8.1 require.
+- **Block-sparse.** When an operand's support is known by tile (for example, from missing Zarr chunks or a mask operand), run Gustavson's algorithm over tiles instead of rows. Hash the present tiles of `B` by their tile coordinates along `S`. For each present tile of `A`, call a dense GEMM against each matching tile of `B`. A tile has one of three states: absent (skipped), fully present (a dense kernel), or partly present (a masked kernel, which applies the mask within the tile). For a causal mask, the tiles above the diagonal are absent, those below are fully present, and only the diagonal tiles need masking, which is how FlashAttention tiles causal attention (Dao et al., 2022). Skipped tiles still contribute their partial aggregate, as the fill-value rules in section 8.1 require.
 - **Choosing.** Dense when both sides are dense with Exact extents. Block-sparse when support is known by tile. Otherwise hash. Thresholds come from spike S11, and can change while running (section 10.4).
 
 #### Correctness
@@ -752,11 +793,13 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 
 - **Packing dense dimensions into array columns** (for example Arrow's fixed-size list type). It breaks principle 2, the XQL logical model. Dense speed belongs to EinFold's dense algorithm and to facts.
 - **Incremental maintenance across Icechunk versions.** Out of scope for now.
+- **Choosing approximations for the user**, such as dropping small values, sampling a vocabulary, or skipping updates. These change results, so users write them in SQL (principle 8). The NanoGPT demo (see [`demos.md`](demos.md)) shows such tricks as small SQL diffs.
 
 ## 11. Verification
 
 - **Equivalence on random inputs.** For every rewrite, compare the rewritten plan with the original on random einsums with NULLs, NaNs, duplicate coordinate tuples, ties, empty groups, and all-NULL groups. Do this on every host. ddx's "soak" test generator already produces random queries with NULLs, ties and duplicates, and checks them against JAX. einfold reuses it as its shared equivalence suite across hosts.
 - **Fill values.** For each row of the fill-value table in section 8.1, check that skipping missing chunks matches a full scan.
+- **Zeros and masks.** Check inferred zero elimination against the unrewritten plan on inputs that break each of its three conditions (NaN or infinite factors, groups reached only by zeros), and check mask operands against the SQL predicate they replace.
 - **Gradients.** With einfold enabled, ddx's gradients still match those computed by JAX's `jax.grad` (ddx's `tests/test_v2_jax.py`).
 - **Speed.** ddx's `matmul` and `attn` (attention) benchmark families (`crates/ddx-datafusion/tests/ad_perf.rs`), forward and backward, with einfold on and off. Measure the symbolic–numeric split separately: the first training step against later steps.
 - **Bits versus math.** Rewrites change summation order, so plain float results may differ in the last bits. Equivalence tests compare with a tolerance. Determinism tests compare the same plan across runs bit for bit. ddx currently tolerates last-bit differences. ddx's tests that use einfold's reference executor, which is deterministic by default (section 8.6), should also check that repeated runs give identical bits.
@@ -811,6 +854,7 @@ A spike is a short, time-boxed experiment that answers one design question. Spik
 
 - **S16: egglog as the rewrite engine. Done.** Report: [`spikes/s16-egglog`](spikes/s16-egglog/README.md). Outcome: adopt egglog for the algebraic layer, in the hybrid design of section 7.6.
 - **S17: n-ary sum-product nodes.** Re-run S16 with each sum-product region as one node over a multiset of operands. Measure e-graph growth on the Einsum Benchmark's largest expressions.
+- **S20: Tiles in egglog.** Encode splitting, retiling, block einsums and the per-task memory analysis (section 9.4) as egglog terms. Reproduce Cubed's plan for a large matrix multiplication, and check that extraction never picks a plan over the memory budget.
 - **S18: Planning time.** Measure egglog's saturation and extraction time on ddx's training plans and on TPC-H (the standard decision-support SQL benchmark), against DataFusion's own planner.
 
 ### 13.4 Literature still to read
@@ -842,8 +886,9 @@ To be validated by spike S3. Each rule follows from CuTe's layout algebra (secti
 
 ## 14. Open questions
 
-- **Semirings.** Support min-plus and max-times semirings for graph workloads such as shortest paths? Eager aggregation's distributivity argument holds for any commutative semiring, so the relational form extends easily. Dense kernels may not.
-- **Coupling extraction and planning.** In the hybrid design, egglog's extraction picks algebraic forms before the planner chooses contraction orders, so extraction cannot see the order each form would get. Spike S16 found no case where this mattered, but did not look for one. Options: call the planner from inside extraction's cost model, or extract several candidates and plan each.
+- **Semirings.** Support min-plus and max-times semirings for graph workloads such as shortest paths, and the log-sum-exp semiring behind softmax? Eager aggregation's distributivity argument holds for any commutative semiring, so the relational form extends easily. Dense kernels may not.
+- **Coupling extraction and planning.** In the hybrid design, egglog's extraction picks algebraic forms before the planner chooses contraction orders, so extraction cannot see the order each form would get. Spike S16 found no case where this mattered, but did not look for one. Options: call the planner from inside extraction's cost model, or extract several candidates and plan each. For tiling, section 9.4 takes the second route: the planner proposes candidates and extraction chooses; spike S20 tests it.
+- **Gaps found by the demos** ([`demos.md`](demos.md)): partial aggregates with associative combines beyond `SUM`, such as the online softmax's (maximum, normalizer, weighted sum); fusion across einsums with a nonlinear step between them; detecting window functions such as `MAX(s) OVER (PARTITION BY i)`; and semi-join reduction through plans many layers deep.
 - **Explicit API.** Offer an `einsum(...)` table function next to automatic detection? Useful for users and tests.
 - **Extension governance.** Where does the `Einsum` relation's spec live, and is it proposed upstream to Substrait?
 - **Benchmarks.** Dataset sizes, hardware, and pass/fail thresholds for section 15.
@@ -859,18 +904,20 @@ To be validated by spike S3. Each rule follows from CuTe's layout algebra (secti
 | Large einsums: Blacher et al.'s satisfiability, triplestore, and tensor-network cases | Contraction planning, plan protection, run-time switching | DataFusion, DuckDB |
 | TPC-H, the standard decision-support SQL benchmark | Detection precision: no plan changes, no slowdowns on ordinary queries | all |
 
+Three end-to-end demos, rediscovering FlashAttention, NanoGPT in SQL with its sparsity record as a diff, and GraphCast with pushdown, are described in [`demos.md`](demos.md).
+
 Each benchmark runs with einfold off and on, on the same host. That is the measure of einfold's worth: speedup on someone else's engine.
 
 ## 16. Roadmap
 
 ### 16.1 Milestones
 
-1. **M0: Spikes S1–S19** (S16 and S19 done). Output: a decision on how facts travel, and a target-profile schema.
+1. **M0: Spikes S1–S20** (S16 and S19 done). Output: a decision on how facts travel, and a target-profile schema.
 2. **M1: EinFold.** Detection (including single-operand factors, `IS NOT DISTINCT FROM` joins, and sums over `UNION ALL`) and EinFold's hash algorithm as a DataFusion rule and `EinsumExec`, for two-operand contractions over sparse tables. Verified as in section 11, and benchmarked on ddx's `matmul` and `attn`.
-3. **M2: Relational form and program mode.** The egglog rule set for normalization, eager aggregation, and pruning, plus the greedy contraction planner, and program mode with program-level caching, written as DataFusion plans, Substrait, and DuckDB SQL. Variable separation and distributivity (9.1), shared scans (9.5), and support pruning (9.2). Same benchmarks on DuckDB, DuckDB+gpudb, DuckDB+Sirius, and GQE. Plan protection per S10.
-4. **M3: Facts.** `einfold-zarr`, layouts, fill-value rules, Bounds and degree statistics, and EinFold's dense and block-sparse algorithms. Reduction at the source (10.5). Integration with xarray-sql, zarr-datafusion, and duckdb-zarr. ERA5 benchmarks.
+3. **M2: Relational form and program mode.** The egglog rule set for normalization, eager aggregation, and pruning, plus the greedy contraction planner, and program mode with program-level caching, written as DataFusion plans, Substrait, and DuckDB SQL. Variable separation and distributivity (9.1), mask operands (9.1), shared scans (9.5), and support pruning, including exact zeros (9.2). Same benchmarks on DuckDB, DuckDB+gpudb, DuckDB+Sirius, and GQE. Plan protection per S10.
+4. **M3: Facts.** `einfold-zarr`, layouts, fill-value rules, SQL constraints and per-chunk value statistics, Bounds and degree statistics, and EinFold's dense and block-sparse algorithms. Reduction at the source (10.5). Integration with xarray-sql, zarr-datafusion, and duckdb-zarr. ERA5 benchmarks.
 5. **M4: Einsum form.** The `Einsum` relation's spec and conformance tests. Run-time switching (10.4) in the reference executor.
-6. **M5: Tiling.** Execution tiling and slicing (9.4), dynamic-programming and exhaustive contraction planners, retiling cost in contraction planning, and output order (10.3).
+6. **M5: Tiling.** Execution tiling and slicing as e-graph terms with a memory budget (9.4), partly masked tiles (10.2), dynamic-programming and exhaustive contraction planners, retiling cost in contraction planning, and output order (10.3).
 7. **M6: GPU adoption (medium term).** Work with the GQE, Sirius, and/or `gpudb` maintainers to run the einsum form on GPU. Sirius is the most natural first partner, because it already runs Substrait plans on GPU and describes itself as composable.
 8. **Later.** Worst-case optimal joins (10.6).
 
@@ -914,6 +961,7 @@ Project and systems:
 - Substrait: https://substrait.io
 - Zarr conventions (`spatial`, `missing_value`, `dependent-arrays`, and the conventions specification): https://github.com/zarr-conventions
 - Proposed XQL Systems `layout:` convention: [`layout-convention.md`](layout-convention.md)
+- Target demos: [`demos.md`](demos.md)
 
 Papers:
 
@@ -923,6 +971,7 @@ Papers:
 - Chaudhuri, S., Shim, K. (1994). Including Group-By in Query Optimization. *VLDB 1994*, 354–366.
 - Chen, J., Huang, Y., Wang, M., Salihoglu, S., Salem, K. (2023). Accurate Summary-based Cardinality Estimation Through the Lens of Cardinality Estimation Graphs. *SIGMOD Record* 52(1), 94–102. https://doi.org/10.1145/3604437.3604458
 - Deeds, K., Ahrens, W., Balazinska, M., Suciu, D. (2025). Galley: Modern Query Optimization for Sparse Tensor Programs. *Proc. ACM Manag. Data* 3(3), Article 164. https://doi.org/10.1145/3725301 (arXiv:2408.14706)
+- Dao, T., Fu, D. Y., Ermon, S., Rudra, A., Ré, C. (2022). FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. *NeurIPS 2022.* https://arxiv.org/abs/2205.14135
 - Gray, J., Kourtis, S. (2021). Hyper-optimized tensor network contraction. *Quantum* 5, 410.
 - Gustavson, F. G. (1978). Two Fast Algorithms for Sparse Matrices: Multiplication and Permuted Transposition. *ACM Trans. Math. Softw.* 4(3), 250–269. https://doi.org/10.1145/355791.355796
 - Moerkotte, G., Neumann, T. (2011). Accelerating Queries with Group-By and Join by Groupjoin. *PVLDB* 4(11), 843–851. https://www.vldb.org/pvldb/vol4/p843-moerkotte.pdf
@@ -958,4 +1007,5 @@ Software and documentation:
 - rechunker algorithm: https://rechunker.readthedocs.io/en/latest/algorithm.html and https://github.com/pangeo-data/rechunker/blob/master/rechunker/algorithm.py
 - opt_einsum: https://github.com/dgasmith/opt_einsum
 - cotengra: https://github.com/jcmgray/cotengra
+- Cubed: https://cubed-dev.github.io/cubed/, https://github.com/cubed-dev/cubed (design notes in `cubed/primitive/DESIGN.md`)
 - Zarr v3 core specification (chunk grids, fill value, codecs, sharding): https://zarr-specs.readthedocs.io/en/latest/v3/core/index.html

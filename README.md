@@ -23,6 +23,7 @@ Design phase. There is no code yet.
 ## Documents
 
 - [Design](docs/design.md): the architecture, core abstractions, optimizer, and roadmap.
+- [Target demos](docs/demos.md): three end-to-end demos that double as design checks: rediscovering FlashAttention from SQL attention, NanoGPT in SQL with a recent sparsity record as a small diff, and GraphCast weather forecasts that read only the data they need.
 - [Layout convention](docs/layout-convention.md): a draft XQL Systems convention that lets Zarr datasets declare how their data is ordered and summarized (curve orderings such as Z-order, chunk visit order, written-chunk records, and per-chunk min/max), so that query engines can scan less.
 
 ## Related projects

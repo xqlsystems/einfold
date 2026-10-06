@@ -13,7 +13,7 @@ SPDX-License-Identifier: Apache-2.0
 - **Spec URL**: same repository
 - **Scope**: Array, Group
 - **Maturity**: Proposal
-- **Status**: draft 1, for discussion. Author: Alex Merose. 2026-10-04.
+- **Status**: draft 1.1, for discussion. Author: Alex Merose. 2026-10-04.
 
 ## 1. Background
 
@@ -126,7 +126,7 @@ A chunk that was not written reads as the array's fill value. What that value me
 
 | Field | Type | Description |
 |---|---|---|
-| `statistics` | object | Map from statistic name (`"min"`, `"max"`, `"count_valid"`, …) to the path of an array over the chunk grid |
+| `statistics` | object | Map from statistic name (`"min"`, `"max"`, `"count_valid"`, `"count_zero"`, …) to the path of an array over the chunk grid. `"count_zero"` counts values exactly equal to zero, which lets readers prove that a chunk is all zeros. |
 | `ignores` | `string[]` | Values excluded when computing the statistics, such as `"missing_value"` and `"NaN"` |
 | `exact` | `boolean` | See 5.5 |
 | `as_of` | `string` | Optional. See 5.5 |

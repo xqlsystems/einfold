@@ -4,3 +4,6 @@
 
 # Rust build output
 target/
+
+# Generated spike fixtures
+docs/spikes/*/fixture/

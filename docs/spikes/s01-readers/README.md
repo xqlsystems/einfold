@@ -26,7 +26,7 @@ Date: 2026-10-06. Readers tested:
 
 - xarray-sql 0.5.0, with DataFusion 54;
 - zarr-datafusion's `zarr-cli` v0.1.1, the prebuilt release from `stratoscale-io/zarr-datafusion`, which the design doc lists as `jayendra13/zarr-datafusion`;
-- duckdb-zarr v0.1.3, built from source for DuckDB 1.5.5.
+- duckdb-zarr v0.1.3, DuckDB's `zarr` community extension (`INSTALL zarr FROM community`), on DuckDB 1.5.5. The first run used a build from source; the community build gives identical results. As of this date the extension is published for DuckDB 1.5.4 and 1.5.5, not yet for 1.5.6.
 
 ## Method
 
@@ -37,7 +37,7 @@ Date: 2026-10-06. Readers tested:
 - `w(lat)`, a lower-dimensional weight, `cos(lat)`.
 - Regular `lat` and `lon` coordinates, and CF-encoded times (`hours since 2000-01-01`).
 
-Probes: [`probe_xarray_sql.py`](probe_xarray_sql.py), [`probe_zarr_datafusion.sql`](probe_zarr_datafusion.sql) (`zarr-cli -f`), and [`probe_duckdb_zarr.py`](probe_duckdb_zarr.py) (`uv run --with duckdb==1.5.5`). Each:
+Probes: [`probe_xarray_sql.py`](probe_xarray_sql.py), [`probe_zarr_datafusion.sql`](probe_zarr_datafusion.sql) (`zarr-cli -f`), and [`probe_duckdb_zarr.py`](probe_duckdb_zarr.py) (`uv run --with duckdb==1.5.5`; installs the community extension unless given a local build). Each:
 
 - registers the store and inspects the schema;
 - counts NULL, NaN and zero rows;

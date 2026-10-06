@@ -2,9 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""Spike S1/S13/S14 probe for duckdb-zarr (built from source, v0.1.3, for DuckDB 1.5.5).
+"""Spike S1/S13/S14 probe for duckdb-zarr v0.1.3, DuckDB's `zarr` community extension.
 
-Run with: uv run --with duckdb==1.5.5 python probe_duckdb_zarr.py <path to zarr.duckdb_extension>
+Run with: uv run --with duckdb==1.5.5 python probe_duckdb_zarr.py [path to zarr.duckdb_extension]
+Without a path, the extension is installed from DuckDB's community repository.
+(As of 2026-10-06 it is published for DuckDB 1.5.4 and 1.5.5, not yet 1.5.6.)
 """
 
 import pathlib
@@ -12,13 +14,17 @@ import sys
 
 import duckdb
 
-ext = sys.argv[1]
+ext = sys.argv[1] if len(sys.argv) > 1 else None
 here = pathlib.Path(__file__).parent
 store = str(here / "fixture" / "v3.zarr")
 main = f"read_zarr('{store}', dims := ['time', 'lat', 'lon'])"
 weights = f"read_zarr('{store}', dims := ['lat'])"
-con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-con.sql(f"LOAD '{ext}'")
+if ext:
+    con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+    con.sql(f"LOAD '{ext}'")
+else:
+    con = duckdb.connect()
+    con.sql("INSTALL zarr FROM community; LOAD zarr")
 
 
 def show(title, sql):

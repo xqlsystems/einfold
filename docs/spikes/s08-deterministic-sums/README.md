@@ -14,14 +14,14 @@ SPDX-License-Identifier: Apache-2.0
 |---|---|---|
 | CPU, one long sum, 12 threads | 3.0× slower than a parallel plain tree | faster than a single-threaded plain sum |
 | CPU, grouped sums | 4.4× slower | 24 bytes of state per group |
-| GPU (GTX 1080 Ti) | 3.5× slower | consumer GPU, with slow float64 |
+| GPU (GTX 1080 Ti; Tesla T4) | 3.5×; 3.6× slower | both have slow float64 |
 
 It needs the largest absolute value in advance. Facts can supply it: per-chunk maximum statistics, or `layout:summaries`. Otherwise it costs a second pass.
 
 - An exact **superaccumulator** is competitive for one long parallel sum (2× a parallel plain tree). It is impractical for grouped sums, at 576 bytes of state per group, 11× slower; and on the GPU it is 83× slower.
 - A **fixed combine order** costs nothing, but is deterministic only for a fixed input order, which hosts don't guarantee (spike S3).
 
-Date: 2026-10-06. CPU: Intel Core i7-8700 (6 cores, 12 threads), Rust 1.91. GPU: NVIDIA GTX 1080 Ti, CUDA 12.8.
+Date: 2026-10-06. CPU: Intel Core i7-8700 (6 cores, 12 threads), Rust 1.91. GPUs: NVIDIA GTX 1080 Ti (CUDA 12.8), and a Tesla T4 on Colab.
 
 ## Accumulators
 
@@ -86,7 +86,16 @@ A relative error of 0 means the result equaled the correctly rounded sum.
 | binned, maximum from facts | 3.67 | 109 | 3.5× | 1 |
 | superaccumulator | 87.9 | 5 | 83× | 1 |
 
-The GPU's binned and superaccumulator results equal the CPU's correctly rounded sum, bit for bit.
+**Tesla T4** (Colab, via [`../s05-gpudb/s05_s08_colab.ipynb`](../s05-gpudb/s05_s08_colab.ipynb)):
+
+| Accumulator | ms | GB/s | vs. atomic | Distinct results in 20 runs |
+|---|---|---|---|---|
+| atomic (scheduler order) | 1.51 | 264 | 1.0× | **6** |
+| fixed tree | 1.52 | 263 | 1.0× | 1 |
+| binned, maximum from facts | 5.44 | 74 | 3.6× | 1 |
+| superaccumulator | 39.4 | 10 | 26× | 1 |
+
+On both GPUs, the binned and superaccumulator results equal the CPU's correctly rounded sum, bit for bit.
 
 ## Findings
 
@@ -95,7 +104,7 @@ The GPU's binned and superaccumulator results equal the CPU's correctly rounded 
 3. **A superaccumulator suits one big sum, not many small ones.** It parallelizes well (24 ms on 12 threads), but its 576-byte state makes it 11× slower for hash aggregation, and its many atomics make it 83× slower on a GPU.
 4. **A fixed order is not enough on hosts.** The fixed tree is free, but it depends on input order. Spike S3 found that neither DataFusion nor DuckDB guarantees input order through a parallel scan and aggregation. It remains useful inside einfold's own executor, where einfold controls the order.
 5. **Kahan matched here, but is not a determinism fix.** Neumaier's compensated sum gave the same bits on every order of this data, because its error term absorbed all rounding. Nothing guarantees that in general, and S19 saw DuckDB's Kahan-based `fsum` vary in parallel.
-6. **On a GPU, deterministic doesn't have to mean slow.** The fixed tree costs nothing, and the binned sum's 3.5× is on a consumer card whose float64 throughput is 1/32 of its float32. Data-center GPUs run float64 far faster, so the binned sum should come out closer to bandwidth-bound there. The Colab T4 run (also slow float64) and a later data-center GPU would confirm.
+6. **On a GPU, deterministic doesn't have to mean slow.** The fixed tree costs nothing, and the binned sum's 3.5× is on a consumer card whose float64 throughput is 1/32 of its float32. The T4, also slow at float64, gave the same 3.6×, and its superaccumulator cost 26× rather than 83×. Data-center GPUs with full-rate float64 (A100, H100) should bring the binned sum closer to bandwidth-bound; that remains to be measured.
 
 ## Limitations
 

@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # einfold: Fast Tensor Contractions for the XQL Model
 
-Status: draft v9. Author: Alex Merose. Last updated: 2026-10-06. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
+Status: draft v9.1. Author: Alex Merose. Last updated: 2026-10-06. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
 
 ## 1. Summary
 
@@ -20,11 +20,18 @@ einfold makes tensor computation fast inside SQL engines, on any hardware those 
 
 einfold aims to be a maximally composable data system. Every part (plan readers and writers, fact providers, planners, reference executors) is a separate, swappable piece behind a small interface.
 
-**The design** has three layers:
+**The design** has four parts:
 
 - a shared vocabulary that maps XQL, einsum, and relational terms onto each other (section 6);
-- a few core abstractions that many optimizations reuse: facts, tiles, partial aggregates, and the split between structure and values (section 8);
+- an architecture with two output forms: standard relational plans that any host can run, and an `Einsum` extension that hosts can adopt for full speed (section 7);
+- a few core abstractions that many optimizations reuse: facts, tiles, partial aggregates, row order, the split between structure and values, and a policy for floating-point results (section 8);
 - a logical optimizer (section 9) and a set of physical realizations (section 10).
+
+**Key decisions.**
+
+- The optimizer is a hybrid. Algebraic rewrites run on egglog, an engine that explores many equivalent versions of a plan at once. Contraction order and tiling run on specialized planners (section 7.6, backed by spike S16).
+- einfold optimizes either one plan at a time, or a whole program of plans that read each other's results, such as a ddx training step (section 7.3).
+- einfold never adds nondeterminism, and keeps exactly computed values exact. Bit-for-bit repeatable float results are a setting on hosts, and the default where einfold itself executes (section 8.6).
 
 **Origin.** einfold grew out of [ddx](https://github.com/xqlsystems/ddx), an XQL Systems project for automatic differentiation of SQL queries. Given a query that computes a function (for example a small neural network written as joins and aggregates), ddx produces the queries that compute its gradients. Training a model this way is mostly contractions, and their slowness motivated einfold. ddx's notes on the problem ([`fast-linalg-notes.md`](https://github.com/xqlsystems/ddx/blob/main/docs/fast-linalg-notes.md)) are the starting point for this design, but everything needed is restated here. ddx benefits from einfold but does not depend on it.
 
@@ -47,7 +54,7 @@ All of them flatten a chunked array into rows. einfold needs the structure they 
 
 ### 2.2 Einsums and their relational form
 
-An **einsum** names each axis of each input with a letter, and names the axes of the output. Any letter that does not appear in the output is summed over. For example, matrix multiplication `C[n,h] = Σ_d X[n,d]·W[d,h]` is written `nd,dh->nh`. A **tensor contraction** is any einsum that sums over at least one shared axis.
+An **einsum** names each axis of each input with a letter, and names the axes of the output. (From section 6 on, this doc calls axes *dimensions*.) Any letter that does not appear in the output is summed over. For example, matrix multiplication `C[n,h] = Σ_d X[n,d]·W[d,h]` is written `nd,dh->nh`. A **tensor contraction** is any einsum that sums over at least one shared axis.
 
 In the XQL model, `X` and `W` are tables of `(axis…, value)` rows, and the matrix product is:
 
@@ -139,9 +146,10 @@ einfold sits where three vocabularies meet: XQL and Xarray, einsum notation, and
 | **Fill value** | Zarr's value for chunks that were never written | Often called "zero" in sparse-tensor work | — |
 | **Tile** | A rectangular box of positions (section 8.2) | A slice or block | A partition |
 | **Chunk** | A storage tile in Zarr (in v3, possibly an inner chunk of a shard; section 6.2) | — | Usually one partition of a scan |
-| **Layout** | A function from positions to row order within a tile (section 8.1) | A strided array view | Row order of a scan |
+| **Layout** | A function from positions to row order within a tile (section 8.2) | A strided array view | Row order of a scan |
 | **Fact** | Something known about an operand, tagged with how it is known (section 8.1) | — | Statistics, metadata |
-| **Einsum** | A sum of products over operands, with output dimensions | `ik,kj->ij` | `Aggregate(SUM(product))` over equi-joins |
+| **Einsum** | A sum of products over operands, with output dimensions | `ik,kj->ij` | `Aggregate(SUM(product))` over joins on dimensions |
+| **Derived factor** | An expression that reads only one operand's columns, treated as one of that operand's value columns (section 9.1) | One factor of a product | A computed column |
 | **Contraction tree** | A binary tree of pairwise contractions that evaluates an einsum | A contraction path | A tree of join-aggregates |
 | **EinFold join** (or **EinFold**) | The package's fused join-and-sum operator (section 10.2). The capitalized name is the operator; lowercase **einfold** is the package | One pairwise contraction | A groupjoin (a join fused with the group-by after it; section 10.1), generalized to groups that span both inputs |
 | **EinFoldHashJoin** | EinFold's hash algorithm, based on Gustavson's 1978 sparse matrix multiply (section 10.2) | Sparse contraction | — |
@@ -151,7 +159,10 @@ einfold sits where three vocabularies meet: XQL and Xarray, einsum notation, and
 | **Reader** | A project that turns arrays into tables (section 2.1) | — | A table provider |
 | **Host** | The engine that runs einfold's output (section 2.3) | — | — |
 | **Target profile** | Data describing what a host supports (section 7.4) | — | — |
-| **E-graph** | A data structure that stores many equivalent versions of an expression compactly, by grouping equal subexpressions into classes (section 7.6) | — | Like the "memo" of a Cascades-style query optimizer |
+| **Relational form**, **einsum form** | einfold's two output forms: standard joins and aggregates, or the `Einsum` extension relation (section 7.2) | — | — |
+| **Program mode** | Optimizing a batch of plans that read each other's results together (section 7.3) | — | — |
+| **Spike** | A short, time-boxed experiment that answers one design question (section 13) | — | — |
+| **E-graph** | A data structure that stores many equivalent versions of an expression compactly, by grouping equal subexpressions into classes (section 7.6) | — | Like the "memo" in which a Cascades-style query optimizer (a common framework for plan search) stores equivalent plans |
 | **Equality saturation** | Applying rewrite rules to an e-graph until no new equivalent forms appear, or a limit is reached | — | — |
 | **Extraction** | Choosing the cheapest expression in an e-graph under a cost model | — | Choosing the cheapest plan |
 
@@ -177,20 +188,19 @@ These are facts about the data model that einfold's rewrites must respect.
 ### 7.1 Overview
 
 ```
-  frontends                        einfold core                                  writers
- ───────────        ─────────────────────────────────────────        ─────────────────────
- Substrait plan ─┐                                                   ┌─► Substrait (GQE, Sirius, DuckDB, DataFusion)
- DataFusion plan ┼─► Rel IR ─► detect ─► EinsumIR ─► logical ─► physical ┼─► SQL text (DuckDB, gpudb, any SQL host)
- SQL (via DF)  ──┘                         ▲          optimizer   realization └─► DataFusion plan (+ EinsumExec)
-                                           │              ▲
-                                    fact providers   path planners
-                                    (Zarr, Arrow,    (greedy, DP,
-                                     statistics,      cotengra-style)
-                                     user, runtime)
+  frontends                          einfold core                                     writers
+ ─────────────         ───────────────────────────────────────────────         ─────────────────────────
+ Substrait plan ──┐                                                          ┌─► Substrait (GQE, Sirius, DuckDB, DataFusion)
+ DataFusion plan ─┼─► Rel IR ─► detect ─► EinsumIR ─► logical ──► physical ───┼─► SQL text (DuckDB, gpudb, any SQL host)
+ SQL (via DF) ────┤                          ▲         optimizer   realization └─► DataFusion plan (+ EinsumExec)
+ program of plans ┘                          │      (egglog rules
+                                      fact providers  + planners)
+                                      (Zarr, Arrow, statistics,
+                                       ddx, user, runtime)
 ```
 
 - **Rel IR.** einfold's internal representation of relational plans, kept close to Substrait. Frontends convert into it and writers convert out of it.
-- **EinsumIR.** einfold's internal representation of an einsum (operands, dimensions, output dimensions, and the pair of operations used for "add" and "multiply", which section 14 calls the semiring), with facts attached to each operand (section 8.1).
+- **EinsumIR.** einfold's internal representation of an einsum (operands, dimensions, output dimensions, and the pair of operations used for "add" and "multiply", called the semiring; section 9.1, step 8), with facts attached to each operand (section 8.1).
 - **Logical optimizer** (section 9). Rewrites einsums: detection and normalization, pruning, choosing the order of contractions, tiling, and sharing work across einsums. Its algebraic rewrites run on the egglog engine, and contraction order and tiling run on specialized planners (section 7.6).
 - **Physical realization** (section 10). Turns each node of the contraction tree into something a host can run.
 
@@ -222,7 +232,7 @@ einfold produces two output forms. The planner picks per subplan, based on the t
 
 A **target profile** describes a host: Substrait or SQL dialect, whether it implements the `Einsum` relation (and for which value types and forms), which join and aggregate shapes it fuses, its deterministic mechanisms and supported precision levels (section 8.6), how to stop it from reordering einfold's plan (section 9.3), whether its readers accept aggregate pushdown (section 10.5), and whether it scans a shared CTE once (section 9.5).
 
-A profile also records quirks of the host's plan reader that the writers must respect. For example, DuckDB's Substrait reader honors a relation's `emit` field (which selects and reorders output columns) only on projections. On joins, filters, sorts, fetches, cross joins and set operations it silently ignores `emit` and returns the leading columns (found by ddx, ddx#117). So einfold's Substrait writer puts `emit` only on projection relations for every host, and adds an explicit projection where it needs to reorder columns.
+A profile also records quirks of the host's plan reader that the writers must respect. For example, DuckDB's Substrait reader honors a relation's `emit` field (which selects and reorders output columns) only on projections. On joins, filters, sorts, fetches, cross joins and set operations it silently ignores `emit` and returns the leading columns (found by ddx, [ddx PR #117](https://github.com/xqlsystems/ddx/pull/117)). So einfold's Substrait writer puts `emit` only on projection relations for every host, and adds an explicit projection where it needs to reorder columns.
 
 Profiles are data, not code, so new hosts need no einfold release. Fallback is per subplan. If a host runs the `Einsum` relation for dense 64-bit floats but not for sparse integers, einfold emits the einsum form for the first subplan and the relational form for the second, in the same plan.
 
@@ -244,7 +254,7 @@ Only `einfold-datafusion` depends on an engine. The core can be used from DuckDB
 
 ### 7.6 Rewrite engine: egglog, in a hybrid design
 
-The logical optimizer's algebra runs on **egglog** (Zhang et al., 2023), an open-source equality-saturation engine written in Rust. egglog is the successor to **egg** (Willsey et al., 2021), and adds Datalog-style rules for deriving facts. An e-graph stores many equivalent versions of a plan at once. Saturation fills it by applying rewrite rules, and extraction then picks the cheapest version under a cost model.
+The logical optimizer's algebra runs on **egglog** (Zhang et al., 2023), an open-source equality-saturation engine written in Rust. egglog is the successor to **egg** (Willsey et al., 2021), and adds rules in the style of Datalog, a rule language from databases that derives new facts from existing ones. An e-graph stores many equivalent versions of a plan at once. Saturation fills it by applying rewrite rules, and extraction then picks the cheapest version under a cost model.
 
 **Why.** Hand-written rewrite passes must be applied in some order, and an early pass can destroy an opportunity a later pass needed. Hand-written heuristics also have to pick one direction for rules that help in either direction. An e-graph keeps all versions and lets the cost model choose. The strongest precedent is SPORES (Wang et al., 2020). It translates linear algebra into relational algebra, which is close to einfold's own IR, then optimizes with egg, and translates back. It ran 1.2–5× faster than SystemML, a production ML system. Its wins came from algebraic choices like einfold's: distributing a product over a sum when that exploits sparsity, and factoring it back when that is cheaper.
 
@@ -272,9 +282,9 @@ The logical optimizer's algebra runs on **egglog** (Zhang et al., 2023), an open
 3. **Bounded, deterministic schedules.** Use a fixed rule order with iteration and size limits, and no random sampling of rule matches. If a limit is hit, keep the best plan found by the rules that did finish. Never rely on an unfinished associativity search.
 4. **Planners and rules share tests.** In the spike, the hand-written planner first dropped a sum over a dimension that no operand has, a case the egglog rule handled correctly. The equivalence tests of section 11 run on both.
 
-**Out of scope, and future work.** Two uses of e-graphs stay in ddx: simplifying the scalar derivative expressions inside projections (`tanh`, `exp`, `CASE`, ddx's NULL handling), which are not sum-products, and choices specific to automatic differentiation, such as saving a region versus recomputing it, or where to checkpoint a deep expression. After milestone M1, einfold's e-graph could accept non-einsum regions as opaque nodes whose costs the caller supplies. ddx could then share einfold's e-graph instead of building a second one.
+**Out of scope, and future work.** Two uses of e-graphs stay in ddx: simplifying the scalar derivative expressions inside projections (`tanh`, `exp`, `CASE`, ddx's NULL handling), which are not sum-products, and choices specific to automatic differentiation, such as saving a region versus recomputing it, or where to checkpoint a deep expression. After milestone M1 (section 16), einfold's e-graph could accept non-einsum regions as opaque nodes whose costs the caller supplies. ddx could then share einfold's e-graph instead of building a second one.
 
-**Risks.** egglog 3.0 is young (released August 2026), so egg is the fallback. RisingWave found that a SQL optimizer built on egg planned a 6-table join in 39 ms, where DuckDB took 5 ms, and that cost functions were hard to debug. For einfold, plan caching (section 8.5) absorbs repeated planning, but one-off queries pay the cost. An earlier egg-based optimizer for DataFusion's expressions, datafusion-tokomak, has been inactive since 2022, for reasons not yet investigated.
+**Risks.** egglog 3.0 is young (released August 2026), so egg is the fallback. RisingWave, a company that builds a streaming SQL database, found that a SQL optimizer built on egg planned a 6-table join in 39 ms, where DuckDB took 5 ms, and that cost functions were hard to debug. For einfold, plan caching (section 8.5) absorbs repeated planning, but one-off queries pay the cost. An earlier egg-based optimizer for DataFusion's expressions, datafusion-tokomak, has been inactive since 2022, for reasons not yet investigated.
 
 ## 8. Core abstractions
 
@@ -319,7 +329,7 @@ A **fact** is something known about an operand, tagged with how it is known. Eve
 - **Table statistics.** Readers already pass Zarr dimension bounds to the engine as table statistics, which engines use to skip data and estimate costs. In DataFusion these are per-column `min`, `max`, and `distinct_count` in its `Statistics` structure. Statistics alone cannot prove density or functional dependencies, so they yield Estimates unless a reader marks them Exact.
 - **Degree statistics.** `D(X | Y)` is the maximum number of rows for any one value of `Y`. For dense arrays these follow from extents. Missing chunks give them at chunk granularity. Sparse tables need the reader to compute them. DataFusion's column statistics have no field for them.
 - **The user.** Declared facts.
-- **Producers of plans, such as ddx.** ddx proves facts that einfold's dense algorithms need. Every ddx program checks that each input table's dimensions identify its rows, and that each derivative table has one row per key; ddx#120 records these as a `Verified` set that callers keep across runs. ddx also knows which columns are dimensions and which are values, and the keys of every step in its program. ddx hands these over as Exact facts on its steps, through the same carrier as reader facts.
+- **Producers of plans, such as ddx.** ddx proves facts that einfold's dense algorithms need. Every ddx program checks that each input table's dimensions identify its rows, and that each derivative table has one row per key; [ddx PR #120](https://github.com/xqlsystems/ddx/pull/120) records these as a `Verified` set that callers keep across runs. ddx also knows which columns are dimensions and which are values, and the keys of every step in its program. ddx hands these over as Exact facts on its steps, through the same carrier as reader facts.
 - **The executor.** Measured facts.
 
 **Inside the optimizer,** facts are egglog analyses: Datalog rules derive them, and egglog's merge functions combine them, keeping the most precise value (section 7.6).
@@ -392,40 +402,14 @@ Most of what einfold computes depends only on **structure**: the einsum, the ext
 
 ### 8.6 Numerics: determinism and precision
 
-Floating-point addition is not associative: `(a + b) + c` can differ from `a + (b + c)` in the last bits. So a parallel sum, whose additions happen in whatever order threads finish, can give slightly different results on each run. This section sets einfold's policy, based on what SQL engines and JAX do.
+Floating-point addition is not associative: `(a + b) + c` can differ from `a + (b + c)` in the last bits. So a parallel sum, whose additions happen in whatever order threads finish, can give slightly different results on each run. This section sets einfold's policy.
 
-#### What the ecosystem does
+**What others do.** Spike S19 ([`spikes/s19-float-sums`](spikes/s19-float-sums/README.md)) surveyed SQL engines and JAX, Google's numerical computing library, and measured DuckDB and DataFusion:
 
-**SQL engines do not guarantee deterministic float sums in parallel.** Every engine we checked treats run-to-run variation as expected behavior:
-
-- **DuckDB.** Its maintainers call varying `sum(double)` results expected, and suggest `fsum` (Kahan summation), `threads=1`, or a cast to `DECIMAL` (DuckDB discussion #12693).
-- **PostgreSQL.** Serial plans give stable float sums, and parallel plans do not. This was reported in 2017 and treated as inherent to floating point.
-- **BigQuery and Snowflake.** Their documentation states that `SUM` over floats can differ between runs, and recommends fixed-point types where precision matters.
-- **DataFusion.** No documented guarantee. Our measurement (below) shows run-to-run variation.
-
-The engines accumulate `DOUBLE` sums in 64 bits, and offer `DECIMAL` for exact results.
-
-**Our measurement.** 4 million `DOUBLE` values spanning 16 orders of magnitude, with mixed signs; each configuration run 20 times on a 12-core machine; DuckDB 1.5.6 and DataFusion 54.0.0.
-
-| Engine and setting | Distinct results in 20 runs | Relative error vs exact sum |
-|---|---|---|
-| DuckDB `sum`, 12 threads | 19 | 1.8e-16 |
-| DuckDB `fsum` (Kahan), 12 threads | 5 | 3.5e-16 |
-| DuckDB `sum`, 1 thread | 1 | 6.9e-14 |
-| DuckDB `fsum`, 1 thread | 1 | 0 |
-| DataFusion `sum`, 1 input partition, `target_partitions = 1` | 1 | 2.7e-15 |
-| DataFusion `sum`, any other partitioning | 4–6 | 1–2e-15 |
-
-Two lessons:
-
-- **Compensated summation, such as Kahan's, is not a determinism fix.** It shrinks the effect of addition order but does not remove it. Only accumulators whose result is truly independent of order (below) are deterministic in parallel.
-- **Determinism and accuracy are different properties.** The single-threaded sums are repeatable but the least accurate, because adding strictly left to right accumulates rounding error. A fixed order buys repeatability, not accuracy.
-
-**JAX separates three concerns,** and handles each differently:
-
-- *Randomness* is deterministic by design. Random numbers come from explicit keys passed through pure functions.
-- *Order of operations* is fast by default and deterministic by opt-in. On GPUs, reductions use atomic operations, and the compiler's autotuner may choose different kernels between compilations. So results can vary between runs. Users opt into determinism with process-wide XLA flags (`--xla_gpu_exclude_nondeterministic_ops`, formerly `--xla_gpu_deterministic_ops`, plus `--xla_gpu_autotune_level=0`). XLA's documentation warns of substantial throughput loss.
-- *Precision* is fast by default, with explicit, scoped controls. Arrays default to 32-bit floats, and 64-bit must be enabled. A float32 matrix multiply at the default precision runs in bfloat16 on TPUs and in TF32 on A100 and H100 GPUs. Users raise precision per operation (a `precision=` argument) or for a block of code (the `jax.default_matmul_precision` context manager).
+- No mainstream SQL engine guarantees repeatable float sums in parallel. DuckDB, PostgreSQL, BigQuery and Snowflake all treat run-to-run variation as expected, and DuckDB's parallel `SUM` returned 19 different results in 20 runs. Engines accumulate `DOUBLE` sums in 64 bits, and offer `DECIMAL` for exact results.
+- Compensated summation, such as DuckDB's Kahan-based `fsum`, is not a determinism fix: in parallel it still varied. Only accumulators whose result is independent of the order of additions are deterministic in parallel.
+- Determinism and accuracy are different properties. The repeatable single-threaded sums were the least accurate, because adding strictly left to right accumulates rounding error.
+- JAX treats three concerns separately. Randomness is deterministic by design. The order of operations is fast by default and deterministic by opt-in, through process-wide flags that cost throughput. Precision is fast by default (a float32 matrix multiply runs in bfloat16, a 16-bit floating-point format, on TPUs), with controls per operation and per block of code.
 
 #### einfold's policy
 
@@ -434,19 +418,19 @@ einfold follows JAX's split.
 **1. Guaranteed by design: einfold never adds nondeterminism.**
 
 - A rewritten plan is never less deterministic than the plan einfold received. einfold's own decisions (the contraction tree, the choice of algorithm, run-time switching in section 10.4) depend only on the plan, the facts, and the data, never on timing. The rewrite engine follows the same rule: fixed schedules and no random sampling (section 7.6). Spike S16 found identical results across repeated runs and thread counts.
-- Rewrites still change *which* numbers are added together and when, so a rewritten plan's bits can differ from the original plan's. "Equivalent" in principle 4 means mathematically equivalent. Distributing a product over a sum can also change overflow behavior: `a·Σbⱼ` can overflow when every `a·bⱼ` does not.
+- Rewrites still change *which* numbers are added together and when, so a rewritten plan's float results can differ in their last bits from the original plan's. "Equivalent" in principle 4 means mathematically equivalent.
 
-**Exactness invariant.** einfold never turns an exactly computed value into a rounded one, and never changes an exact value that a comparison, filter, join key, ordering or `LIMIT` depends on. `COUNT`, `MIN`, `MAX`, and integer and `DECIMAL` arithmetic stay exact. Only floating-point sums may change in their last bits, as section 8.6's policy describes. ddx relies on exactly this split: it already assumes that a float `SUM` can differ between a saved result and its recomputation, and that the exact operations do not.
+**2. Exactness invariant.** einfold never turns an exactly computed value into a rounded one, and never changes an exact value that a comparison, filter, join key, ordering or `LIMIT` depends on. `COUNT`, `MIN`, `MAX`, and integer and `DECIMAL` arithmetic stay exact. Only floating-point sums may change in their last bits, under the rest of this policy. ddx relies on exactly this split: it already assumes that a float `SUM` can differ between a saved result and its recomputation, and that the exact operations do not.
 
 - **Integer and `DECIMAL` overflow.** Eager aggregation, distributivity and reordering can create intermediate values the original plan never computed. For example, `a·Σbⱼ` can overflow when every `a·bⱼ` does not, and reordering additions can overflow a partial sum. In SQL, integer overflow is usually an error, so such a rewrite could turn a correct result into a failed query. einfold applies these rewrites to exact types only when Exact facts or Bounds prove that no intermediate value can exceed its type. Otherwise it leaves that part of the plan unchanged.
 
-**2. Determinism is a scoped setting, off by default on hosts.**
+**3. Determinism is a scoped setting, off by default on hosts.**
 
-- By default, einfold emits the fastest forms the host supports, with the host's usual float behavior, as every SQL engine above does.
+- By default, einfold emits the fastest forms the host supports, with the host's usual float behavior, as every SQL engine in spike S19 does.
 - A user can request determinism per session or per query, as with JAX's flag or DuckDB's `threads=1`. einfold then uses only mechanisms the host's target profile lists as deterministic: a single partition, the host's own deterministic mode, or a cast to `DECIMAL`. If the host offers none, einfold leaves that subplan in its original form and says why.
 - `DECIMAL` is the portable deterministic path, since every engine recommends it and it is exact. Its limits are value range and speed.
 
-**3. Deterministic by default where einfold executes.**
+**4. Deterministic by default where einfold executes.**
 
 - The reference executor (`EinsumExec`) and the `Einsum` relation's specification are deterministic by default, and the conformance suite checks that repeated runs give identical bits. einfold controls these, and conformance testing needs repeatability, much as JAX on TPU is deterministic in practice.
 - Ways to accumulate `value` deterministically, in order of preference:
@@ -455,17 +439,17 @@ einfold follows JAX's split.
   3. **Fixed-point values** (SQL `DECIMAL` or scaled integers) where the value range allows. Exact, and `gpudb` already sums these on the GPU. Costly to prove safe.
 - Users who want maximum speed in the reference executor, for example when training models, can turn determinism off.
 
-**4. Precision is its own setting.** Modeled on JAX's precision levels:
+**5. Precision is its own setting.** Modeled on JAX's precision levels:
 
 | Level | Accumulator | Einsum-form kernels |
 |---|---|---|
-| `fast` | the host's default | may use reduced-precision formats, such as TF32 or bfloat16, where the host offers them |
+| `fast` | the host's default | may use reduced-precision formats where the host offers them, such as bfloat16 or TF32 (NVIDIA's reduced-precision format for matrix multiplication) |
 | `default` | 64-bit for 32-bit and 64-bit floats | full input precision |
 | `highest` | an exact or reproducible accumulator | full input precision |
 
 `default` follows SQL's convention of 64-bit sums, and Gustavson's advice to accumulate in higher precision and round once (section 10.2). Precision and determinism are set independently, except that `highest` is also deterministic.
 
-**5. Warn where small differences become big ones.** In SQL, a sum that varies in its last bit can flip a comparison. Sums feed `WHERE` and `HAVING` filters, `ORDER BY … LIMIT`, `MIN` and `MAX` ties, `GROUP BY` on computed keys, and joins on computed values. Then a last-bit difference becomes different rows. ddx, for example, needs a tie-breaking rule for `MIN` and `MAX` because sums across partitions vary. einfold traces each float sum through the plan, and when one feeds such a decision without determinism requested, it warns and suggests deterministic mode. It does not change the plan on its own, since hosts don't either.
+**6. Warn where small differences become big ones.** In SQL, a sum that varies in its last bit can flip a comparison. Sums feed `WHERE` and `HAVING` filters, `ORDER BY … LIMIT`, `MIN` and `MAX` ties, `GROUP BY` on computed keys, and joins on computed values. Then a last-bit difference becomes different rows. ddx, for example, needs a tie-breaking rule for `MIN` and `MAX` because sums across partitions vary. einfold traces each float sum through the plan, and when one feeds such a decision without determinism requested, it warns and suggests deterministic mode. It does not change the plan on its own, since hosts don't either.
 
 **In target profiles,** each host records which deterministic mechanisms it offers and which precision levels it supports.
 
@@ -602,8 +586,8 @@ To change tilings, einfold borrows from rechunker, a tool from the Pangeo commun
 
 ### 9.5 Share work across einsums
 
-- **Shared scans.** ddx's two gradient contractions from section 3, `X̄[n,d] = Σ_h Ȳ[n,h]·W[d,h]` and `W̄[d,h] = Σ_n X[n,d]·Ȳ[n,h]`, both read `Ȳ`. Both can stream `Ȳ` against a hash table: one on `W` keyed by `h`, one on `X` keyed by `n`. One scan of `Ȳ` then feeds both results. Each row `(n, h, ȳ)` adds to row `n` of `X̄` through the `W` table, and to column `h` of `W̄` through the `X` table. In ddx these are two separate steps that each read the stored `Ȳ` step, so an optimizer rule seeing one plan at a time cannot share the scan. Program mode (section 7.3) can: it sees every step of the program. In general, group the einsums in one plan, or one program, that share an operand, and stream the shared operand. Holding all of a program's steps in one e-graph also shares their common subexpressions automatically. This is multiple-query optimization (Sellis, 1988), the classic technique of sharing work among queries run together, applied to einsums.
-- **Common subexpressions.** Put every node of every contraction tree in a canonical form, hash it, and compute identical nodes once (Deeds et al., §5.4). In egglog this comes for free: the e-graph stores each distinct subexpression once, so einsums placed in the same e-graph share them automatically.
+- **Shared scans.** ddx's two gradient contractions from section 3, `X̄[n,d] = Σ_h Ȳ[n,h]·W[d,h]` and `W̄[d,h] = Σ_n X[n,d]·Ȳ[n,h]`, both read `Ȳ`. Both can stream `Ȳ` against a hash table: one on `W` keyed by `h`, one on `X` keyed by `n`. One scan of `Ȳ` then feeds both results. Each row `(n, h, ȳ)` adds to row `n` of `X̄` through the `W` table, and to column `h` of `W̄` through the `X` table. In ddx these are two separate steps that each read the stored `Ȳ` step, so an optimizer rule seeing one plan at a time cannot share the scan. Program mode (section 7.3) can: it sees every step of the program. In general, group the einsums in one plan, or one program, that share an operand, and stream the shared operand. This is multiple-query optimization (Sellis, 1988), the classic technique of sharing work among queries run together, applied to einsums.
+- **Common subexpressions.** Put every node of every contraction tree in a canonical form, hash it, and compute identical nodes once (Deeds et al., §5.4). In egglog this comes for free: the e-graph stores each distinct subexpression once, so einsums placed in the same e-graph, including all the steps of a program, share them automatically.
 - **Realization.** Reference executor: an `EinsumExec` with several outputs. Relational form: the shared operand is emitted once as a CTE that both einsums reference. Whether the host then scans it once is recorded in the target profile.
 
 ## 10. Physical realization
@@ -643,7 +627,7 @@ FROM A JOIN n1 ON A.j = n1.j GROUP BY A.i;
   - If all `bⱼ` are NULL, `Σbⱼ` is NULL, so `a·Σbⱼ` is NULL. Every `a·bⱼ` is also NULL. Both forms skip.
   - Otherwise both forms add the same non-NULL terms.
 
-The rule is therefore exact in SQL semantics, up to the floating-point effects in section 8.6.
+The rule is therefore exact in SQL semantics, up to floating-point rounding. For integer and `DECIMAL` values it is applied only when no intermediate value can overflow (section 8.6).
 
 **When it helps.** Yan and Larson skip pre-aggregation when the grouping columns form a key, because then nothing gets smaller. The einsum version of that test: a node gains only if it sums out at least one dimension. For matrix multiplication `nd,dh->nh`, the shared dimension `d` is summed only after the join, and nothing is private, so eager aggregation changes nothing. Matrix multiplication needs EinFold. Eager aggregation matters for chains of three or more operands, for ddx's multi-way gradient contractions, and for operands with private dimensions (marginals, traces, weighted means).
 
@@ -757,7 +741,7 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 
 - **Equivalence on random inputs.** For every rewrite, compare the rewritten plan with the original on random einsums with NULLs, NaNs, duplicate coordinate tuples, ties, empty groups, and all-NULL groups. Do this on every host. ddx's "soak" test generator already produces random queries with NULLs, ties and duplicates, and checks them against JAX. einfold reuses it as its shared equivalence suite across hosts.
 - **Fill values.** For each row of the fill-value table in section 8.1, check that skipping missing chunks matches a full scan.
-- **Gradients.** With einfold enabled, ddx's gradients still match those of JAX, Google's numerical computing library, computed with `jax.grad` (ddx's `tests/test_v2_jax.py`).
+- **Gradients.** With einfold enabled, ddx's gradients still match those computed by JAX's `jax.grad` (ddx's `tests/test_v2_jax.py`).
 - **Speed.** ddx's `matmul` and `attn` (attention) benchmark families (`crates/ddx-datafusion/tests/ad_perf.rs`), forward and backward, with einfold on and off. Measure the symbolic–numeric split separately: the first training step against later steps.
 - **Bits versus math.** Rewrites change summation order, so plain float results may differ in the last bits. Equivalence tests compare with a tolerance. Determinism tests compare the same plan across runs bit for bit. ddx currently tolerates last-bit differences. ddx's tests that use einfold's reference executor, which is deterministic by default (section 8.6), should also check that repeated runs give identical bits.
 
@@ -805,12 +789,13 @@ A spike is a short, time-boxed experiment that answers one design question. Spik
 - **S11: Algorithm thresholds.** At what density and size does EinFold's dense algorithm beat its hash algorithm on CPU? This also sets the switching threshold in section 10.4.
 - **S12: Reader aggregate pushdown.** How can a DataFusion table provider take over the `Partial` phase of an aggregation, and is there an equivalent for duckdb-zarr? What partial-state format do the engines expect?
 - **S15: Sirius.** Does DuckDB's optimizer reorder einfold's contraction tree before Sirius's hook sees the plan? Which relational-form shapes stay on GPU, and which fall back to CPU? Is the float `SUM` in Sirius (via libcudf) deterministic (section 8.6)? Can a Substrait extension relation reach Sirius through its hook? Does `pin_table` keep ddx's weights in GPU memory across training steps?
+- **S19: Float sums in hosts. Done.** Report: [`spikes/s19-float-sums`](spikes/s19-float-sums/README.md). Outcome: hosts do not guarantee repeatable float sums in parallel, so determinism became a setting on hosts (section 8.6).
 
 ### 13.3 Optimizer engine
 
 - **S16: egglog as the rewrite engine. Done.** Report: [`spikes/s16-egglog`](spikes/s16-egglog/README.md). Outcome: adopt egglog for the algebraic layer, in the hybrid design of section 7.6.
 - **S17: n-ary sum-product nodes.** Re-run S16 with each sum-product region as one node over a multiset of operands. Measure e-graph growth on the Einsum Benchmark's largest expressions.
-- **S18: Planning time.** Measure egglog's saturation and extraction time on ddx's training plans and on TPC-H, against DataFusion's own planner.
+- **S18: Planning time.** Measure egglog's saturation and extraction time on ddx's training plans and on TPC-H (the standard decision-support SQL benchmark), against DataFusion's own planner.
 
 ### 13.4 Literature still to read
 
@@ -842,6 +827,7 @@ To be validated by spike S3. Each rule follows from CuTe's layout algebra (secti
 ## 14. Open questions
 
 - **Semirings.** Support min-plus and max-times semirings for graph workloads such as shortest paths? Eager aggregation's distributivity argument holds for any commutative semiring, so the relational form extends easily. Dense kernels may not.
+- **Coupling extraction and planning.** In the hybrid design, egglog's extraction picks algebraic forms before the planner chooses contraction orders, so extraction cannot see the order each form would get. Spike S16 found no case where this mattered, but did not look for one. Options: call the planner from inside extraction's cost model, or extract several candidates and plan each.
 - **Explicit API.** Offer an `einsum(...)` table function next to automatic detection? Useful for users and tests.
 - **Extension governance.** Where does the `Einsum` relation's spec live, and is it proposed upstream to Substrait?
 - **Benchmarks.** Dataset sizes, hardware, and pass/fail thresholds for section 15.
@@ -863,7 +849,7 @@ Each benchmark runs with einfold off and on, on the same host. That is the measu
 
 ### 16.1 Milestones
 
-1. **M0: Spikes S1–S18** (S16 done). Output: a decision on how facts travel, and a target-profile schema.
+1. **M0: Spikes S1–S19** (S16 and S19 done). Output: a decision on how facts travel, and a target-profile schema.
 2. **M1: EinFold.** Detection (including single-operand factors, `IS NOT DISTINCT FROM` joins, and sums over `UNION ALL`) and EinFold's hash algorithm as a DataFusion rule and `EinsumExec`, for two-operand contractions over sparse tables. Verified as in section 11, and benchmarked on ddx's `matmul` and `attn`.
 3. **M2: Relational form and program mode.** The egglog rule set for normalization, eager aggregation, and pruning, plus the greedy contraction planner, and program mode with program-level caching, written as DataFusion plans, Substrait, and DuckDB SQL. Variable separation and distributivity (9.1), shared scans (9.5), and support pruning (9.2). Same benchmarks on DuckDB, DuckDB+gpudb, DuckDB+Sirius, and GQE. Plan protection per S10.
 4. **M3: Facts.** `einfold-zarr`, layouts, fill-value rules, Bounds and degree statistics, and EinFold's dense and block-sparse algorithms. Reduction at the source (10.5). Integration with xarray-sql, zarr-datafusion, and duckdb-zarr. ERA5 benchmarks.
@@ -949,7 +935,6 @@ Software and documentation:
 - XLA GPU determinism: https://openxla.org/xla/determinism
 - JAX discussion #10674, on GPU determinism: https://github.com/jax-ml/jax/discussions/10674
 - JAX default matmul precision: https://docs.jax.dev/en/latest/_autosummary/jax.default_matmul_precision.html and JAX issue #10413
-
 - Apache Arrow columnar format, dictionary-encoded layout: https://arrow.apache.org/docs/format/Columnar.html#dictionary-encoded-layout
 - DataFusion table statistics (`Statistics`, `ColumnStatistics`, `Precision`): https://docs.rs/datafusion/latest/datafusion/common/struct.Statistics.html
 - CuTe layout algebra (NVIDIA CUTLASS): https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/cute/02_layout_algebra.md

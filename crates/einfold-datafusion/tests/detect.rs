@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Detection over plans of real SQL (design §9.1).
+//! Detection over plans of real SQL: which queries it reads as einsums, and
+//! which it must decline.
 
 use std::sync::Arc;
 
@@ -370,7 +371,8 @@ async fn allowlisted_function_in_factor() {
 }
 
 // A factor or filter moved onto its leaf runs on rows that may never join, so
-// anything that could raise an error must stay where it is (design §4).
+// anything that could raise an error must stay where it is: the rewrite must not
+// fail where the original query succeeds.
 
 #[tokio::test]
 async fn declines_fallible_cast() {

@@ -2,17 +2,32 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Detect einsums in DataFusion logical plans (design doc §9.1).
+//! Detect einsums in DataFusion logical plans.
 //!
-//! [`detect`] reads one `Aggregate` node as an einsum: an `Aggregate(group by
-//! G; SUM(e))` over a tree of inner equi-joins, filters, projections and
-//! subquery aliases. Every node below that tree is a *leaf*, an opaque operand.
-//! Detection only describes the einsum; replacing the node is the optimizer
-//! rule's job.
+//! An einsum, in SQL, is
+//!
+//! ```sql
+//! SELECT i, j, SUM(a.v * b.v) FROM a JOIN b ON a.k = b.k GROUP BY i, j
+//! ```
+//!
+//! a join of *operands* on equal key columns, summing a product of one factor
+//! per operand, grouped by some of the keys. [`detect`] reads one `Aggregate`
+//! node in that shape: `SUM(e)` over a tree of inner equi-joins, filters,
+//! projections and subquery aliases. Every node below that tree is a *leaf*: a
+//! subplan detection doesn't look inside (a table scan, a subquery with its own
+//! `GROUP BY`, ...). Each leaf becomes one operand. Detection only describes
+//! the einsum; replacing the node is the optimizer rule's job.
 //!
 //! Detection declines (returns `None`) whenever it cannot prove that the einsum
-//! means exactly what the plan means (design §4, supplement §6.2): which groups
-//! exist, which values are NULL, how NULL keys join, and bag semantics.
+//! means exactly what the plan means. In particular it preserves:
+//!
+//! - **which groups exist:** a group appears only if at least one joined row
+//!   reached it;
+//! - **which sums are NULL:** `SUM` skips NULL products, and is NULL only if
+//!   every product in the group was;
+//! - **how NULL keys join:** `=` never matches NULL, `IS NOT DISTINCT FROM`
+//!   matches NULL to NULL;
+//! - **duplicates:** every joined row counts, even if its key tuple repeats.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -27,12 +42,13 @@ use datafusion::logical_expr::{
 };
 use einfold_ir::{Dim, Einsum, KeyEquality, Operand, Semiring};
 
-/// An `Aggregate` node read as an einsum, with what is needed to rebuild it
-/// (design §9.1).
+/// An `Aggregate` node read as an einsum, with what is needed to rebuild it.
 #[derive(Clone, Debug)]
 pub struct Detected {
-    /// The einsum. Its dimensions are named after their dimension classes
-    /// (design §9.1, step 5); operands are the leaves in plan order.
+    /// The einsum. Each dimension is a *dimension class*: a set of columns that
+    /// the joins and filters force to be equal, such as `{a.k, b.k}` for
+    /// `a.k = b.k`. It is named after its first column. Operands are the
+    /// leaves in plan order.
     pub einsum: Einsum,
     /// One binding per operand, in the order of `einsum.operands()`.
     pub operands: Vec<OperandInput>,
@@ -49,8 +65,9 @@ pub struct Detected {
 /// How one einsum operand reads its leaf of the plan.
 #[derive(Clone, Debug)]
 pub struct OperandInput {
-    /// The leaf subtree, with every filter over only its columns applied on
-    /// top (design §9.1, step 6).
+    /// The leaf subtree, with every filter that reads only its columns applied
+    /// on top. For an inner join, filtering one side before the join equals
+    /// filtering the joined rows after it.
     pub plan: Arc<LogicalPlan>,
     /// The leaf's column for each entry of the operand's `dims`, in order.
     pub dim_columns: Vec<Column>,
@@ -60,7 +77,7 @@ pub struct OperandInput {
     pub value: Expr,
 }
 
-/// Try to read the `Aggregate` node `plan` as an einsum (design §9.1).
+/// Try to read the `Aggregate` node `plan` as an einsum.
 ///
 /// Matches `SUM(e)` over `Float64`, with plain-column group keys, over inner
 /// equi-joins, filters, projections and aliases down to opaque leaves. `e` must
@@ -70,9 +87,9 @@ pub fn detect(plan: &LogicalPlan) -> Option<Detected> {
     let LogicalPlan::Aggregate(agg) = plan else {
         return None;
     };
-    // SQL returns one row from an aggregate without GROUP BY even when nothing
-    // joined, but an einsum has a row only where some joined row reached
-    // (design §8.3). Decline until the IR can say which it means.
+    // Without GROUP BY, SQL returns one row (with a NULL sum) even when no row
+    // joined, but an einsum has a row only where some joined row reached.
+    // Decline until the IR can express that.
     if agg.group_expr.is_empty() || agg.aggr_expr.len() != 1 {
         return None;
     }
@@ -89,7 +106,9 @@ pub fn detect(plan: &LogicalPlan) -> Option<Detected> {
     {
         return None;
     }
-    // Integer and DECIMAL sums must stay exact (design §8.6, item 2).
+    // Only float sums: an integer or DECIMAL sum is exact in SQL, and a rewrite
+    // that reorders or regroups its additions could overflow where the
+    // original did not.
     if p.args[0].get_type(agg.input.schema()).ok()? != DataType::Float64 {
         return None;
     }
@@ -217,9 +236,11 @@ impl Builder {
         group_slots: Vec<usize>,
         schema: DFSchemaRef,
     ) -> Option<Detected> {
-        // Classify filter conjuncts (design §9.1, step 6): column equalities
-        // join dimension classes; a predicate over one leaf stays with it;
-        // anything else (a mask, or a comparison of values) is declined in M1.
+        // Classify filter conjuncts. `x = y` and `x IS NOT DISTINCT FROM y`
+        // between columns merge their dimension classes (two columns of one
+        // leaf make a diagonal, like `m.i = m.j`). A predicate over one leaf
+        // moves onto that leaf. Anything else, such as `a.t >= b.t`, relates
+        // operands in a way an einsum can't express yet, so decline.
         let mut leaf_preds: Vec<Vec<Expr>> = vec![Vec::new(); self.leaves.len()];
         for pred in std::mem::take(&mut self.predicates) {
             if let Some((l, r, kind)) = column_equality(&pred) {
@@ -232,7 +253,11 @@ impl Builder {
             }
         }
 
-        // Dimension classes (step 5) and group keys (step 7).
+        // Dimension classes: union-find over the column equalities, so that
+        // `a.k = b.k AND b.k = c.k` makes one class of three columns. Each class
+        // records how it compares keys. The two kinds differ only for NULL: `=`
+        // drops rows with a NULL key, `IS NOT DISTINCT FROM` joins NULL to
+        // NULL. A class that mixes them has no single meaning, so decline.
         let mut uf = UnionFind::new(self.slots.len());
         for &(l, r, _) in &self.equalities {
             uf.union(l, r);
@@ -345,10 +370,14 @@ impl Builder {
         names
     }
 
-    /// Split the aggregated expression into one factor per leaf (design §9.1,
-    /// steps 3 and 4). Returns `None` unless it is a product of `Float64`
-    /// factors that each read at most one leaf. Factors of one leaf are
-    /// multiplied together, and constant factors go to the first operand.
+    /// Split the aggregated expression into one factor per leaf. Returns `None`
+    /// unless it is a product of `Float64` factors that each read at most one
+    /// leaf: `SUM(a.v * f(b.x, b.y))` splits, but `SUM(a.v + b.v)` and
+    /// `SUM(exp(a.v * b.v))` don't. Any expression over one leaf's columns,
+    /// such as `1 - b.z * b.z`, is one factor, since it is constant within
+    /// that leaf's row. Factors of one leaf are multiplied together, and
+    /// constant factors go to the first operand. Reordering a float product
+    /// this way can change its last bits, but not its mathematical value.
     fn factors(&self, sum_expr: Expr) -> Option<Vec<Option<Expr>>> {
         let schema = self.slot_schema()?;
         let mut flat = Vec::new();
@@ -466,8 +495,10 @@ pub const MOVABLE_FUNCTIONS: &[&str] = &["abs", "exp", "ln", "sqrt", "tanh", "si
 
 /// Whether detection can move `e`, an expression over `schema`: evaluate it on
 /// a leaf's rows rather than on the joined rows. That is safe only for
-/// deterministic, row-wise expressions that cannot raise an error, since a
-/// leaf row that never joins must not make the query fail (design §4).
+/// deterministic, row-wise expressions that cannot raise an error: a leaf row
+/// that never joins is never evaluated by the original plan, so if it made
+/// `CAST('abc' AS DOUBLE)` or `1 / 0` fail, the rewrite would turn a working
+/// query into an error.
 fn movable(e: &Expr, schema: &DFSchema) -> bool {
     let ty = |e: &Expr| e.get_type(schema).ok();
     let arithmetic = |e: &Expr| ty(e).is_some_and(|t| t.is_integer() || t.is_floating());

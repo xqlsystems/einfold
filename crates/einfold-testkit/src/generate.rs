@@ -7,7 +7,7 @@
 use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use einfold_ir::{Aggregate, Dim, Fold, KeyEquality, Operand, RowValue};
+use einfold_ir::{Aggregate, Dim, Fold, KeyEquality, Op, Operand, RowValue};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -111,9 +111,15 @@ impl Case {
         }
         let equality: BTreeMap<Dim, KeyEquality> =
             (0..n_dims).map(|i| (dim(i), pool[i].2)).collect();
-        let aggregate = [Aggregate::Sum, Aggregate::Count, Aggregate::Avg][rng.below(3)];
-        let fold = Fold::new(operands, output, equality, RowValue::Product, aggregate)
-            .expect("generated folds are well formed");
+        let aggregate = [Aggregate::SUM, Aggregate::COUNT, Aggregate::AVG][rng.below(3)];
+        let fold = Fold::new(
+            operands,
+            output,
+            equality,
+            RowValue::Product(Op::Mul),
+            aggregate,
+        )
+        .expect("generated folds are well formed");
         let info = |d: &Dim| pool[d.0[1..].parse::<usize>().unwrap()];
         let tables = fold
             .operands()
@@ -199,7 +205,7 @@ fn build_sql(e: &Fold) -> String {
     }
     sql += &format!(
         "{}({}) AS v FROM {}",
-        e.aggregate().sql_name(),
+        e.aggregate(),
         product.join(" * "),
         ops[0].name
     );

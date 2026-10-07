@@ -11,7 +11,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
-use einfold_ir::{Aggregate, AggregateValue, Dim, KeyEquality, PartialAggregate};
+use einfold_ir::{Aggregate, Dim, KeyEquality, PartialAggregate, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -72,7 +72,7 @@ pub fn naive_reference(case: &Case) -> RecordBatch {
             groups
                 .entry(key)
                 .or_insert(PartialAggregate::new(agg))
-                .update(product);
+                .update(product.map(Value::Float));
             continue;
         }
         let dims = &e.operands()[i].dims;
@@ -107,14 +107,14 @@ pub fn naive_reference(case: &Case) -> RecordBatch {
             .or_insert(PartialAggregate::new(agg))
             .update(None);
     }
-    let result: Vec<(Vec<Key>, AggregateValue)> = groups
+    let result: Vec<(Vec<Key>, Option<Value>)> = groups
         .into_iter()
         .filter_map(|(k, s)| s.finish().map(|v| (k, v)))
         .collect();
     to_batch(case, &result)
 }
 
-fn to_batch(case: &Case, result: &[(Vec<Key>, AggregateValue)]) -> RecordBatch {
+fn to_batch(case: &Case, result: &[(Vec<Key>, Option<Value>)]) -> RecordBatch {
     let e = &case.fold;
     let mut fields = Vec::new();
     let mut cols: Vec<ArrayRef> = Vec::new();
@@ -153,17 +153,18 @@ fn to_batch(case: &Case, result: &[(Vec<Key>, AggregateValue)]) -> RecordBatch {
         cols.push(col);
     }
     // `COUNT` is a non-NULL Int64, as in SQL; `SUM` and `AVG` are nullable floats.
-    if e.aggregate() == Aggregate::Count {
+    if e.aggregate() == Aggregate::COUNT {
         let counts = result.iter().map(|r| match r.1 {
-            AggregateValue::Int(i) => i,
-            AggregateValue::Float(_) => panic!("COUNT yields an integer"),
+            Some(Value::Int(i)) => i,
+            _ => panic!("COUNT yields a non-NULL integer"),
         });
         fields.push(Field::new("v", DataType::Int64, false));
         cols.push(Arc::new(counts.collect::<Int64Array>()));
     } else {
         let floats = result.iter().map(|r| match r.1 {
-            AggregateValue::Float(f) => f,
-            AggregateValue::Int(_) => panic!("SUM and AVG yield floats"),
+            None => None,
+            Some(Value::Float(f)) => Some(f),
+            Some(_) => panic!("SUM and AVG of floats yield floats"),
         });
         fields.push(Field::new("v", DataType::Float64, true));
         cols.push(Arc::new(floats.collect::<Float64Array>()));

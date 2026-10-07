@@ -69,7 +69,7 @@ fn generator_is_deterministic_and_varied() {
 #[test]
 fn all_three_aggregates_are_generated_with_their_sql_types() {
     use einfold_ir::Aggregate;
-    for agg in [Aggregate::Sum, Aggregate::Count, Aggregate::Avg] {
+    for agg in [Aggregate::SUM, Aggregate::COUNT, Aggregate::AVG] {
         let case = (0..200)
             .map(Case::generate)
             .find(|c| c.fold.aggregate() == agg)
@@ -81,7 +81,7 @@ fn all_three_aggregates_are_generated_with_their_sql_types() {
             .unwrap()
             .data_type()
             .clone();
-        let want = if agg == Aggregate::Count {
+        let want = if agg == Aggregate::COUNT {
             "Int64"
         } else {
             "Float64"

@@ -2,22 +2,44 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! The equivalence harness of design §11: random einsums over random tables,
-//! checked against SQL itself.
+//! An equivalence harness: random folds over random tables, checked against
+//! SQL itself.
 //!
-//! - [`Case::generate`] makes a seeded [`Case`]: an [`Einsum`](einfold_ir::Einsum),
-//!   its tables, and the SQL that Blacher's four rules give it (design §2.2).
-//! - [`sql_reference`] runs that SQL in DataFusion; [`naive_reference`] computes
-//!   the same result by nested loops, using
-//!   [`PartialSum`](einfold_ir::PartialSum) (design §8.3).
-//! - [`assert_same_result`] compares two results as SQL would: rows as a
-//!   multiset, keys exactly (NULL equals NULL), values to a relative `1e-9`
-//!   (NULL equals NULL, NaN equals NaN).
+//! A *fold* ([`einfold_ir::Fold`]) is a SQL query of the shape `SELECT
+//! <output>, AGG(a.v * b.v * ...) FROM a JOIN b ON ... GROUP BY <output>`,
+//! where `AGG` is `SUM`, `COUNT`, or `AVG`. An einsum is the `SUM` case. This
+//! crate checks an implementation of such queries against two independent
+//! oracles, so that a rewrite is only ever allowed to change how the answer is
+//! computed, never the answer.
+//!
+//! - [`Case::generate`] makes a seeded [`Case`]: a fold, its tables, and its
+//!   SQL.
+//! - [`sql_reference`] runs that SQL in DataFusion; [`naive_reference`]
+//!   computes the same result by nested loops, with
+//!   [`PartialAggregate`](einfold_ir::PartialAggregate)s.
+//! - [`assert_same_result`] compares two results as SQL would.
 //! - [`check`] runs an implementation against the SQL reference on many cases.
 //!
-//! Every table has the columns of its operand's dimensions, in order, named by
-//! the dimension, followed by a `Float64` column `v`. A result has the output
-//! dimensions, then `v`. A dimension appears at most once per operand here.
+//! # Invariants checked
+//!
+//! 1. **Same groups.** A group appears in the result exactly when some joined
+//!    row reached it, even if every value in it is NULL. Keys compare exactly,
+//!    with NULL equal to NULL and floats by their bits (`-0.0` differs from
+//!    `0.0`, NaN equals NaN), as DataFusion's `GROUP BY` does.
+//! 2. **Same values.** `SUM` and `AVG` are NULL if every value in the group is
+//!    NULL, and NaN propagates. `COUNT` is an exact `Int64`, 0 for an all-NULL
+//!    group. Floats match to a relative `1e-9`, since a rewrite may add in a
+//!    different order.
+//! 3. **Same rows, in any order.** Rows compare as a multiset, so duplicate
+//!    result rows must be duplicated.
+//! 4. **The oracles agree.** `naive_reference` equals `sql_reference` on every
+//!    generated case (`tests/selftest.rs`), which validates both.
+//!
+//! The generated inputs cover NULL and duplicate keys, NULL, NaN, and all-NULL
+//! values, empty tables, and `Int64`, `Utf8`, and `Float64` keys. A table has
+//! one column per dimension of its operand, named by the dimension, then a
+//! `Float64` column `v`. A result has the output dimensions, then `v`. A
+//! dimension appears at most once per operand here.
 
 mod compare;
 mod generate;
@@ -40,8 +62,8 @@ pub fn case_seed(seed: u64, i: usize) -> u64 {
 ///
 /// # Panics
 ///
-/// On the first mismatch, with the case's seed, einsum, SQL, tables, and a
-/// diff of the two results (design §11).
+/// On the first mismatch, with the case's seed, fold, SQL, tables, and a
+/// diff of the two results.
 pub fn check(n_cases: usize, seed: u64, implementation: impl Fn(&Case) -> RecordBatch) {
     for i in 0..n_cases {
         let cs = case_seed(seed, i);

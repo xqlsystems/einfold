@@ -2,12 +2,12 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! The seeded case generator (design §11).
+//! The seeded case generator.
 
 use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use einfold_ir::{Dim, Einsum, KeyEquality, Operand, Semiring};
+use einfold_ir::{Aggregate, Dim, Fold, KeyEquality, Operand, RowValue};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -35,18 +35,24 @@ impl Rng {
 /// The coordinates of a `Float64` dimension, by index: both zeros and NaN.
 const FLOATS: [f64; 6] = [0.0, -0.0, f64::NAN, 1.5, -1.5, 2.0];
 
-/// One generated test: an einsum, the tables for its operands, and the SQL
-/// that Blacher's four rules give it (design §2.2).
+/// One generated test: a fold over a join, the tables for its operands, and
+/// the SQL query that means the same thing.
+///
+/// The SQL follows the standard translation of an einsum (Blacher et al.,
+/// 2023): list the operands in `FROM`, equate each shared dimension in `JOIN
+/// ... ON`, `GROUP BY` the output dimensions, and aggregate the product of the
+/// operands' value columns. Here the aggregate is `SUM`, `COUNT`, or `AVG`.
 ///
 /// Table `i` is named after operand `i`.
 #[derive(Clone, Debug)]
 pub struct Case {
-    /// The einsum under test.
-    pub einsum: Einsum,
+    /// The fold under test: its row value is the product of the operands'
+    /// `v` columns, and its aggregate is `SUM`, `COUNT`, or `AVG`.
+    pub fold: Fold,
     /// One table per operand: its dimension columns, then `v` (`Float64`).
     pub tables: Vec<RecordBatch>,
     /// `JOIN ... ON` with `=` or `IS NOT DISTINCT FROM`, `GROUP BY` the output
-    /// dimensions, and `SUM` of the product of the `v` columns.
+    /// dimensions, and the aggregate of the product of the `v` columns.
     pub sql: String,
 }
 
@@ -62,7 +68,7 @@ impl Case {
     /// `Float64` (whose coordinates include `0.0`, `-0.0`, and NaN).
     /// Keys are sometimes NULL; `v` has NULLs and NaN; tables may be empty and
     /// repeat coordinate tuples. With more than two operands, every dimension
-    /// uses [`KeyEquality::Equal`], to avoid a DataFusion bug.
+    /// uses [`KeyEquality::Equal`], to avoid a DataFusion bug (issues #21 and #22).
     pub fn generate_with(seed: u64, n_operands: usize) -> Case {
         let mut rng = Rng(seed);
         let n_dims = 2 + rng.below(3);
@@ -105,10 +111,11 @@ impl Case {
         }
         let equality: BTreeMap<Dim, KeyEquality> =
             (0..n_dims).map(|i| (dim(i), pool[i].2)).collect();
-        let einsum = Einsum::new(operands, output, equality, Semiring::SumProduct)
-            .expect("generated einsums are well formed");
+        let aggregate = [Aggregate::Sum, Aggregate::Count, Aggregate::Avg][rng.below(3)];
+        let fold = Fold::new(operands, output, equality, RowValue::Product, aggregate)
+            .expect("generated folds are well formed");
         let info = |d: &Dim| pool[d.0[1..].parse::<usize>().unwrap()];
-        let tables = einsum
+        let tables = fold
             .operands()
             .iter()
             .map(|op| {
@@ -167,18 +174,13 @@ impl Case {
                 RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).expect("columns match")
             })
             .collect();
-        let sql = build_sql(&einsum);
-        Case {
-            einsum,
-            tables,
-            sql,
-        }
+        let sql = build_sql(&fold);
+        Case { fold, tables, sql }
     }
 }
 
-/// Blacher's four rules (design §2.2) for an einsum whose operands each hold a
-/// dimension at most once.
-fn build_sql(e: &Einsum) -> String {
+/// The SQL for a fold whose operands each hold a dimension at most once.
+fn build_sql(e: &Fold) -> String {
     let ops = e.operands();
     let first = |d: &Dim| {
         ops.iter()
@@ -195,7 +197,12 @@ fn build_sql(e: &Einsum) -> String {
     for (s, d) in select.iter().zip(e.output()) {
         sql += &format!("{s} AS {d}, ");
     }
-    sql += &format!("SUM({}) AS v FROM {}", product.join(" * "), ops[0].name);
+    sql += &format!(
+        "{}({}) AS v FROM {}",
+        e.aggregate().sql_name(),
+        product.join(" * "),
+        ops[0].name
+    );
     for (i, op) in ops.iter().enumerate().skip(1) {
         let on: Vec<String> = op
             .dims
@@ -223,8 +230,14 @@ fn build_sql(e: &Einsum) -> String {
 
 impl fmt::Display for Case {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "einsum: {}\nsql: {}", self.einsum, self.sql)?;
-        for (op, t) in self.einsum.operands().iter().zip(&self.tables) {
+        writeln!(
+            f,
+            "fold: {} {}\nsql: {}",
+            self.fold.aggregate(),
+            self.fold,
+            self.sql
+        )?;
+        for (op, t) in self.fold.operands().iter().zip(&self.tables) {
             let t = datafusion::arrow::util::pretty::pretty_format_batches(std::slice::from_ref(t));
             writeln!(f, "table {}:\n{}", op.name, t.map_err(|_| fmt::Error)?)?;
         }

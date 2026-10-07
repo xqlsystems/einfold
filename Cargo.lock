@@ -1339,6 +1339,7 @@ version = "0.0.0"
 dependencies = [
  "datafusion",
  "einfold-ir",
+ "futures",
  "tokio",
 ]
 

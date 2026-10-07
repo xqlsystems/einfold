@@ -209,7 +209,7 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::physical_plan::{collect, displayable};
     use datafusion::prelude::SessionContext;
-    use einfold_ir::{Aggregate, Dim, KeyEquality, Operand, RowValue};
+    use einfold_ir::{Aggregate, Dim, KeyEquality, Op, Operand, RowValue};
 
     fn fold_with(aggregate: Aggregate) -> Fold {
         let d = |s: &str| Dim::new(s);
@@ -223,7 +223,7 @@ mod tests {
                 .iter()
                 .map(|s| (d(s), KeyEquality::Equal))
                 .collect(),
-            RowValue::Product,
+            RowValue::Product(Op::Mul),
             aggregate,
         )
         .unwrap()
@@ -238,7 +238,7 @@ mod tests {
     }
 
     fn out_schema() -> SchemaRef {
-        schema_for(Aggregate::Sum)
+        schema_for(Aggregate::SUM)
     }
 
     fn schema_for(aggregate: Aggregate) -> SchemaRef {
@@ -283,7 +283,7 @@ mod tests {
     }
 
     fn exec(a: &[Vec<RecordBatch>], b: &[Vec<RecordBatch>]) -> Arc<EinFoldExec> {
-        exec_with(Aggregate::Sum, a, b)
+        exec_with(Aggregate::SUM, a, b)
     }
 
     fn exec_with(
@@ -301,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn every_aggregate_matches_kernel() {
         let (pa, pb) = (partitions(&rows(3, 60), 4), partitions(&rows(5, 45), 3));
-        for agg in [Aggregate::Sum, Aggregate::Count, Aggregate::Avg] {
+        for agg in [Aggregate::SUM, Aggregate::COUNT, Aggregate::AVG] {
             let got = run(exec_with(agg, &pa, &pb)).await;
             let want = fold_join(&fold_with(agg), &operand(&pa), &operand(&pb)).unwrap();
             assert_eq!(got.columns(), want.columns(), "{agg}");
@@ -330,7 +330,7 @@ mod tests {
         let (ra, rb) = (rows(3, 60), rows(5, 45));
         let (pa, pb) = (partitions(&ra, 4), partitions(&rb, 3));
         let got = run(exec(&pa, &pb)).await;
-        let want = fold_join(&fold_with(Aggregate::Sum), &operand(&pa), &operand(&pb)).unwrap();
+        let want = fold_join(&fold_with(Aggregate::SUM), &operand(&pa), &operand(&pb)).unwrap();
         assert!(got.num_rows() > 0);
         assert_eq!(got.columns(), want.columns());
         assert_eq!(got.schema(), out_schema());
@@ -385,7 +385,7 @@ mod tests {
             MemorySourceConfig::try_new_exec(&p, in_schema(), None).unwrap();
         let narrow = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)]));
         assert!(EinFoldExec::try_new(
-            fold_with(Aggregate::Sum),
+            fold_with(Aggregate::SUM),
             child.clone(),
             child.clone(),
             narrow

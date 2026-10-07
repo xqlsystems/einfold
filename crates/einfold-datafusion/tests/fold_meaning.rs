@@ -230,9 +230,9 @@ fn finish(
         .into_values()
         .map(|(key, sum, count)| {
             let value = match aggregate {
-                Aggregate::Sum => ScalarValue::Float64(sum),
-                Aggregate::Count => ScalarValue::Int64(Some(count)),
-                Aggregate::Avg => ScalarValue::Float64(sum.map(|s| s / count as f64)),
+                Aggregate::SUM => ScalarValue::Float64(sum),
+                Aggregate::COUNT => ScalarValue::Int64(Some(count)),
+                Aggregate::AVG => ScalarValue::Float64(sum.map(|s| s / count as f64)),
                 other => panic!("unexpected aggregate {other}"),
             };
             (key, value)

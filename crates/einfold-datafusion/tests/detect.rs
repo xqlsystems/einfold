@@ -444,7 +444,7 @@ async fn count_star() {
     let det = detected("SELECT a.i, COUNT(*) FROM a JOIN b ON a.k = b.k GROUP BY a.i").await;
     assert_eq!(det.fold.to_string(), "COUNT(a[i,k] · b[k]) -> [i]");
     // COUNT of a product is a sum of 0/1 indicators: a semiring fold.
-    assert_eq!(det.fold.semiring(), Some(Semiring::SumProduct));
+    assert_eq!(det.fold.semiring(), Some(Semiring::SUM_PRODUCT));
     assert_eq!(
         values(&det),
         [
@@ -481,14 +481,14 @@ async fn avg_of_a_product() {
     assert_eq!(det.fold.to_string(), "AVG(a[i,k] · b[k]) -> [i]");
     // AVG is SUM / COUNT, not itself a semiring aggregate.
     assert_eq!(det.fold.semiring(), None);
-    assert_eq!(det.fold.aggregate(), Aggregate::Avg);
+    assert_eq!(det.fold.aggregate(), Aggregate::AVG);
     assert_eq!(det.value_output.name, "avg(a.v * b.v)");
 }
 
 #[tokio::test]
 async fn sum_is_a_semiring_fold() {
     let det = detected("SELECT a.i, SUM(a.v * b.v) FROM a JOIN b ON a.k = b.k GROUP BY a.i").await;
-    assert_eq!(det.fold.semiring(), Some(Semiring::SumProduct));
+    assert_eq!(det.fold.semiring(), Some(Semiring::SUM_PRODUCT));
 }
 
 #[tokio::test]

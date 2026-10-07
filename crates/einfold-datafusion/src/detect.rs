@@ -47,7 +47,7 @@ use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
 use datafusion::logical_expr::{
     when, BinaryExpr, Expr, ExprSchemable, Filter, JoinType, LogicalPlan, Operator,
 };
-use einfold_ir::{Aggregate, Dim, Fold, KeyEquality, Operand, RowValue};
+use einfold_ir::{Aggregate, Dim, Fold, KeyEquality, Op, Operand, RowValue};
 
 /// A fold found in a plan: the [`Fold`], bound to the plan's inputs and to the
 /// `Aggregate` node's output, so that a rule can replace the node.
@@ -122,11 +122,11 @@ pub fn detect(plan: &LogicalPlan) -> Option<FoldMatch> {
     }
     let udf = func.func.inner();
     let aggregate = if udf.is::<Sum>() {
-        Aggregate::Sum
+        Aggregate::SUM
     } else if udf.is::<Avg>() {
-        Aggregate::Avg
+        Aggregate::AVG
     } else if udf.is::<Count>() {
-        Aggregate::Count
+        Aggregate::COUNT
     } else {
         return None;
     };
@@ -134,7 +134,7 @@ pub fn detect(plan: &LogicalPlan) -> Option<FoldMatch> {
     // in SQL, and a rewrite that reorders or regroups the additions could
     // overflow where the original did not. `COUNT` is exact on any type.
     let arg_type = p.args[0].get_type(agg.input.schema()).ok()?;
-    if aggregate != Aggregate::Count && arg_type != DataType::Float64 {
+    if aggregate != Aggregate::COUNT && arg_type != DataType::Float64 {
         return None;
     }
 
@@ -351,7 +351,14 @@ impl Builder {
             .iter()
             .map(|(root, k)| (dims[root].clone(), *k))
             .collect();
-        let fold = Fold::new(operands, output, equality, RowValue::Product, aggregate).ok()?;
+        let fold = Fold::new(
+            operands,
+            output,
+            equality,
+            RowValue::Product(Op::Mul),
+            aggregate,
+        )
+        .ok()?;
         let group_outputs = group_dims
             .into_iter()
             .enumerate()
@@ -412,7 +419,7 @@ impl Builder {
     /// and each factor becomes `1.0` or NULL.
     fn factors(&self, arg: Expr, aggregate: Aggregate) -> Option<Vec<Option<Expr>>> {
         let schema = self.slot_schema()?;
-        let count = aggregate == Aggregate::Count;
+        let count = aggregate == Aggregate::COUNT;
         let mut flat = Vec::new();
         flatten_product(arg, &schema, count, &mut flat)?;
         let mut factors: Vec<Option<Expr>> = vec![None; self.leaves.len()];

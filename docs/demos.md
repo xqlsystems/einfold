@@ -52,14 +52,14 @@ GROUP BY w.i, v.d, n.z;
 
 | FlashAttention's idea | einfold's mechanism | Status in the design |
 |---|---|---|
-| Skip tiles above the diagonal | The predicate `q.t >= k.t` becomes a mask operand, and the block-sparse algorithm skips absent tiles and masks the diagonal ones | Designed (design.md §9.1, §10.2) |
+| Skip tiles above the diagonal | The predicate `q.t >= k.t` becomes a mask, and the block-sparse algorithm skips absent tiles and masks the diagonal ones | Designed (design.md §9.1, §10.2) |
 | Work tile by tile with bounded memory | Tiles in the algebra: block einsums with a per-task memory budget | Designed (§8.2, §9.4); prototyped for matrix multiplication in spike S20 |
 | Never store join rows for `QKᵀ` or for the product with `V` | The EinFold join fuses each join with its sum | Designed (§10.2) |
 | Never store the `N×N` scores *between* the two products | Fuse the scores, the softmax and the product with `V` into one task over (query tile, key tile) pairs | **Gap:** fusion across einsums, with a nonlinear step between them |
-| The online softmax: a running maximum and sum, rescaled as larger scores arrive | The partial aggregate for each output row becomes the triple (maximum, normalizer, weighted sum), combined with `m = max(m₁, m₂)`, `z = z₁·e^(m₁−m) + z₂·e^(m₂−m)`, `a = a₁·e^(m₁−m) + a₂·e^(m₂−m)` | **Gap:** partial aggregates (§8.3) cover `SUM` only. This combine is associative, so it generalizes cleanly. It is the "log-sum-exp" semiring, which ties into the semiring open question (§14). |
+| The online softmax: a running maximum and sum, rescaled as larger scores arrive | The partial aggregate for each output row becomes the triple (maximum, normalizer, weighted sum), combined with `m = max(m₁, m₂)`, `z = z₁·e^(m₁−m) + z₂·e^(m₂−m)`, `a = a₁·e^(m₁−m) + a₂·e^(m₂−m)` | **Partly designed:** since RFC 0001, partial aggregates (§8.3) are general, and this combine is associative and commutative, so EinFold can compute it as a fold. **Gap:** no algebraic rewrite covers it yet. It is the "log-sum-exp" semiring, which ties into the semiring open question (§14). |
 | Recognize the softmax in SQL | Detect `exp(s − MAX(s) OVER (PARTITION BY i))`, normalized by a sum over the same partition | **Gap:** detection does not yet look at window functions |
 
-So the demo is achievable, and the gaps are specific: generalized partial aggregates, fusion across einsums, and softmax detection.
+So the demo is achievable, and the gaps are specific: algebraic rewrites for the softmax's fold, fusion across folds, and softmax detection.
 
 ### Success criteria
 
@@ -68,7 +68,7 @@ So the demo is achievable, and the gaps are specific: generalized partial aggreg
 - Results match the naive SQL plan within floating-point tolerance, and repeat bit for bit in the reference executor.
 - Measured on einfold's DataFusion reference executor against the naive plan on DataFusion and DuckDB.
 
-FlashAttention's speed on GPUs also comes from managing on-chip memory, and that is the host's job. einfold produces the plan's *structure*. Running it at GPU-kernel speed requires a host that implements the `Einsum` relation, such as Sirius or NVIDIA's GPU Query Engine.
+FlashAttention's speed on GPUs also comes from managing on-chip memory, and that is the host's job. einfold produces the plan's *structure*. Running it at GPU-kernel speed requires a host that implements the `Fold` relation, such as Sirius or NVIDIA's GPU Query Engine.
 
 ## Demo 2: NanoGPT in N lines of SQL, plus an M-line diff for the sparsity record
 
@@ -165,7 +165,7 @@ Zarr facts and readers, projection and filter pushdown into chunk reads, semi-jo
 
 | Design feature | FlashAttention | NanoGPT | GraphCast |
 |---|---|---|---|
-| Mask operands and partly masked tiles | ✓ | ✓ | |
+| Masks and partly masked tiles | ✓ | ✓ | |
 | EinFold join (fused join and sum) | ✓ | ✓ | ✓ |
 | Tiles with a memory budget (S20) | ✓ | | ✓ |
 | Derived factors | ✓ | ✓ | ✓ |
@@ -177,7 +177,7 @@ Zarr facts and readers, projection and filter pushdown into chunk reads, semi-jo
 
 Design gaps found, in order of how many demos need them:
 
-1. **Generalized partial aggregates.** Associative combines beyond `SUM`, such as the online softmax's (maximum, normalizer, weighted sum). FlashAttention, and NanoGPT through its attention and loss.
+1. **Rewrites for folds beyond `SUM`.** Since RFC 0001, EinFold computes any fold whose partial states merge, including the online softmax's (maximum, normalizer, weighted sum). What remains is algebra for it: eager aggregation and contraction order under the log-sum-exp semiring. FlashAttention, and NanoGPT through its attention and loss.
 2. **Fusion across einsums** with a nonlinear step in between. FlashAttention and NanoGPT.
 3. **Detecting window functions,** such as `MAX(s) OVER (PARTITION BY i)` in a softmax. FlashAttention and NanoGPT.
 4. **Semi-join reduction through deep plans,** and receptive fields as bounds on support. GraphCast.

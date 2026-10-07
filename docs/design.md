@@ -4,31 +4,32 @@ SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# einfold: Fast Tensor Contractions for the XQL Model
+# einfold: Fast Folds over Joins, for Tensors and the XQL Model
 
-Status: draft v12. Author: Alex Merose. Last updated: 2026-10-06. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
+Status: draft v13. Author: Alex Merose. Last updated: 2026-10-07. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
 
 This doc gives the design and the reasons for it. Its companion, the [supplement](supplement.md), holds the details: algorithms, rule tables, correctness arguments, and the evidence from spikes. The supplement's sections are numbered to match this doc's.
 
 ## 1. Summary
 
-einfold makes tensor computation fast inside SQL engines, on any hardware those engines run on. Its name joins *einsum*, the standard notation for tensor contractions, with *fold*, functional programming's word for a reducing pass. That is the system's core idea: evaluate an einsum by folding its sums into the joins that feed them.
+einfold makes tensor computation, and more generally aggregation over joins, fast inside SQL engines, on any hardware those engines run on. Its name joins *einsum*, the standard notation for tensor contractions, with *fold*, functional programming's word for a reducing pass. That is the system's core idea: evaluate an aggregate over a join by folding each joined row into its group as the join produces it, so the join's rows never pile up.
 
-**The setting.** XQL Systems builds SQL access to large scientific arrays, such as climate and weather data. In the XQL model, a dataset becomes a table with one row per combination of coordinates (for example one row per time, latitude, and longitude), and each variable (such as temperature) becomes a column. Much array math then becomes joins and aggregations. In particular, a **tensor contraction** (matrix multiplication is the simplest case) becomes a join followed by a `SUM` over groups.
+**The setting.** XQL Systems builds SQL access to large scientific arrays, such as climate and weather data. In the XQL model, a dataset becomes a table with one row per combination of coordinates (for example one row per time, latitude, and longitude), and each variable (such as temperature) becomes a column. Much array math then becomes joins and aggregations. In particular, a **tensor contraction** (matrix multiplication is the simplest case) becomes a join followed by a `SUM` over groups. That shape, a join followed by any aggregate, is what einfold calls a **fold over a join** (section 2.2).
 
 **The problem.** SQL engines run contractions badly. They materialize huge intermediate joins, sum too late, and ignore the dense structure of the arrays (section 3).
 
-**The approach.** einfold **rewrites query plans; it never executes them.** A query plan is the tree of relational operators (scans, joins, aggregates) that an engine builds from a SQL query. einfold takes a plan in, finds the einsums inside it, and returns a plan that the engine runs faster. The engine, which this doc calls the **host**, may run on CPU or GPU. einfold never touches a device. Every part of einfold (plan readers and writers, fact providers, planners, the reference executor) is a separate, swappable piece behind a small interface.
+**The approach.** einfold **rewrites query plans; it never executes them.** A query plan is the tree of relational operators (scans, joins, aggregates) that an engine builds from a SQL query. einfold takes a plan in, finds the folds over joins inside it, and returns a plan that the engine runs faster. The engine, which this doc calls the **host**, may run on CPU or GPU. einfold never touches a device. Every part of einfold (plan readers and writers, fact providers, planners, the reference executor) is a separate, swappable piece behind a small interface.
 
 **Key decisions.**
 
-1. **Two output forms.** A *relational form* of standard joins and aggregates that any host runs, and an `Einsum` extension relation that hosts can adopt for full speed (section 7.2).
-2. **A hybrid optimizer.** Algebraic rewrites run on egglog, an engine that explores many equivalent versions of a plan at once. Contraction order comes from a specialized planner called during egglog's extraction, and tilings are proposed by a planner and chosen in the e-graph (section 7.6).
-3. **Facts in a side channel.** What einfold knows about each operand (dimensions, extents, layouts, statistics) travels in its own fact table, filled by one provider per reader, not in Arrow or Substrait metadata (section 8.1).
-4. **Exact where SQL is exact; deterministic where einfold runs.** einfold never adds nondeterminism, and keeps exactly computed values exact. Bit-for-bit repeatable float sums are a setting on hosts, and the default in einfold's own executor (section 8.6).
-5. **Users declare, einfold proves.** Anything that changes results (filters, masks, approximations) is written in plain SQL. einfold infers only optimizations it can prove exact, such as skipping exact zeros (section 9.2).
-6. **Tiling is part of the algebra.** Following Cubed, a tiled computation is a block-level einsum or a change of tiling, and plans over a memory budget are rejected at planning time (section 9.4).
-7. **Programs, not just queries.** einfold optimizes one plan at a time, or a whole program of plans that read each other's results, such as a training step (section 7.3).
+1. **Folds, not just sums.** The central object is the fold over a join: any aggregate whose partial results merge, such as `SUM`, `COUNT` or `AVG`. Einsums are the most important case. Every fold gets the fused join-and-aggregate operator; *semiring* folds, such as einsums, also get the algebraic rewrites (section 2.2, [RFC 0001](rfcs/0001-folds-over-joins.md)).
+2. **Two output forms.** A *relational form* of standard joins and aggregates that any host runs, and an *extension form*, a `Fold` Substrait relation that hosts can adopt for full speed (section 7.2).
+3. **A hybrid optimizer.** Algebraic rewrites run on egglog, an engine that explores many equivalent versions of a plan at once. Contraction order comes from a specialized planner called during egglog's extraction, and tilings are proposed by a planner and chosen in the e-graph (section 7.6).
+4. **Facts in a side channel.** What einfold knows about each operand (dimensions, extents, layouts, statistics) travels in its own fact table, filled by one provider per reader, not in Arrow or Substrait metadata (section 8.1).
+5. **Exact where SQL is exact; deterministic where einfold runs.** einfold never adds nondeterminism, and keeps exactly computed values exact. Bit-for-bit repeatable float sums are a setting on hosts, and the default in einfold's own executor (section 8.6).
+6. **Users declare, einfold proves.** Anything that changes results (filters, masks, approximations) is written in plain SQL. einfold infers only optimizations it can prove exact, such as skipping exact zeros (section 9.2).
+7. **Tiling is part of the algebra.** Following Cubed, a tiled computation is a block-level einsum or a change of tiling, and plans over a memory budget are rejected at planning time (section 9.4).
+8. **Programs, not just queries.** einfold optimizes one plan at a time, or a whole program of plans that read each other's results, such as a training step (section 7.3).
 
 **Origin.** einfold grew out of [ddx](https://github.com/xqlsystems/ddx), an XQL Systems project for automatic differentiation of SQL queries. Given a query that computes a function (for example a small neural network written as joins and aggregates), ddx produces the queries that compute its gradients. Training a model this way is mostly contractions, and their slowness motivated einfold. ddx benefits from einfold but does not depend on it.
 
@@ -51,7 +52,7 @@ The data lives in **Zarr**, a storage format for large N-dimensional arrays. Zar
 
 All of them flatten a chunked array into rows, and einfold needs the structure they flatten away. Spike S1 found that they also disagree on much of what einfold needs to know, such as whether missing data arrives as NULL or NaN (supplement section 2.1).
 
-### 2.2 Einsums and their relational form
+### 2.2 Einsums, and folds over joins
 
 An **einsum** names each axis of each input with a letter, and names the axes of the output. Any letter that does not appear in the output is summed over. Matrix multiplication `C[n,h] = Σ_d X[n,d]·W[d,h]` is written `nd,dh->nh`. A **tensor contraction** is any einsum that sums over at least one shared axis. (From section 6 on, this doc calls axes *dimensions*.)
 
@@ -69,6 +70,16 @@ Contracted axes become join keys; output axes become group keys. Blacher et al. 
 2. list the output axes in `SELECT` and `GROUP BY`;
 3. take the `SUM` of the product of the values;
 4. equate shared axes in `WHERE`, transitively.
+
+**Folds over joins.** Replace `SUM` with any aggregate, and the product with any expression of the joined row, and the query is still slow for the same reason: the join's rows are materialized before they are aggregated. einfold calls this general shape a **fold over a join**, and recognizes three levels of structure in it ([RFC 0001](rfcs/0001-folds-over-joins.md)):
+
+1. **A fold.** The aggregate's partial results can be merged, associatively and commutatively: `SUM`, `COUNT`, `MIN`, `MAX`, `AVG`, `BOOL_OR`. In algebra, the partial state is a *commutative monoid*. Every fold can be computed by fusing the join with the aggregate, so join rows never exist (section 10.2).
+2. **A semiring fold.** The row value is a product, under some ⊗, of one factor per input, and the aggregate is a ⊕ that ⊗ distributes over: `a ⊗ (b ⊕ c) = (a ⊗ b) ⊕ (a ⊗ c)`. Einsums (`SUM` of `*`) are the main example. `COUNT` of a join, `MIN` of sums (shortest paths) and `MAX` of products are others. Distributivity is what makes it correct to aggregate an input before joining it, and to reorder the joins: the algebraic rewrites of sections 9 and 10.1.
+3. **An algebraic fold.** `AVG(a.v * b.v)` is `SUM(a.v * b.v) / COUNT(a.v * b.v)`, two semiring folds over one join followed by a final division, so it gets everything level 2 gets.
+
+The levels follow the classes of aggregates in Gray et al.'s data-cube paper ("Data Cube: A Relational Aggregation Operator", 1997), which sorts aggregates by the state a partial result must carry. A *distributive* aggregate (`SUM`, `COUNT`, `MIN`, `MAX`, `BOOL_AND`) folds each value, perhaps lifted first (`COUNT` lifts it to 1), with one operation. An *algebraic* aggregate (`AVG`, and in principle variance, covariance and regression) is a fixed tuple of distributive ones plus a final function. Three classes are not folds einfold handles yet: *holistic* aggregates (`MEDIAN`, `COUNT(DISTINCT)`), whose state grows with the input; *approximate* ones (`approx_distinct`), whose state is a mergeable sketch; and *order-dependent* ones (`STRING_AGG`, `FIRST_VALUE`), which are out of scope.
+
+This doc teaches with einsums, the most familiar case, and says where the general fold differs.
 
 ### 2.3 Hosts
 
@@ -117,7 +128,7 @@ Three more problems come from the XQL setting:
 
 - Read relational plans (Substrait, DataFusion's `LogicalPlan`) and write optimized plans (Substrait, SQL for named dialects).
 - Remove the aggregation-pushdown and contraction-order problems on every host, using standard operators only.
-- Define an `Einsum` Substrait extension relation that carries contraction structure and facts, for hosts that implement it.
+- Define an `Fold` Substrait extension relation that carries contraction structure and facts, for hosts that implement it.
 - Carry facts (dimensions, extents, layouts, tilings, statistics) from readers to the plan, Zarr first.
 - Ship a reference executor for DataFusion that proves the extension is worth adopting.
 - Integrate with xarray-sql, duckdb-zarr, zarr-datafusion, Zax-SQL, and ddx.
@@ -131,34 +142,53 @@ Three more problems come from the XQL setting:
 
 ## 6. Vocabulary
 
-einfold sits where three vocabularies meet: XQL and Xarray, einsum notation, and relational algebra. These are the terms the rest of the doc relies on; the supplement (section 6.1) has the full glossary, with each term's einsum and relational equivalents.
+einfold sits where three vocabularies meet: XQL and Xarray, einsum notation, and relational algebra. These are the terms the rest of the doc relies on, by layer; the supplement (section 6.1) has the full glossary.
+
+**Data** (the XQL model):
 
 | Term | Meaning |
 |---|---|
-| **Dimension** | A named axis, such as `lat` or `time`; a key column in a table. This doc says "dimension" where einsum literature says "index" |
-| **Coordinate**, **position** | A label along a dimension (`30.0°N`), and an integer offset `0 … n−1` along it. Coordinates are what tables hold; positions are what dense kernels need |
-| **Extent** | The number of positions along a dimension |
-| **Operand** | One variable over its own dimensions, as input to an einsum: a narrow table `(dims…, value)` |
+| **Coordinate**, **position** | A label along an axis (`30.0°N`), and an integer offset `0 … n−1` along it. Coordinates are what tables hold; positions are what dense kernels need |
+| **Extent** | The number of positions along an axis |
 | **Support** | The coordinate tuples that have a row |
 | **Fill value** | Zarr's value for chunks that were never written |
 | **Tile**, **chunk** | A rectangular box of positions; a chunk is a storage tile in Zarr |
 | **Layout** | How positions within a tile map to row order |
-| **Fact** | Something known about an operand, tagged with how it is known (section 8.1) |
-| **Contraction tree** | A binary tree of pairwise contractions that evaluates an einsum |
-| **EinFold** | einfold's fused join-and-sum operator (section 10.2). The capitalized name is the operator; lowercase **einfold** is the package |
-| **Partial aggregate** | A per-group state that can be combined later (section 8.3) |
-| **Relational form**, **einsum form** | einfold's two output forms (section 7.2) |
+
+**Queries:**
+
+| Term | Meaning |
+|---|---|
+| **Fold** (over a join) | A join of operands, grouped by output dimensions, with an aggregate folding each group's row values (section 2.2) |
+| **Operand** | One input to a fold: a table, a subquery, or a mask. Often one data variable over its own axes |
+| **Dimension** | One variable of a fold: a set of columns the query equates, with how it compares them (`=` or `IS NOT DISTINCT FROM`). A data axis becomes a dimension when a query joins or groups on it. This doc says "dimension" where einsum literature says "index" |
+| **Aggregate** | How a group's values combine (`SUM`, `COUNT`, `AVG`, …), with SQL's rules for NULLs, empty groups and exactness. *Distributive* (one operation) or *algebraic* (distributive parts plus a final function), as section 2.2 explains |
+| **Row value**, **factor** | What each joined row contributes. When it is a product, each operand contributes one **factor**: an expression over that operand's columns alone |
+| **Semiring fold** | A fold whose row value is a ⊗-product of factors, and whose aggregate is a ⊕ that ⊗ distributes over. A property derived from the fold, which unlocks the algebraic rewrites |
+| **Einsum** | The sum-product semiring fold: `SUM` of products |
+| **Mask** | An operand that only filters which rows join, contributing no value: its factor is ⊗'s identity (section 9.1) |
+| **Fact** | Something known about an operand or a dimension, tagged with how it is known (section 8.1) |
+
+**Evaluation and execution:**
+
+| Term | Meaning |
+|---|---|
+| **Partial aggregate** | A group's state over part of the input, mergeable with other parts: whether any row reached the group, plus the aggregate's own state (section 8.3) |
+| **Accumulator** | How an aggregate state's additions are computed numerically, such as plain `f64` or a binned reproducible sum (section 8.6) |
+| **Contraction**, **contraction tree** | One step of a semiring fold: join two operands, and aggregate away the dimensions nothing else needs. A tree of them evaluates the fold |
+| **EinFold** | einfold's fused join-and-fold operator, for any fold (section 10.2). The capitalized name is the operator; lowercase **einfold** is the package |
+| **Relational form**, **extension form** | einfold's two output forms: standard joins and aggregates, or a `Fold` Substrait relation (section 7.2) |
 | **Target profile** | Data describing what a host supports (section 7.4) |
 | **E-graph**, **extraction** | A structure holding many equivalent versions of an expression, and choosing the cheapest one (section 7.6) |
 
-Notation: `dims(T)` is the set of dimensions of operand `T`, and `O` the output dimensions. A dimension in two or more operands is **shared**; one not in `O` is **summed**; one in exactly one operand and not in `O` is **private**.
+Notation: `dims(T)` is the set of dimensions of operand `T`, and `O` the output dimensions. A dimension in two or more operands is **shared**; one not in `O` is **aggregated away** (for einsums, *summed*); one in exactly one operand and not in `O` is **private**. A query can name one output dimension in several output columns (`GROUP BY a.k, b.k` where `a.k = b.k`), so output dimensions and output columns are kept distinct.
 
 **Nuances of the data model.** Every rewrite respects these; the supplement (section 6.2) explains each.
 
 - Coordinates are not positions, and the map between them is a fact that must be exact.
 - Joins compare coordinates exactly, and the fill value decides what a missing chunk means.
 - SQL semantics govern, not Xarray's: SQL `SUM` skips NULL but propagates NaN.
-- A group exists only where some row joined, and its `SUM` is NULL only if every contribution was NULL.
+- A group exists only where some row joined, whatever the aggregate. Its `SUM` or `AVG` is NULL only if every contribution was NULL, and its `COUNT` is then 0.
 - SQL sums duplicates (bag semantics).
 - Memory order, sharding and irregular chunk grids are all metadata a reader must report.
 
@@ -175,7 +205,7 @@ flowchart LR
     fprog[Program of plans]
   end
   subgraph core [einfold core]
-    rel[Rel IR] --> det[Detect] --> eir[EinsumIR]
+    rel[Rel IR] --> det[Detect] --> eir[fold IR]
     eir --> logi["Logical optimizer<br/>(egglog rules + planners)"]
     logi --> phys[Physical realization]
   end
@@ -183,7 +213,7 @@ flowchart LR
   subgraph writers [Writers]
     wsub["Substrait<br/>(GQE, Sirius, DuckDB, DataFusion)"]
     wsql["SQL text<br/>(DuckDB, gpudb, any SQL host)"]
-    wdf["DataFusion plan<br/>(+ EinsumExec)"]
+    wdf["DataFusion plan<br/>(+ EinFoldExec)"]
   end
   fsub --> rel
   fdf --> rel
@@ -195,18 +225,18 @@ flowchart LR
 ```
 
 - **Rel IR.** einfold's representation of relational plans, kept close to Substrait.
-- **EinsumIR.** einfold's representation of an einsum: operands, dimensions, output dimensions, and the semiring (the pair of operations used for "add" and "multiply"), with facts attached to each operand.
-- **Logical optimizer** (section 9). Detection, pruning, contraction order, tiling, and sharing work across einsums.
+- **Fold IR.** einfold's representation of a fold over a join: operands, dimensions (each with its key equality), output dimensions, the row value and the aggregate, with facts attached. Whether the fold is a semiring fold is derived from these, not stored.
+- **Logical optimizer** (section 9). Detection, pruning, contraction order, tiling, and sharing work across folds.
 - **Physical realization** (section 10). Turns each node of the contraction tree into something a host can run.
 
 ### 7.2 Output forms
 
 einfold produces two output forms, and picks one per subplan from the host's target profile.
 
-- **The relational form** is standard Substrait or SQL. Each node of the contraction tree becomes a join followed by an aggregate, so dimensions are summed out as early as possible (section 10.1). It fixes problem 2 on every host. It cannot speed up a two-operand contraction such as a matrix product, which has nothing to sum early.
-- **The einsum form** is an `Einsum` Substrait extension relation that carries the contraction and its facts. A host that implements it can run EinFold (section 10.2), with dense and block-sparse kernels, at GEMM-class speed. It is the only fix for problem 1. It is published as a spec with a conformance suite, so hosts can adopt it without depending on einfold's code.
+- **The relational form** is standard Substrait or SQL. For a semiring fold, each node of the contraction tree becomes a join followed by an aggregate, so dimensions are aggregated away as early as possible (section 10.1). It fixes problem 2 on every host. It cannot speed up a two-operand fold such as a matrix product, which has nothing to aggregate early, nor a fold that isn't a semiring fold.
+- **The extension form** is a `Fold` Substrait extension relation that carries a fold and its facts. A host that implements it can run EinFold (section 10.2), which fuses the join with the aggregate for any fold, with dense and block-sparse kernels where the semiring has them, at GEMM-class speed for einsums. It is the only fix for problem 1. It is published as a spec with a conformance suite, so hosts can adopt it without depending on einfold's code.
 
-einfold ships one reference executor: `EinsumExec`, a DataFusion operator that implements the einsum form. It proves the extension is worth adopting, and ddx uses it directly. Device executors belong to the hosts.
+einfold ships one reference executor: `EinFoldExec`, a DataFusion operator that implements the extension form. It proves the extension is worth adopting, and ddx uses it directly. Device executors belong to the hosts.
 
 ### 7.3 Deployment modes
 
@@ -219,14 +249,14 @@ einfold ships one reference executor: `EinsumExec`, a DataFusion operator that i
 
 A **target profile** describes a host as data, not code, so supporting a new host needs no einfold release. It records:
 
-- the plan formats and SQL dialect the host reads, and whether it implements the `Einsum` relation, and for which types;
+- the plan formats and SQL dialect the host reads, and whether it implements the `Fold` relation, and for which types;
 - which join and aggregate shapes it fuses;
 - how to stop its optimizer from undoing or choking on einfold's plan (section 9.3);
 - its deterministic mechanisms and precision levels (section 8.6);
 - whether its readers accept aggregate pushdown (section 10.5);
 - quirks of its plan reader that einfold's writers must respect.
 
-Fallback is per subplan: einfold can emit the einsum form for one subplan and the relational form for another, in the same plan.
+Fallback is per subplan: einfold can emit the extension form for one subplan and the relational form for another, in the same plan.
 
 ### 7.5 Components
 
@@ -234,11 +264,11 @@ einfold is written in Rust, as several crates, with Python bindings.
 
 | Crate | Role | Depends on |
 |---|---|---|
-| `einfold-ir` | Rel IR, EinsumIR, facts, tiles, partial-aggregate states | nothing engine-specific |
+| `einfold-ir` | Rel IR, fold IR, facts, tiles, partial-aggregate states | nothing engine-specific |
 | `einfold-plan` | Logical optimizer (egglog rules in `.egg` files, plus planners) and physical realization | `einfold-ir`, `egglog` |
-| `einfold-substrait` | Substrait in and out; the `Einsum` relation | `einfold-ir`, `substrait` |
+| `einfold-substrait` | Substrait in and out; the `Fold` relation | `einfold-ir`, `substrait` |
 | `einfold-sql` | SQL writers per dialect | `einfold-ir` |
-| `einfold-datafusion` | `LogicalPlan` frontend, optimizer rule, reference `EinsumExec` | `einfold-plan`, DataFusion |
+| `einfold-datafusion` | `LogicalPlan` frontend, optimizer rule, reference `EinFoldExec` | `einfold-plan`, DataFusion |
 | `einfold-zarr` | Zarr fact provider | `einfold-ir`, a Zarr metadata reader |
 | `einfold-py` | Python bindings | the above |
 
@@ -297,12 +327,12 @@ A **tile** is a rectangular box of positions. A Zarr chunk, a scan partition, a 
 
 ### 8.3 Partial aggregates
 
-A **partial aggregate** is the state of one output group, computed over part of the input and combined later. Eager aggregation, EinFold's accumulator, slicing, parallel partitions and reduction at the source all produce them, so their SQL semantics are defined once. For `SUM` over products, the state is:
+A **partial aggregate** is the state of one output group, computed over part of the input and combined later. Eager aggregation, EinFold, slicing, parallel partitions and reduction at the source all produce them, so their SQL semantics are defined once. The state has two independent parts:
 
-- `matched`: did any joined row reach the group? This decides whether the group exists;
-- `value`: the sum of the non-NULL products, or "none".
+- **group existence:** did any joined row reach the group? SQL creates a group exactly when one does, whatever the row's value, so this is the same for every aggregate;
+- **the aggregate's state:** one partial result per distributive part of the aggregate: a sum for `SUM`, a minimum for `MIN`, a sum and a count for `AVG`. Each part is a commutative monoid, and so is their product, so states merge in any grouping and order.
 
-Setting `matched` before testing for NULL keeps an all-NULL group in the output as NULL rather than dropping it.
+A row marks its group as reached before its value is tested for NULL. So a group reached only by NULL values exists, with `SUM` and `AVG` NULL and `COUNT` 0, rather than vanishing. Keeping existence apart from the aggregate's state gives every aggregate this rule for free. *How* a state's additions are computed numerically is a third, separate choice: the **accumulator** (section 8.6).
 
 ### 8.4 Order is a layout
 
@@ -310,9 +340,9 @@ The order in which rows arrive is a layout: which dimensions vary slowest and wh
 
 ### 8.5 Structure and values
 
-Most of what einfold computes depends only on **structure**: the einsum, extents, tilings and support. Only the final arithmetic depends on **values**. So structure is computed once and reused:
+Most of what einfold computes depends only on **structure**: the fold, extents, tilings and support. Only the final arithmetic depends on **values**. So structure is computed once and reused:
 
-- contraction trees are cached, keyed by the einsum in canonical form, never by table names;
+- contraction trees are cached, keyed by the fold in canonical form, never by table names;
 - when the support is fixed and only values change, EinFold runs a cached symbolic pass once and then only numeric passes, which fits ddx's training steps exactly;
 - densities measured in one run remain facts for later runs over the same support.
 
@@ -323,7 +353,7 @@ Floating-point addition is not associative, so a parallel sum can differ in its 
 1. **einfold never adds nondeterminism.** Its own decisions depend only on the plan, the facts and the data, never on timing. Rewrites may still change which numbers are added together, so float results can differ in their last bits from the original plan's; "equivalent" in principle 4 means mathematically equivalent.
 2. **Exactness invariant.** Exact values stay exact: `COUNT`, `MIN`, `MAX`, integers and `DECIMAL`, and any value a comparison, filter, join key, ordering or `LIMIT` depends on. Rewrites that could overflow an exact type apply only when facts prove they cannot.
 3. **Determinism is a setting on hosts,** off by default, like every engine's. When requested, einfold uses only the deterministic mechanisms the host's profile lists, such as a single partition or `DECIMAL`, or leaves the subplan unchanged and says why.
-4. **Determinism is the default where einfold executes:** in `EinsumExec` and in the `Einsum` relation's spec. Its accumulator is a **binned reproducible sum**, which gives the same bits in any order, on any number of threads, and with GPU atomics. Spike S8 measured it at 3–4.4× a plain sum on CPU and 3.5× on a GPU. It was also more accurate than the plain sum.
+4. **Determinism is the default where einfold executes:** in `EinFoldExec` and in the `Fold` relation's spec. Its accumulator is a **binned reproducible sum**, which gives the same bits in any order, on any number of threads, and with GPU atomics. Spike S8 measured it at 3–4.4× a plain sum on CPU and 3.5× on a GPU. It was also more accurate than the plain sum.
 5. **Precision is its own setting,** with levels `fast`, `default` and `highest`, after JAX's.
 6. **Warn where small differences become big ones,** when a float sum feeds a filter, ordering, tie or join.
 
@@ -331,40 +361,40 @@ The supplement (section 8.6) gives the full policy and the measurements.
 
 ## 9. Logical optimization
 
-The logical optimizer rewrites einsums without choosing how each node runs.
+The logical optimizer rewrites folds without choosing how each node runs. Detection, pruning and sharing apply to every fold. Contraction order and tiling apply to semiring folds, whose aggregate may move below joins (section 2.2).
 
 ```mermaid
 flowchart LR
-  a["Detect and normalize<br/>(9.1)"] --> b["Prune<br/>(9.2)"] --> c["Plan contraction tree<br/>(9.3)"] --> d["Choose tiling<br/>(9.4)"] --> e["Share across einsums<br/>(9.5)"]
+  a["Detect and normalize<br/>(9.1)"] --> b["Prune<br/>(9.2)"] --> c["Plan contraction tree<br/>(9.3)"] --> d["Choose tiling<br/>(9.4)"] --> e["Share across folds<br/>(9.5)"]
 ```
 
 ### 9.1 Detect and normalize
 
-Detection finds `Aggregate(SUM(…))` over a tree of joins, filters and projections, anywhere in a plan, and sums of such aggregates over `UNION ALL`. It turns each into an einsum:
+Detection finds an aggregate (`SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, and logical folds) over a tree of joins, filters and projections, anywhere in a plan, and sums of such aggregates over `UNION ALL`. It turns each into a fold, and classifies it at the strongest level it can prove: a semiring fold, an algebraic fold such as `AVG`, or a fold that only allows fusing the join with the aggregate:
 
 - **It looks through projections** to find the product.
 - **It separates variables.** A dataset table repeats each variable across the dimensions it lacks. Detection splits each variable into its own operand, so a latitude weight becomes an operand over latitude only, and its repetition disappears.
 - **It treats any expression over one operand as one factor.**
 - **It builds dimensions from join conditions,** by union-find over `=` and `IS NOT DISTINCT FROM`. Each kind of equality is preserved, so NULL keys behave as before.
-- **It classifies filters.** A filter on a dimension becomes a slice, and a filter on values shrinks an operand's support. A predicate relating dimensions of different operands, such as a causal mask `q.t >= k.t`, becomes a **mask operand**: the set of allowed coordinate pairs, joined in like any other operand.
+- **It classifies filters.** A filter on a dimension becomes a slice, and a filter on values shrinks an operand's support. A predicate relating dimensions of different operands, such as a causal mask `q.t >= k.t`, becomes a **mask**: the set of allowed coordinate pairs, joined in like any other operand.
 - **It lets extraction decide whether to expand a product over a sum,** following Galley's cost-based approach.
 
 Anything detection cannot prove equivalent is left unchanged. The algorithm, with its correctness conditions, is in supplement section 9.1.
 
 ### 9.2 Prune the support
 
-Before contracting, einfold removes rows that cannot change the result: rows with no join partner anywhere in the einsum, by semi-joins in the style of Yannakakis, and rows whose factor is exactly zero. A user who writes a filter such as `WHERE v <> 0` declares that semantics, and einfold keeps it at the operand and exploits it. einfold drops zero rows on its own only under three checkable conditions: the zero feeds only a sum of products; the other factors are finite (since `0 × NaN` is NaN); and whether a group exists is not visible downstream. Dropping merely *small* values is an approximation, and stays the user's to write (principle 8).
+Before contracting, einfold removes rows that cannot change the result: rows with no join partner anywhere in the fold, by semi-joins in the style of Yannakakis, and rows whose factor is exactly zero. A user who writes a filter such as `WHERE v <> 0` declares that semantics, and einfold keeps it at the operand and exploits it. einfold drops zero rows on its own only under three checkable conditions: the zero feeds only a sum of products; the other factors are finite (since `0 × NaN` is NaN); and whether a group exists is not visible downstream. Dropping merely *small* values is an approximation, and stays the user's to write (principle 8).
 
 ### 9.3 Plan the contraction tree
 
-The order of contractions matters as much as join order. For `ij,jk,k->i`, multiplying the matrices first costs `|i|·|j|·|k|` multiplications, while contracting `jk,k->j` first costs `|j|·|k| + |i|·|j|`. einfold plans in the manner of opt_einsum and cotengra:
+For a semiring fold, the order of contractions matters as much as join order. For the einsum `ij,jk,k->i`, multiplying the matrices first costs `|i|·|j|·|k|` multiplications, while contracting `jk,k->j` first costs `|j|·|k| + |i|·|j|`. einfold plans in the manner of opt_einsum and cotengra:
 
 - private dimensions are summed out first;
 - the search is exhaustive for a few operands, dynamic programming up to about 14, and greedy beyond;
 - costs combine FLOPs, intermediate size, retiling IO and reordering;
 - trees are cached.
 
-**Plan protection.** A decomposed einsum is a deep tree of small queries, and a host's optimizer can spend more time on it than it saves. Spike S10 reproduced Blacher et al.'s satisfiability example on current hosts:
+**Plan protection.** A decomposed fold is a deep tree of small queries, and a host's optimizer can spend more time on it than it saves. Spike S10 reproduced Blacher et al.'s satisfiability example on current hosts:
 
 - *Both DuckDB and DataFusion kept a contraction order written as CTEs.*
 - *DuckDB took 56 s to plan 91 inlined CTEs,* and over 3 minutes for 218. Written `AS MATERIALIZED`, the same CTEs planned in under 0.4 s.
@@ -385,9 +415,9 @@ Spike S20 found this works:
 
 In a query, a tiling becomes a partition key; when it matches the Zarr chunks, partitions map one-to-one onto chunks.
 
-### 9.5 Share work across einsums
+### 9.5 Share work across folds
 
-Einsums that read the same operand can share one scan of it. In program mode, that includes steps of a ddx program, such as the two gradient contractions of a layer, which both read the output gradient. Identical subexpressions are computed once, which the e-graph provides for free.
+Folds that read the same operand can share one scan of it. In program mode, that includes steps of a ddx program, such as the two gradient contractions of a layer, which both read the output gradient. Identical subexpressions are computed once, which the e-graph provides for free.
 
 ## 10. Physical realization
 
@@ -395,14 +425,14 @@ Each node of the contraction tree becomes either a relational join-aggregate or 
 
 ### 10.1 The relational form: eager aggregation
 
-Sum out a dimension as soon as no later step needs it. Over a whole contraction tree, each node becomes one CTE that joins its two inputs and groups by its kept dimensions. This is exact under SQL semantics, NULLs included, because multiplication distributes over addition (supplement section 10.1). It helps whenever a node sums out a dimension, as in chains of three or more operands, multi-way gradient contractions, and marginals. It does nothing for a plain matrix product, which needs EinFold.
+For a semiring fold, aggregate away a dimension as soon as no later step needs it. Over a whole contraction tree, each node becomes one CTE that joins its two inputs and groups by its kept dimensions. This is exact under SQL semantics, NULLs included, because ⊗ distributes over ⊕: for einsums, multiplication over addition (supplement section 10.1). It helps whenever a node aggregates a dimension away, as in chains of three or more operands, multi-way gradient contractions, and marginals. It does nothing for a plain matrix product, which needs EinFold. An algebraic fold is rewritten through its parts: `AVG(a·b)` becomes a `SUM` and a `COUNT` over the same tree (Yan and Larson's "eager count"), divided at the end. Folds that are neither keep their joins below a single aggregate.
 
-### 10.2 The einsum form: EinFold
+### 10.2 The extension form: EinFold
 
-EinFold fuses the `SUM` into the join, so join rows never exist.
+EinFold fuses the aggregate into the join, so join rows never exist: each joined row updates its group's partial aggregate as it is produced. This works for every fold, since it only needs the aggregate's partial states to merge.
 
-- **Hash algorithm.** Its core is Gustavson's 1978 sparse matrix multiply, generalized to einsums. One input is built into a table keyed by the shared dimensions, and the other is streamed against it. Each output row's state lives in Gustavson's arrays: running sums, the columns touched, and a "multiple switch" that never needs clearing between rows. When the streamed input arrives grouped by the output's leading dimensions, only one output row's state is live at a time.
-- **Dense algorithm.** When both operands are dense with exact coordinate maps, EinFold skips hashing and calls a GEMM.
+- **Hash algorithm.** Its core is Gustavson's 1978 sparse matrix multiply, generalized to folds. One input is built into a table keyed by the shared dimensions, and the other is streamed against it. Each output row's state lives in Gustavson's arrays: the partial aggregates, the columns touched, and a "multiple switch" that never needs clearing between rows. When the streamed input arrives grouped by the output's leading dimensions, only one output row's state is live at a time.
+- **Dense algorithm.** When both operands are dense with exact coordinate maps, EinFold skips hashing and calls a dense kernel: GEMM for einsums. Other semirings need their own dense kernels (a "tropical GEMM" for min-plus), which hosts may lack.
 - **Block-sparse algorithm.** When support is known by tile, as with missing chunks or masks, EinFold runs Gustavson's algorithm over tiles, calling dense kernels per tile and masked kernels for partly masked tiles. This is how FlashAttention tiles causal attention.
 
 Spike S11 measured the crossover on CPU:
@@ -428,9 +458,9 @@ Worst-case optimal joins, for cyclic sparse einsums such as triangle counting, a
 
 ## 11. Verification
 
-- **Equivalence on random inputs.** For every rewrite, compare the rewritten plan with the original on random einsums with NULLs, NaNs, duplicate coordinate tuples, ties, empty groups, and all-NULL groups. Do this on every host. ddx's "soak" test generator already produces random queries with NULLs, ties and duplicates, and checks them against JAX. einfold reuses it as its shared equivalence suite across hosts.
+- **Equivalence on random inputs.** For every rewrite, compare the rewritten plan with the original on random folds with NULLs, NaNs, duplicate coordinate tuples, ties, empty groups, and all-NULL groups. Do this on every host. ddx's "soak" test generator already produces random queries with NULLs, ties and duplicates, and checks them against JAX. einfold reuses it as its shared equivalence suite across hosts.
 - **Fill values.** For each row of the fill-value table in section 8.1, check that skipping missing chunks matches a full scan.
-- **Zeros and masks.** Check inferred zero elimination against the unrewritten plan on inputs that break each of its three conditions (NaN or infinite factors, groups reached only by zeros), and check mask operands against the SQL predicate they replace.
+- **Zeros and masks.** Check inferred zero elimination against the unrewritten plan on inputs that break each of its three conditions (NaN or infinite factors, groups reached only by zeros), and check masks against the SQL predicate they replace.
 - **Gradients.** With einfold enabled, ddx's gradients still match those computed by JAX's `jax.grad` (ddx's `tests/test_v2_jax.py`).
 - **Speed.** ddx's `matmul` and `attn` (attention) benchmark families (`crates/ddx-datafusion/tests/ad_perf.rs`), forward and backward, with einfold on and off. Measure the symbolic–numeric split separately: the first training step against later steps.
 - **Bits versus math.** Rewrites change summation order, so plain float results may differ in the last bits. Equivalence tests compare with a tolerance. Determinism tests compare the same plan across runs bit for bit. ddx currently tolerates last-bit differences. ddx's tests that use einfold's reference executor, which is deterministic by default (section 8.6), should also check that repeated runs give identical bits.
@@ -446,7 +476,7 @@ Worst-case optimal joins, for cyclic sparse einsums such as triangle counting, a
 | ddx | Program mode, or the in-engine rule | Facts ddx proves: unique keys (its `Verified` set), which columns are dimensions, and the keys of every step (section 8.1) |
 | NVIDIA GQE | Plan-to-plan (Substrait) | from the reader |
 | DuckDB + gpudb | SQL-to-SQL | from the reader |
-| DuckDB + Sirius | SQL-to-SQL today. Later, the `Einsum` relation inside Sirius's Substrait pipeline | from the reader |
+| DuckDB + Sirius | SQL-to-SQL today. Later, the `Fold` relation inside Sirius's Substrait pipeline | from the reader |
 
 What stays in ddx, such as caching each training step's physical plan, is listed in supplement section 12.
 
@@ -462,13 +492,13 @@ The spike index, [`docs/spikes/README.md`](spikes/README.md), lists each spike w
 
 ## 14. Open questions
 
-- **Semirings.** Support min-plus and max-times semirings for graph workloads such as shortest paths, and the log-sum-exp semiring behind softmax? Eager aggregation's distributivity argument holds for any commutative semiring, so the relational form extends easily. Dense kernels may not.
+- **Further semirings and aggregates.** RFC 0001 made the fold central, and folds are described by their operations and the laws relating them, so any (⊕, ⊗) pair where ⊗ distributes over ⊕ is a semiring. M1 supports `SUM`, `COUNT`, `AVG`, `MIN` and `MAX`; conditional laws (`MAX` of products needs non-negative factors) wait for facts that prove them. Open: the log-sum-exp semiring behind softmax, and dense kernels for semirings other than sum-product. Order-sensitive aggregates such as `STRING_AGG` are out of scope for now.
 - **Scaling the planner inside extraction.** Spike S17 settled how extraction and planning couple: egglog's cost model runs the contraction planner on each region's operands, so extraction sees planned costs (section 7.6). What remains is speed for large regions. egglog calls the cost function again whenever a child's cost improves, so it needs a cache of planned costs per operand multiset, and an incremental planner beyond a few hundred operands.
-- **The tile-size proposer.** Extraction can only choose sizes the proposer offers (spike S20). Which sizes to propose for general einsums, beyond storage sizes, their least common multiples and halvings, is open.
+- **The tile-size proposer.** Extraction can only choose sizes the proposer offers (spike S20). Which sizes to propose for general folds, beyond storage sizes, their least common multiples and halvings, is open.
 - **Upstream reports.** Bugs found by the spikes, not yet filed: DataFusion's `Unparser` drops predicates of a decorrelated subquery (TPC-H Q22) and refers to tables outside unaliased subqueries (S7); zarr-datafusion pairs a lower-dimensional data variable with its dimension wrongly (S1), and its pushed-down aggregates accumulate integers in `f64` (S12). Each needs the maintainers, and the author's go-ahead.
-- **Gaps found by the demos** ([`demos.md`](demos.md)): partial aggregates with associative combines beyond `SUM`, such as the online softmax's (maximum, normalizer, weighted sum); fusion across einsums with a nonlinear step between them; detecting window functions such as `MAX(s) OVER (PARTITION BY i)`; and semi-join reduction through plans many layers deep.
+- **Gaps found by the demos** ([`demos.md`](demos.md)): the online softmax's state (maximum, normalizer, weighted sum) is a fold that EinFold can compute under RFC 0001, but no algebraic rewrite yet covers it; fusion across folds with a nonlinear step between them; detecting window functions such as `MAX(s) OVER (PARTITION BY i)`; and semi-join reduction through plans many layers deep.
 - **Explicit API.** Offer an `einsum(...)` table function next to automatic detection? Useful for users and tests.
-- **Extension governance.** Where does the `Einsum` relation's spec live, and is it proposed upstream to Substrait?
+- **Extension governance.** Where does the `Fold` relation's spec live, and is it proposed upstream to Substrait?
 - **Benchmarks.** Dataset sizes, hardware, and pass/fail thresholds for section 15.
 - **Zax-SQL partnership.** Zax-SQL is a hosted service, so anything beyond the relational form needs Earthmover to run einfold inside their engine. Earthmover's stated goal for its compute engine ("the system should make those decisions, not the user") matches einfold's.
 
@@ -476,7 +506,7 @@ The spike index, [`docs/spikes/README.md`](spikes/README.md), lists each spike w
 
 | Workload | Tests | Hosts |
 |---|---|---|
-| Matrix multiplication and attention (ddx), forward and backward | Contraction planning, EinFold, einsum form, shared scans | DataFusion, GQE, DuckDB+gpudb (exact types only, since gpudb never moves float `SUM` to the GPU), DuckDB+Sirius |
+| Matrix multiplication and attention (ddx), forward and backward | Contraction planning, EinFold, extension form, shared scans | DataFusion, GQE, DuckDB+gpudb (exact types only, since gpudb never moves float `SUM` to the GPU), DuckDB+Sirius |
 | Geoscience on Zarr (ERA5): EOFs (empirical orthogonal functions, the principal components of a climate field), weighted means, regridding | Variable separation, eager aggregation, tiling, reduction at the source, data larger than memory | xarray-sql, duckdb-zarr, zarr-datafusion |
 | Sparse and graph: sparse matrix multiplication, einsums over sparse dimensions | EinFold's hash and block-sparse algorithms, pruning | DataFusion, GQE |
 | Large einsums: Blacher et al.'s satisfiability, triplestore, and tensor-network cases | Contraction planning, plan protection, run-time switching | DataFusion, DuckDB |
@@ -491,12 +521,12 @@ Each benchmark runs with einfold off and on, on the same host. That is the measu
 ### 16.1 Milestones
 
 1. **M0: Spikes S1–S20.** Done except S6, S9 and S15, which are blocked on access. Outcome: facts travel in a side channel filled by per-reader providers (section 8.1); target profiles record plan protection (section 9.3), unparsing rules (section 7.3) and aggregate pushdown routes (section 10.5). The target-profile schema itself is the first task of M1.
-2. **M1: EinFold.** Detection (including single-operand factors, `IS NOT DISTINCT FROM` joins, and sums over `UNION ALL`) and EinFold's hash algorithm as a DataFusion rule and `EinsumExec`, for two-operand contractions over sparse tables. Verified as in section 11, and benchmarked on ddx's `matmul` and `attn`.
-3. **M2: Relational form and program mode.** The egglog rule set for normalization, eager aggregation, and pruning, plus the greedy contraction planner, and program mode with program-level caching, written as DataFusion plans, Substrait, and DuckDB SQL. Variable separation and distributivity (9.1), mask operands (9.1), shared scans (9.5), and support pruning, including exact zeros (9.2). Same benchmarks on DuckDB, DuckDB+gpudb, DuckDB+Sirius, and GQE. Plan protection per S10: `MATERIALIZED` CTEs on DuckDB, plain CTEs on DataFusion.
+2. **M1: EinFold.** Detection (including single-operand factors, `IS NOT DISTINCT FROM` joins, and sums over `UNION ALL`) and EinFold's hash algorithm as a DataFusion rule and `EinFoldExec`, for two-operand folds over sparse tables, with the aggregates `SUM`, `COUNT`, `AVG`, `MIN` and `MAX`. Verified as in section 11, and benchmarked on ddx's `matmul` and `attn`.
+3. **M2: Relational form and program mode.** The egglog rule set, using each semiring's laws, for normalization, eager aggregation, and pruning, plus the greedy contraction planner, and program mode with program-level caching, written as DataFusion plans, Substrait, and DuckDB SQL. Variable separation and distributivity (9.1), masks (9.1), shared scans (9.5), and support pruning, including exact zeros (9.2). Same benchmarks on DuckDB, DuckDB+gpudb, DuckDB+Sirius, and GQE. Plan protection per S10: `MATERIALIZED` CTEs on DuckDB, plain CTEs on DataFusion.
 4. **M3: Facts.** `einfold-zarr`, layouts, fill-value rules, SQL constraints and per-chunk value statistics, Bounds and degree statistics, and EinFold's dense and block-sparse algorithms. Reduction at the source (10.5). Integration with xarray-sql, zarr-datafusion, and duckdb-zarr. ERA5 benchmarks.
-5. **M4: Einsum form.** The `Einsum` relation's spec and conformance tests. Run-time switching (10.4) in the reference executor.
+5. **M4: Extension form.** The `Fold` relation's spec and conformance tests. Run-time switching (10.4) in the reference executor.
 6. **M5: Tiling.** Execution tiling and slicing as e-graph terms with a memory budget (9.4), partly masked tiles (10.2), dynamic-programming and exhaustive contraction planners, retiling cost in contraction planning, and output order (10.3).
-7. **M6: GPU adoption (medium term).** Work with the GQE, Sirius, and/or `gpudb` maintainers to run the einsum form on GPU. Sirius is the most natural first partner, because it already runs Substrait plans on GPU and describes itself as composable.
+7. **M6: GPU adoption (medium term).** Work with the GQE, Sirius, and/or `gpudb` maintainers to run the extension form on GPU. Sirius is the most natural first partner, because it already runs Substrait plans on GPU and describes itself as composable.
 8. **Later.** Worst-case optimal joins (10.6).
 
 ### 16.2 Priority of the further optimizations
@@ -516,15 +546,15 @@ Agreed priority, highest first. Each lives in the section that owns it:
 ## 17. Risks
 
 - **Wrong rewrites.** Mitigation: conservative detection; the partial-aggregate and fill-value rules (sections 8.1 and 8.3); the tests in section 11.
-- **The einsum form is never adopted.** Then einfold's ceiling on GPU hosts is the relational form, which cannot speed up two-operand contractions. Mitigation: keep the relational form valuable on its own; keep the `Einsum` relation small and well tested; show results with the reference executor.
-- **Host optimizers undo or choke on einfold's plans.** S10 found that hosts keep the written order but DuckDB can spend minutes planning it. Mitigation: plan protection in the target profile (`MATERIALIZED` CTEs on DuckDB), and never emitting flat einsums.
+- **The extension form is never adopted.** Then einfold's ceiling on GPU hosts is the relational form, which cannot speed up two-operand contractions. Mitigation: keep the relational form valuable on its own; keep the `Fold` relation small and well tested; show results with the reference executor.
+- **Host optimizers undo or choke on einfold's plans.** S10 found that hosts keep the written order but DuckDB can spend minutes planning it. Mitigation: plan protection in the target profile (`MATERIALIZED` CTEs on DuckDB), and never emitting flat folds.
 - **Host behavior drift.** Hosts change what they fuse and accelerate. Mitigation: target profiles are data, plus a benchmark suite per host.
 - **Rewrite-engine dependency.** egglog is young, and saturation can blow up. Mitigation: the hybrid design and bounded schedules (section 7.6); egg as a fallback.
 - **Facts lost in transit, or stale.** S2 found that no in-plan carrier survives every host, and that DataFusion keeps metadata above operators that invalidate it. Mitigation: the side-channel fact table, and facts tied to the plan node where they hold (section 8.1).
 - **Readers disagree.** The same store reads differently through each reader (S1). Mitigation: per-reader fact providers, and the shared equivalence suite run through every reader.
 - **Unparser bugs.** DataFusion's `Unparser` can write SQL that silently changes results (S7). Mitigation: unparse only unoptimized plans, and check every unparsed plan.
 - **GPU hosts need recent GPUs.** gpudb and Sirius need compute capability 7.5+ (S5), so einfold's GPU testing needs cloud GPUs. A free Colab T4 sufficed for S5.
-- **gpudb gives einfold's float workloads no GPU speedup today.** On a T4, gpudb ran only an integer reduction on the GPU. It declined every `DOUBLE` sum, many-to-many joins, and subquery operands (S5). Mitigation: M6's work with gpudb's maintainer on the einsum form, or on `DOUBLE` sums with S8's binned accumulator; meanwhile, the relational form's value on DuckDB+gpudb is the CPU-side plan shape.
+- **gpudb gives einfold's float workloads no GPU speedup today.** On a T4, gpudb ran only an integer reduction on the GPU. It declined every `DOUBLE` sum, many-to-many joins, and subquery operands (S5). Mitigation: M6's work with gpudb's maintainer on the extension form, or on `DOUBLE` sums with S8's binned accumulator; meanwhile, the relational form's value on DuckDB+gpudb is the CPU-side plan shape.
 - **Float sums on GPU hosts.** Deterministic float sums on GPU need host support. gpudb avoids the question by never rewriting float `SUM`, which also keeps float einsums off its GPU path. Mitigation: determinism is a setting, not a default, on hosts (section 8.6); S8's binned sum is a concrete proposal for hosts, cheap even with GPU atomics.
 
 ## 18. References

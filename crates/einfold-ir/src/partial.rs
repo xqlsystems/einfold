@@ -15,11 +15,14 @@
 //! - **whether the group exists.** SQL creates a group exactly when some
 //!   joined row reaches it, whatever that row's value. This is the same for
 //!   every aggregate;
-//! - **the aggregate's own state:** a running sum, a count, a sum and a count.
+//! - **the aggregate's own state:** one partial result per distributive part
+//!   of the aggregate (see [`Aggregate::parts`]). `SUM` has one part, and
+//!   `AVG` has two, a sum and a count.
 //!
-//! Keeping them apart gives every aggregate SQL's subtle rule for free: a group
-//! reached only by rows whose values are NULL still exists, and its `SUM` is
-//! NULL rather than missing.
+//! Each piece is a monoid, and so is their product, so pieces combine in any
+//! grouping and order. Keeping them apart gives every aggregate SQL's subtle
+//! rule for free: a group reached only by rows whose values are NULL still
+//! exists, and its `SUM` is NULL rather than missing.
 //!
 //! Sums here use plain `f64` addition. Float addition is not associative
 //! (`(a + b) + c` can differ from `a + (b + c)` in the last bits), so the
@@ -27,93 +30,48 @@
 //! [`merge`](PartialAggregate::merge) calls decides a float result's last
 //! bits. Callers that promise repeatable results must use a fixed order.
 
-use std::cmp::Ordering;
-
 use crate::aggregate::Aggregate;
-use crate::algebra::Op;
+use crate::algebra::Value;
 
-/// The state of one [`Aggregate`] over part of a group's values.
+/// The most distributive parts an aggregate has.
+const MAX_PARTS: usize = 2;
+
+/// The state of one [`Aggregate`] over part of a group's values: one partial
+/// result per part, `None` while the part has seen no value.
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[non_exhaustive]
-pub enum AggregateState {
-    /// A numeric [`Aggregate::Fold`]: the non-NULL values so far, folded with
-    /// `op`, or `None` if there were none yet.
-    Fold {
-        /// The folding operation: `+`, `*`, `min` or `max`.
-        op: Op,
-        /// The folded value so far.
-        acc: Option<f64>,
-    },
-    /// A logical [`Aggregate::Fold`] (`BOOL_AND`, `BOOL_OR`): the non-NULL
-    /// truth values so far, folded with `op`, or `None` if there were none.
-    Logical {
-        /// `AND` or `OR`.
-        op: Op,
-        /// The folded truth value so far.
-        acc: Option<bool>,
-    },
-    /// `COUNT`: the number of non-NULL values so far.
-    Count(i64),
-    /// `AVG`: the sum and the count of the non-NULL values so far.
-    Avg {
-        /// Sum of the non-NULL values.
-        sum: f64,
-        /// Number of non-NULL values.
-        count: i64,
-    },
-}
-
-/// A finished aggregate value, in the type SQL gives that aggregate.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum AggregateValue {
-    /// Numeric folds and `AVG`: a nullable float.
-    Float(Option<f64>),
-    /// Logical folds: a nullable truth value.
-    Bool(Option<bool>),
-    /// `COUNT`: a non-NULL integer.
-    Int(i64),
-}
-
-/// Combine two numbers with `op`. `min` and `max` order floats as Arrow and
-/// DataFusion do: by IEEE 754's total order, where NaN is above every number
-/// and `-0.0` is below `0.0`.
-fn combine(op: Op, a: f64, b: f64) -> f64 {
-    let pick = |want: Ordering| if a.total_cmp(&b) == want { a } else { b };
-    match op {
-        Op::Add => a + b,
-        Op::Mul => a * b,
-        Op::Min => pick(Ordering::Less),
-        Op::Max => pick(Ordering::Greater),
-        Op::And | Op::Or => unreachable!("logical operations fold truth values"),
-    }
+pub struct AggregateState {
+    aggregate: Aggregate,
+    parts: [Option<Value>; MAX_PARTS],
 }
 
 impl AggregateState {
     /// The state of `aggregate` before any value.
-    pub fn empty(aggregate: Aggregate) -> Self {
-        match aggregate {
-            Aggregate::Fold(op) if op.is_logical() => AggregateState::Logical { op, acc: None },
-            Aggregate::Fold(op) => AggregateState::Fold { op, acc: None },
-            Aggregate::Count => AggregateState::Count(0),
-            Aggregate::Avg => AggregateState::Avg { sum: 0.0, count: 0 },
+    pub fn new(aggregate: Aggregate) -> Self {
+        assert!(
+            aggregate.parts().len() <= MAX_PARTS,
+            "{aggregate} has too many parts"
+        );
+        AggregateState {
+            aggregate,
+            parts: [None; MAX_PARTS],
         }
     }
 
+    /// The aggregate whose state this is.
+    pub fn aggregate(&self) -> Aggregate {
+        self.aggregate
+    }
+
     /// Add one value; `None` is a NULL value, which every aggregate skips.
-    /// Logical aggregates read a non-zero value as `TRUE`.
-    pub fn update(&mut self, value: Option<f64>) {
+    ///
+    /// # Panics
+    ///
+    /// If the aggregate does not act on the value's type, or the type
+    /// differs from earlier values'.
+    pub fn update(&mut self, value: Option<Value>) {
         let Some(v) = value else { return };
-        match self {
-            AggregateState::Fold { op, acc } => *acc = Some(acc.map_or(v, |a| combine(*op, a, v))),
-            AggregateState::Logical { op, acc } => {
-                let t = v != 0.0;
-                *acc = Some(acc.map_or(t, |a| if *op == Op::And { a && t } else { a || t }));
-            }
-            AggregateState::Count(c) => *c += 1,
-            AggregateState::Avg { sum, count } => {
-                *sum += v;
-                *count += 1;
-            }
+        for (part, acc) in self.aggregate.parts().iter().zip(&mut self.parts) {
+            *acc = Some(part.update(*acc, v));
         }
     }
 
@@ -123,41 +81,26 @@ impl AggregateState {
     ///
     /// If the two states belong to different aggregates.
     pub fn merge(&mut self, other: &AggregateState) {
-        match (self, other) {
-            (AggregateState::Fold { op, acc }, AggregateState::Fold { op: o2, acc: b })
-                if op == o2 =>
-            {
-                if let Some(b) = b {
-                    *acc = Some(acc.map_or(*b, |a| combine(*op, a, *b)));
-                }
-            }
-            (AggregateState::Logical { op, acc }, AggregateState::Logical { op: o2, acc: b })
-                if op == o2 =>
-            {
-                if let Some(b) = b {
-                    *acc = Some(acc.map_or(*b, |a| if *op == Op::And { a && *b } else { a || *b }));
-                }
-            }
-            (AggregateState::Count(a), AggregateState::Count(b)) => *a += b,
-            (AggregateState::Avg { sum, count }, AggregateState::Avg { sum: s2, count: c2 }) => {
-                *sum += s2;
-                *count += c2;
-            }
-            (a, b) => panic!("cannot merge {b:?} into {a:?}: different aggregates"),
+        assert_eq!(
+            self.aggregate, other.aggregate,
+            "cannot merge states of different aggregates"
+        );
+        for ((part, acc), b) in self
+            .aggregate
+            .parts()
+            .iter()
+            .zip(&mut self.parts)
+            .zip(other.parts)
+        {
+            *acc = part.merge(*acc, b);
         }
     }
 
-    /// The aggregate's value: NULL for folds and `AVG` when every value was
-    /// NULL, and 0 for `COUNT`.
-    pub fn finish(&self) -> AggregateValue {
-        match *self {
-            AggregateState::Fold { acc, .. } => AggregateValue::Float(acc),
-            AggregateState::Logical { acc, .. } => AggregateValue::Bool(acc),
-            AggregateState::Count(c) => AggregateValue::Int(c),
-            AggregateState::Avg { sum, count } => {
-                AggregateValue::Float((count > 0).then(|| sum / count as f64))
-            }
-        }
+    /// The aggregate's SQL result: NULL for most aggregates when every value
+    /// was NULL, and 0 for `COUNT`.
+    pub fn finish(&self) -> Option<Value> {
+        self.aggregate
+            .finish(&self.parts[..self.aggregate.parts().len()])
     }
 }
 
@@ -174,14 +117,14 @@ impl PartialAggregate {
     pub fn new(aggregate: Aggregate) -> Self {
         PartialAggregate {
             reached: false,
-            state: AggregateState::empty(aggregate),
+            state: AggregateState::new(aggregate),
         }
     }
 
     /// Fold in one joined row's value; `None` is a NULL value.
     ///
     /// The row marks the group as reached even when its value is NULL.
-    pub fn update(&mut self, value: Option<f64>) {
+    pub fn update(&mut self, value: Option<Value>) {
         self.reached = true;
         self.state.update(value);
     }
@@ -198,8 +141,8 @@ impl PartialAggregate {
     }
 
     /// The final result: `None` if the group does not exist, and otherwise
-    /// the aggregate's value.
-    pub fn finish(&self) -> Option<AggregateValue> {
+    /// the aggregate's SQL result, which may be NULL (`Some(None)`).
+    pub fn finish(&self) -> Option<Option<Value>> {
         self.reached.then(|| self.state.finish())
     }
 }
@@ -207,9 +150,19 @@ impl PartialAggregate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use AggregateValue::{Float, Int};
+    use Value::{Bool, Float, Int};
 
-    fn fold(aggregate: Aggregate, values: &[Option<f64>]) -> PartialAggregate {
+    const ALL: [Aggregate; 7] = [
+        Aggregate::SUM,
+        Aggregate::COUNT,
+        Aggregate::AVG,
+        Aggregate::MIN,
+        Aggregate::MAX,
+        Aggregate::BOOL_OR,
+        Aggregate::BOOL_AND,
+    ];
+
+    fn fold(aggregate: Aggregate, values: &[Option<Value>]) -> PartialAggregate {
         let mut p = PartialAggregate::new(aggregate);
         for v in values {
             p.update(*v);
@@ -217,15 +170,13 @@ mod tests {
         p
     }
 
+    fn floats(xs: &[Option<f64>]) -> Vec<Option<Value>> {
+        xs.iter().map(|x| x.map(Float)).collect()
+    }
+
     #[test]
     fn unreached_group_does_not_exist() {
-        for a in [
-            Aggregate::SUM,
-            Aggregate::Count,
-            Aggregate::Avg,
-            Aggregate::MIN,
-            Aggregate::MAX,
-        ] {
+        for a in ALL {
             assert_eq!(PartialAggregate::new(a).finish(), None);
         }
     }
@@ -233,80 +184,97 @@ mod tests {
     #[test]
     fn group_reached_only_by_nulls() {
         let nulls = [None, None];
-        assert_eq!(fold(Aggregate::SUM, &nulls).finish(), Some(Float(None)));
-        assert_eq!(fold(Aggregate::Count, &nulls).finish(), Some(Int(0)));
-        assert_eq!(fold(Aggregate::Avg, &nulls).finish(), Some(Float(None)));
+        assert_eq!(fold(Aggregate::SUM, &nulls).finish(), Some(None));
+        assert_eq!(fold(Aggregate::COUNT, &nulls).finish(), Some(Some(Int(0))));
+        assert_eq!(fold(Aggregate::AVG, &nulls).finish(), Some(None));
+        assert_eq!(fold(Aggregate::BOOL_OR, &nulls).finish(), Some(None));
     }
 
     #[test]
     fn nulls_are_skipped() {
-        let vs = [None, Some(2.0), None, Some(4.0)];
-        assert_eq!(fold(Aggregate::SUM, &vs).finish(), Some(Float(Some(6.0))));
-        assert_eq!(fold(Aggregate::Count, &vs).finish(), Some(Int(2)));
-        assert_eq!(fold(Aggregate::Avg, &vs).finish(), Some(Float(Some(3.0))));
+        let vs = floats(&[None, Some(2.0), None, Some(4.0)]);
+        assert_eq!(fold(Aggregate::SUM, &vs).finish(), Some(Some(Float(6.0))));
+        assert_eq!(fold(Aggregate::COUNT, &vs).finish(), Some(Some(Int(2))));
+        assert_eq!(fold(Aggregate::AVG, &vs).finish(), Some(Some(Float(3.0))));
+    }
+
+    #[test]
+    fn integers_stay_integers_until_avg() {
+        let vs = [Some(Int(3)), None, Some(Int(4))];
+        assert_eq!(fold(Aggregate::SUM, &vs).finish(), Some(Some(Int(7))));
+        assert_eq!(fold(Aggregate::MAX, &vs).finish(), Some(Some(Int(4))));
+        assert_eq!(fold(Aggregate::AVG, &vs).finish(), Some(Some(Float(3.5))));
     }
 
     #[test]
     fn min_max_and_logical_folds() {
-        let vs = [None, Some(2.0), Some(-1.0), None, Some(4.0)];
-        assert_eq!(fold(Aggregate::MIN, &vs).finish(), Some(Float(Some(-1.0))));
-        assert_eq!(fold(Aggregate::MAX, &vs).finish(), Some(Float(Some(4.0))));
-        assert_eq!(fold(Aggregate::MIN, &[None]).finish(), Some(Float(None)));
+        let vs = floats(&[None, Some(2.0), Some(-1.0), None, Some(4.0)]);
+        assert_eq!(fold(Aggregate::MIN, &vs).finish(), Some(Some(Float(-1.0))));
+        assert_eq!(fold(Aggregate::MAX, &vs).finish(), Some(Some(Float(4.0))));
         // NaN is above every number, as in Arrow's ordering; -0.0 is below 0.0.
-        let Some(Float(Some(m))) = fold(Aggregate::MAX, &[Some(1.0), Some(f64::NAN)]).finish()
+        let Some(Some(Float(m))) =
+            fold(Aggregate::MAX, &floats(&[Some(1.0), Some(f64::NAN)])).finish()
         else {
             panic!()
         };
         assert!(m.is_nan());
-        assert_eq!(
-            fold(Aggregate::MIN, &[Some(0.0), Some(-0.0)]).finish(),
-            Some(Float(Some(-0.0)))
-        );
-        let tf = [Some(1.0), None, Some(0.0)];
+        let zeros = floats(&[Some(0.0), Some(-0.0)]);
+        let Some(Some(Float(z))) = fold(Aggregate::MIN, &zeros).finish() else {
+            panic!()
+        };
+        assert!(z.is_sign_negative());
+        let tf = [Some(Bool(true)), None, Some(Bool(false))];
         assert_eq!(
             fold(Aggregate::BOOL_OR, &tf).finish(),
-            Some(AggregateValue::Bool(Some(true)))
+            Some(Some(Bool(true)))
         );
         assert_eq!(
             fold(Aggregate::BOOL_AND, &tf).finish(),
-            Some(AggregateValue::Bool(Some(false)))
-        );
-        assert_eq!(
-            fold(Aggregate::BOOL_OR, &[None]).finish(),
-            Some(AggregateValue::Bool(None))
+            Some(Some(Bool(false)))
         );
     }
 
     #[test]
     fn nan_propagates_but_is_counted() {
-        let vs = [Some(1.0), Some(f64::NAN)];
-        let Some(Float(Some(s))) = fold(Aggregate::SUM, &vs).finish() else {
+        let vs = floats(&[Some(1.0), Some(f64::NAN)]);
+        let Some(Some(Float(s))) = fold(Aggregate::SUM, &vs).finish() else {
             panic!()
         };
         assert!(s.is_nan());
-        assert_eq!(fold(Aggregate::Count, &vs).finish(), Some(Int(2)));
+        assert_eq!(fold(Aggregate::COUNT, &vs).finish(), Some(Some(Int(2))));
     }
 
     #[test]
     fn merge_matches_sequential_updates() {
-        let parts: [&[Option<f64>]; 4] = [&[Some(1.0)], &[None], &[], &[Some(4.0), Some(3.0)]];
+        let parts: [Vec<Option<Value>>; 4] = [
+            vec![Some(Int(1))],
+            vec![None],
+            vec![],
+            vec![Some(Int(4)), Some(Int(3))],
+        ];
         for a in [
             Aggregate::SUM,
-            Aggregate::Count,
-            Aggregate::Avg,
+            Aggregate::COUNT,
+            Aggregate::AVG,
             Aggregate::MIN,
             Aggregate::MAX,
         ] {
             let mut merged = PartialAggregate::new(a);
-            for p in parts {
+            for p in &parts {
                 merged.merge(&fold(a, p));
             }
-            let all: Vec<Option<f64>> = parts.concat();
+            let all: Vec<Option<Value>> = parts.concat();
             assert_eq!(merged.finish(), fold(a, &all).finish(), "{a}");
         }
         // Merging only empty pieces leaves the group nonexistent.
         let mut empty = PartialAggregate::new(Aggregate::SUM);
         empty.merge(&PartialAggregate::new(Aggregate::SUM));
         assert_eq!(empty.finish(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot combine")]
+    fn mixed_types_are_rejected() {
+        fold(Aggregate::SUM, &[Some(Int(1)), Some(Float(1.0))]);
     }
 }

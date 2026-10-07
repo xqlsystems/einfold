@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::aggregate::Aggregate;
+use crate::aggregate::{Aggregate, Distributive, Lift};
 use crate::algebra::{Op, Semiring};
 
 /// A dimension of a fold: a set of columns that the query equates.
@@ -265,8 +265,13 @@ impl Fold {
     /// ([`Semiring::requires_non_negative`]), which callers must prove first.
     pub fn semiring(&self) -> Option<Semiring> {
         match (self.row_value, self.aggregate) {
-            (RowValue::Product(mul), Aggregate::Fold(add)) => Semiring::new(add, mul),
-            (RowValue::Product(Op::Mul), Aggregate::Count) => Some(Semiring::SUM_PRODUCT),
+            (RowValue::Product(mul), Aggregate::Distributive(d)) => match d.lift() {
+                Lift::Value => Semiring::new(d.op(), mul),
+                Lift::One if d == Distributive::COUNT && mul == Op::Mul => {
+                    Some(Semiring::SUM_PRODUCT)
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -382,7 +387,7 @@ mod tests {
             Some(Semiring::SUM_PRODUCT)
         );
         assert_eq!(
-            make(times, Aggregate::Count).semiring(),
+            make(times, Aggregate::COUNT).semiring(),
             Some(Semiring::SUM_PRODUCT)
         );
         assert_eq!(
@@ -397,14 +402,14 @@ mod tests {
         assert!(max_times.requires_non_negative());
         // `+` does not distribute over `+`: SUM(a + b) is a fold, not a semiring fold.
         assert_eq!(make(plus, Aggregate::SUM).semiring(), None);
-        assert_eq!(make(times, Aggregate::Avg).semiring(), None);
+        assert_eq!(make(times, Aggregate::AVG).semiring(), None);
         assert_eq!(make(RowValue::Expr, Aggregate::SUM).semiring(), None);
         assert_eq!(
             make(plus, Aggregate::MIN).to_string(),
             "MIN(A[i,k] + B[k,j]) -> [i]"
         );
         assert_eq!(
-            make(RowValue::Expr, Aggregate::Avg).to_string(),
+            make(RowValue::Expr, Aggregate::AVG).to_string(),
             "AVG(f(A[i,k], B[k,j])) -> [i]"
         );
     }

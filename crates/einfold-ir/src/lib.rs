@@ -35,8 +35,8 @@ pub mod facts;
 pub mod fold;
 pub mod partial;
 
-pub use aggregate::Aggregate;
-pub use algebra::{Distributivity, Identity, Op, Semiring};
+pub use aggregate::{Aggregate, Algebraic, Distributive, Finish, Lift};
+pub use algebra::{Distributivity, Op, Semiring, Value, ValueType};
 pub use facts::{Fact, Precision};
 pub use fold::{Dim, Fold, FoldError, KeyEquality, Operand, RowValue};
-pub use partial::{AggregateState, AggregateValue, PartialAggregate};
+pub use partial::{AggregateState, PartialAggregate};

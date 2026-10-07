@@ -18,6 +18,15 @@
 //!   where ⊗ *distributes* over ⊕: `a ⊗ (b ⊕ c) = (a ⊗ b) ⊕ (a ⊗ c)`.
 //!   Distributivity is what makes it correct to aggregate one input before
 //!   joining it with another (`Σ_j a·b_j = a·Σ_j b_j`), and to reorder joins.
+//!
+//! These are the standard structures for the problem. Abo Khamis, Ngo and
+//! Rudra's *FAQ* ("Functional Aggregate Queries", PODS 2016) solves
+//! aggregates over joins in any commutative semiring, and its algorithm,
+//! InsideOut, is the "aggregate early, reorder joins" rewrite above. Green,
+//! Karvounarakis and Tannen's *provenance semirings* (PODS 2007) show that
+//! one semiring-generic evaluation covers bag semantics, probabilities and
+//! more. Lin's "Monoidify!" (2013) makes the case that an aggregate's state
+//! must be a monoid for parallel, partial aggregation to be correct.
 
 use std::fmt;
 
@@ -30,9 +39,9 @@ pub enum Op {
     Add,
     /// `*` over numbers. Identity 1.
     Mul,
-    /// The smaller of two numbers. Identity +∞.
+    /// The smaller of two numbers. Identity +∞, or the largest integer.
     Min,
-    /// The larger of two numbers. Identity −∞.
+    /// The larger of two numbers. Identity −∞, or the smallest integer.
     Max,
     /// Logical `AND`. Identity `TRUE`.
     And,
@@ -40,14 +49,37 @@ pub enum Op {
     Or,
 }
 
-/// The identity of an [`Op`]: combining it with any value leaves the value
-/// unchanged.
+/// A non-NULL value that operations combine.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Identity {
-    /// A number: 0 for `+`, 1 for `*`, ±∞ for `MIN` and `MAX`.
-    Number(f64),
-    /// A truth value: `TRUE` for `AND`, `FALSE` for `OR`.
+pub enum Value {
+    /// A 64-bit integer.
+    Int(i64),
+    /// A 64-bit float.
+    Float(f64),
+    /// A truth value.
     Bool(bool),
+}
+
+/// The type of a [`Value`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ValueType {
+    /// [`Value::Int`].
+    Int,
+    /// [`Value::Float`].
+    Float,
+    /// [`Value::Bool`].
+    Bool,
+}
+
+impl Value {
+    /// The value's type.
+    pub fn value_type(self) -> ValueType {
+        match self {
+            Value::Int(_) => ValueType::Int,
+            Value::Float(_) => ValueType::Float,
+            Value::Bool(_) => ValueType::Bool,
+        }
+    }
 }
 
 /// Whether one operation distributes over another.
@@ -65,21 +97,47 @@ pub enum Distributivity {
 }
 
 impl Op {
-    /// The operation's identity.
-    pub fn identity(self) -> Identity {
-        match self {
-            Op::Add => Identity::Number(0.0),
-            Op::Mul => Identity::Number(1.0),
-            Op::Min => Identity::Number(f64::INFINITY),
-            Op::Max => Identity::Number(f64::NEG_INFINITY),
-            Op::And => Identity::Bool(true),
-            Op::Or => Identity::Bool(false),
-        }
+    /// The operation's identity among values of type `ty`: combining it
+    /// with any value leaves the value unchanged. `None` if the operation
+    /// does not act on that type.
+    pub fn identity(self, ty: ValueType) -> Option<Value> {
+        use ValueType as T;
+        Some(match (self, ty) {
+            (Op::Add, T::Int) => Value::Int(0),
+            (Op::Add, T::Float) => Value::Float(0.0),
+            (Op::Mul, T::Int) => Value::Int(1),
+            (Op::Mul, T::Float) => Value::Float(1.0),
+            (Op::Min, T::Int) => Value::Int(i64::MAX),
+            (Op::Min, T::Float) => Value::Float(f64::INFINITY),
+            (Op::Max, T::Int) => Value::Int(i64::MIN),
+            (Op::Max, T::Float) => Value::Float(f64::NEG_INFINITY),
+            (Op::And, T::Bool) => Value::Bool(true),
+            (Op::Or, T::Bool) => Value::Bool(false),
+            _ => return None,
+        })
     }
 
-    /// Whether the operation acts on truth values rather than numbers.
-    pub fn is_logical(self) -> bool {
-        matches!(self, Op::And | Op::Or)
+    /// Combine two values of the same type. `None` if their types differ, or
+    /// the operation does not act on their type.
+    ///
+    /// Integer `+` and `*` wrap on overflow, as DataFusion's do. `min` and
+    /// `max` order floats as Arrow and DataFusion do: by IEEE 754's total
+    /// order, where NaN is above every number and `-0.0` is below `0.0`.
+    pub fn combine(self, a: Value, b: Value) -> Option<Value> {
+        use Value::{Bool, Float, Int};
+        Some(match (self, a, b) {
+            (Op::Add, Int(a), Int(b)) => Int(a.wrapping_add(b)),
+            (Op::Add, Float(a), Float(b)) => Float(a + b),
+            (Op::Mul, Int(a), Int(b)) => Int(a.wrapping_mul(b)),
+            (Op::Mul, Float(a), Float(b)) => Float(a * b),
+            (Op::Min, Int(a), Int(b)) => Int(a.min(b)),
+            (Op::Min, Float(a), Float(b)) => Float(if b.total_cmp(&a).is_lt() { b } else { a }),
+            (Op::Max, Int(a), Int(b)) => Int(a.max(b)),
+            (Op::Max, Float(a), Float(b)) => Float(if b.total_cmp(&a).is_gt() { b } else { a }),
+            (Op::And, Bool(a), Bool(b)) => Bool(a && b),
+            (Op::Or, Bool(a), Bool(b)) => Bool(a || b),
+            _ => return None,
+        })
     }
 
     /// Whether `self` distributes over `over`:
@@ -116,6 +174,11 @@ impl fmt::Display for Op {
 
 /// A semiring: an "add" (⊕) and a "multiply" (⊗), where ⊗ distributes over
 /// ⊕, possibly only under a condition on the values.
+///
+/// In every semiring here, ⊕'s identity, the semiring's "zero", also
+/// *annihilates*: `0 ⊗ a = 0`. That is what lets a dense kernel pad absent
+/// entries with the zero. In the conditional semirings it holds only for
+/// positive `a`: `max` of `*` has zero −∞, and `−∞ · 0` is NaN.
 ///
 /// Semirings are built only through [`Semiring::new`], which checks the law,
 /// so holding one is evidence that it holds.
@@ -210,37 +273,86 @@ mod tests {
         assert!(!Semiring::SUM_PRODUCT.requires_non_negative());
     }
 
+    fn floats(xs: &[f64]) -> Vec<Value> {
+        xs.iter().map(|&x| Value::Float(x)).collect()
+    }
+
+    /// Sample values for an operation, with the condition on its law.
+    fn samples(op: Op, law: Distributivity) -> Vec<Value> {
+        if op == Op::And || op == Op::Or {
+            return vec![Value::Bool(false), Value::Bool(true)];
+        }
+        let all = [-3.0, -0.5, 0.0, 0.5, 2.0, 7.0];
+        let xs: Vec<f64> = match law {
+            Distributivity::IfNonNegative => all.into_iter().filter(|&x| x >= 0.0).collect(),
+            _ => all.to_vec(),
+        };
+        floats(&xs)
+    }
+
+    const OPS: [Op; 6] = [Op::Add, Op::Mul, Op::Min, Op::Max, Op::And, Op::Or];
+
     /// Check each claimed law on sample values, including the condition.
     #[test]
     fn claimed_laws_hold_on_samples() {
-        let num = |op: Op, a: f64, b: f64| match op {
-            Op::Add => a + b,
-            Op::Mul => a * b,
-            Op::Min => a.min(b),
-            Op::Max => a.max(b),
-            _ => unreachable!(),
-        };
-        let numeric = [Op::Add, Op::Mul, Op::Min, Op::Max];
-        let samples = [-3.0, -0.5, 0.0, 0.5, 2.0, 7.0];
-        for mul in numeric {
-            for add in numeric {
+        for mul in OPS {
+            for add in OPS {
                 let law = mul.distributes_over(add);
                 if law == Distributivity::Never {
                     continue;
                 }
-                for a in samples {
-                    for b in samples {
-                        for c in samples {
-                            if law == Distributivity::IfNonNegative && a < 0.0 {
-                                continue;
-                            }
-                            let lhs = num(mul, a, num(add, b, c));
-                            let rhs = num(add, num(mul, a, b), num(mul, a, c));
-                            assert_eq!(lhs, rhs, "{mul} over {add} at {a}, {b}, {c}");
+                let vs = samples(mul, law);
+                for &a in &vs {
+                    for &b in &vs {
+                        for &c in &vs {
+                            let lhs = mul.combine(a, add.combine(b, c).unwrap());
+                            let rhs =
+                                add.combine(mul.combine(a, b).unwrap(), mul.combine(a, c).unwrap());
+                            assert_eq!(lhs, rhs, "{mul} over {add} at {a:?}, {b:?}, {c:?}");
                         }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn identities_are_identities() {
+        for op in OPS {
+            for v in samples(op, Distributivity::Always) {
+                let e = op.identity(v.value_type()).unwrap();
+                assert_eq!(op.combine(e, v), Some(v), "{op} at {v:?}");
+            }
+            for v in [Value::Int(-4), Value::Int(9)] {
+                if let Some(e) = op.identity(ValueType::Int) {
+                    assert_eq!(op.combine(e, v), Some(v), "{op} at {v:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_annihilates() {
+        for mul in OPS {
+            for add in OPS {
+                let Some(s) = Semiring::new(add, mul) else {
+                    continue;
+                };
+                for a in samples(mul, Distributivity::Always) {
+                    if s.requires_non_negative() && !matches!(a, Value::Float(x) if x > 0.0) {
+                        continue;
+                    }
+                    let zero = add.identity(a.value_type()).unwrap();
+                    assert_eq!(mul.combine(zero, a), Some(zero), "{s} at {a:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mismatched_types_do_not_combine() {
+        assert_eq!(Op::Add.combine(Value::Int(1), Value::Float(1.0)), None);
+        assert_eq!(Op::And.combine(Value::Float(1.0), Value::Float(1.0)), None);
+        assert_eq!(Op::Or.identity(ValueType::Int), None);
     }
 }

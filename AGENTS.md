@@ -59,13 +59,15 @@ For each milestone, first build one **thin end-to-end path**: the smallest case 
 
 ### While waiting for review
 
-Agents don't build on unreviewed foundations while they wait. Instead, they work on things that don't depend on them:
+Agents don't build on unreviewed foundations while they wait. First, ask whether any work is worth doing *now*. Waiting is often the better choice: more of the design will be settled later, so the same work done then costs less and is less likely to be redone. Agent time is limited and should be spent deliberately. **Doing nothing is a perfectly fine choice.**
+
+When work is worth doing now, choose things that don't depend on unreviewed foundations:
 
 - test generators and oracles;
 - benchmarks against the unmodified engine;
 - spikes;
 - docs;
-- reviewing each other's pull requests against the design.
+- reviewing each other's pull requests against the design, and for composability within the XQL ecosystem einfold belongs to (readers such as xarray-sql and duckdb-zarr, ddx, and the hosts), so that pieces fit together without one project bending to another.
 
 ## Size
 

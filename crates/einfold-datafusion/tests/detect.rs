@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Detection over plans of real SQL: which queries it reads as einsums, and
+//! Detection over plans of real SQL: which queries it reads as folds, and
 //! which it must decline.
 
 use std::sync::Arc;
@@ -12,8 +12,8 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::MemTable;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
-use einfold_datafusion::detect::{detect, Detected, MOVABLE_FUNCTIONS};
-use einfold_ir::{Dim, KeyEquality};
+use einfold_datafusion::detect::{detect, FoldMatch, MOVABLE_FUNCTIONS};
+use einfold_ir::{Aggregate, Dim, KeyEquality, Semiring};
 
 fn table(cols: &[(&str, DataType)]) -> Arc<MemTable> {
     let fields: Vec<Field> = cols
@@ -66,15 +66,15 @@ async fn aggregate(sql: &str, optimize: bool) -> LogicalPlan {
     found.unwrap_or_else(|| panic!("no aggregate in\n{plan}"))
 }
 
-/// Detects the einsum in the optimized plan, and checks that the planned
-/// plan gives the same einsum.
-async fn detected(sql: &str) -> Detected {
+/// Detects the fold in the optimized plan, and checks that the planned
+/// plan gives the same fold.
+async fn detected(sql: &str) -> FoldMatch {
     let [planned, optimized] = [false, true].map(|optimize| async move {
         let agg = aggregate(sql, optimize).await;
         detect(&agg).unwrap_or_else(|| panic!("not detected:\n{}", agg.display_indent()))
     });
     let (planned, optimized) = (planned.await, optimized.await);
-    assert_eq!(planned.einsum, optimized.einsum);
+    assert_eq!(planned.fold, optimized.fold);
     optimized
 }
 
@@ -83,17 +83,17 @@ async fn declined(sql: &str) {
     for optimize in [false, true] {
         let agg = aggregate(sql, optimize).await;
         if let Some(d) = detect(&agg) {
-            panic!("detected {} in\n{}", d.einsum, agg.display_indent());
+            panic!("detected {} in\n{}", d.fold, agg.display_indent());
         }
     }
 }
 
 /// Asserts that detection declines the planned plan. For queries the
-/// optimizer rewrites into a shape that is an einsum.
+/// optimizer rewrites into a shape that is a fold.
 async fn declined_before_optimization(sql: &str) {
     let agg = aggregate(sql, false).await;
     if let Some(d) = detect(&agg) {
-        panic!("detected {} in\n{}", d.einsum, agg.display_indent());
+        panic!("detected {} in\n{}", d.fold, agg.display_indent());
     }
 }
 
@@ -102,14 +102,14 @@ fn d(s: &str) -> Dim {
 }
 
 /// Each operand's dimension columns, as `qualifier.name` strings.
-fn dim_columns(det: &Detected) -> Vec<Vec<String>> {
+fn dim_columns(det: &FoldMatch) -> Vec<Vec<String>> {
     det.operands
         .iter()
         .map(|o| o.dim_columns.iter().map(|c| c.flat_name()).collect())
         .collect()
 }
 
-fn values(det: &Detected) -> Vec<String> {
+fn values(det: &FoldMatch) -> Vec<String> {
     det.operands.iter().map(|o| o.value.to_string()).collect()
 }
 
@@ -119,11 +119,11 @@ async fn matrix_product() {
         "SELECT a.i, b.j, SUM(a.v * b.v) AS s FROM a JOIN b ON a.k = b.k GROUP BY a.i, b.j",
     )
     .await;
-    assert_eq!(det.einsum.to_string(), "a[i,k] · b[k,j] -> [i,j]");
-    assert_eq!(det.einsum.equality(&d("k")), Some(KeyEquality::Equal));
+    assert_eq!(det.fold.to_string(), "SUM(a[i,k] · b[k,j]) -> [i,j]");
+    assert_eq!(det.fold.equality(&d("k")), Some(KeyEquality::Equal));
     // Group keys outside every join keep NULL as a coordinate, as GROUP BY does.
     assert_eq!(
-        det.einsum.equality(&d("i")),
+        det.fold.equality(&d("i")),
         Some(KeyEquality::NotDistinctFrom)
     );
     assert_eq!(dim_columns(&det), [vec!["a.i", "a.k"], vec!["b.k", "b.j"]]);
@@ -134,7 +134,7 @@ async fn matrix_product() {
         .map(|(c, d)| (c.flat_name(), d.clone()))
         .collect();
     assert_eq!(outs, [("a.i".into(), d("i")), ("b.j".into(), d("j"))]);
-    assert_eq!(det.sum_output.name, "sum(a.v * b.v)");
+    assert_eq!(det.value_output.name, "sum(a.v * b.v)");
 }
 
 #[tokio::test]
@@ -142,7 +142,7 @@ async fn where_clause_join() {
     let det =
         detected("SELECT a.i, b.j, SUM(a.v * b.v) FROM a, b WHERE a.k = b.k GROUP BY a.i, b.j")
             .await;
-    assert_eq!(det.einsum.to_string(), "a[i,k] · b[k,j] -> [i,j]");
+    assert_eq!(det.fold.to_string(), "SUM(a[i,k] · b[k,j]) -> [i,j]");
 }
 
 #[tokio::test]
@@ -152,8 +152,8 @@ async fn batched_matrix_product() {
          GROUP BY x.n, x.i, y.j",
     )
     .await;
-    assert_eq!(det.einsum.to_string(), "x[n,i,k] · y[n,k,j] -> [n,i,j]");
-    assert_eq!(det.einsum.summed(), [d("k")].into());
+    assert_eq!(det.fold.to_string(), "SUM(x[n,i,k] · y[n,k,j]) -> [n,i,j]");
+    assert_eq!(det.fold.summed(), [d("k")].into());
 }
 
 #[tokio::test]
@@ -163,7 +163,10 @@ async fn three_operand_chain() {
          JOIN b ON a.k = b.k JOIN c ON b.j = c.j GROUP BY a.i, c.l",
     )
     .await;
-    assert_eq!(det.einsum.to_string(), "a[i,k] · b[k,j] · c[j,l] -> [i,l]");
+    assert_eq!(
+        det.fold.to_string(),
+        "SUM(a[i,k] · b[k,j] · c[j,l]) -> [i,l]"
+    );
     assert_eq!(values(&det), ["a.v", "b.v", "c.v"]);
 }
 
@@ -174,9 +177,9 @@ async fn is_not_distinct_from_join() {
          GROUP BY a.i, b.j",
     )
     .await;
-    assert_eq!(det.einsum.to_string(), "a[i,k] · b[k,j] -> [i,j]");
+    assert_eq!(det.fold.to_string(), "SUM(a[i,k] · b[k,j]) -> [i,j]");
     assert_eq!(
-        det.einsum.equality(&d("k")),
+        det.fold.equality(&d("k")),
         Some(KeyEquality::NotDistinctFrom)
     );
 }
@@ -188,14 +191,14 @@ async fn transitive_class_spans_three_operands() {
          GROUP BY a.i",
     )
     .await;
-    assert_eq!(det.einsum.to_string(), "a[i,k] · b[k] · c[k] -> [i]");
+    assert_eq!(det.fold.to_string(), "SUM(a[i,k] · b[k] · c[k]) -> [i]");
 }
 
 #[tokio::test]
 async fn diagonal() {
     let det = detected("SELECT m.i, SUM(m.v) FROM m WHERE m.i = m.j GROUP BY m.i").await;
-    assert_eq!(det.einsum.to_string(), "m[i,i] -> [i]");
-    assert_eq!(det.einsum.equality(&d("i")), Some(KeyEquality::Equal));
+    assert_eq!(det.fold.to_string(), "SUM(m[i,i]) -> [i]");
+    assert_eq!(det.fold.equality(&d("i")), Some(KeyEquality::Equal));
     assert_eq!(dim_columns(&det), [vec!["m.i", "m.j"]]);
 }
 
@@ -203,7 +206,7 @@ async fn diagonal() {
 async fn group_key_that_is_not_joined() {
     // b.j is not a join key: it becomes a dimension of its own.
     let det = detected("SELECT b.j, SUM(a.v * b.v) FROM a JOIN b ON a.k = b.k GROUP BY b.j").await;
-    assert_eq!(det.einsum.to_string(), "a[k] · b[k,j] -> [j]");
+    assert_eq!(det.fold.to_string(), "SUM(a[k] · b[k,j]) -> [j]");
 }
 
 #[tokio::test]
@@ -211,7 +214,7 @@ async fn two_group_keys_in_one_class() {
     let det =
         detected("SELECT a.k, b.k, SUM(a.v * b.v) FROM a JOIN b ON a.k = b.k GROUP BY a.k, b.k")
             .await;
-    assert_eq!(det.einsum.to_string(), "a[k] · b[k] -> [k]");
+    assert_eq!(det.fold.to_string(), "SUM(a[k] · b[k]) -> [k]");
     let dims: Vec<&Dim> = det.group_outputs.iter().map(|(_, d)| d).collect();
     assert_eq!(dims, [&d("k"), &d("k")]);
 }
@@ -222,7 +225,7 @@ async fn self_join_keeps_operands_apart() {
         "SELECT p.i, q.k, SUM(p.v * q.v) FROM a p JOIN a q ON p.k = q.i GROUP BY p.i, q.k",
     )
     .await;
-    assert_eq!(det.einsum.to_string(), "p[i,k] · q[k,q.k] -> [i,q.k]");
+    assert_eq!(det.fold.to_string(), "SUM(p[i,k] · q[k,q.k]) -> [i,q.k]");
 }
 
 #[tokio::test]
@@ -232,7 +235,7 @@ async fn single_leaf_filters() {
          WHERE a.i < 10 AND b.v > 0.5 GROUP BY a.i, b.j",
     )
     .await;
-    assert_eq!(det.einsum.to_string(), "a[i,k] · b[k,j] -> [i,j]");
+    assert_eq!(det.fold.to_string(), "SUM(a[i,k] · b[k,j]) -> [i,j]");
     for (op, pred) in det
         .operands
         .iter()
@@ -254,7 +257,7 @@ async fn factors_in_projection_below_aggregate() {
          GROUP BY i, j",
     )
     .await;
-    assert_eq!(det.einsum.to_string(), "a[i,k] · b[k,j] -> [i,j]");
+    assert_eq!(det.fold.to_string(), "SUM(a[i,k] · b[k,j]) -> [i,j]");
     // The constant is folded into the first operand.
     assert_eq!(values(&det), ["a.v * Float64(2)", "b.v"]);
 }
@@ -267,7 +270,7 @@ async fn derived_factor_over_one_leaf() {
          JOIN act ON inp.n IS NOT DISTINCT FROM act.n GROUP BY inp.p, act.o",
     )
     .await;
-    assert_eq!(det.einsum.to_string(), "inp[n,p] · act[n,o] -> [p,o]");
+    assert_eq!(det.fold.to_string(), "SUM(inp[n,p] · act[n,o]) -> [p,o]");
     assert_eq!(
         values(&det),
         ["inp.x", "act.g * (Float64(1) - act.z * act.z)"]
@@ -277,7 +280,7 @@ async fn derived_factor_over_one_leaf() {
 #[tokio::test]
 async fn operand_without_factor() {
     let det = detected("SELECT a.i, SUM(a.v) FROM a JOIN b ON a.k = b.k GROUP BY a.i").await;
-    assert_eq!(det.einsum.to_string(), "a[i,k] · b[k] -> [i]");
+    assert_eq!(det.fold.to_string(), "SUM(a[i,k] · b[k]) -> [i]");
     assert_eq!(values(&det), ["a.v", "Float64(1)"]);
 }
 
@@ -295,7 +298,7 @@ async fn declines_cross_leaf_inequality() {
 #[tokio::test]
 async fn declines_sum_distinct() {
     // The optimizer rewrites SUM(DISTINCT v) into a SUM over a GROUP BY leaf,
-    // which is an einsum.
+    // which is a fold.
     declined_before_optimization("SELECT a.i, SUM(DISTINCT a.v) FROM a GROUP BY a.i").await;
 }
 
@@ -348,7 +351,7 @@ async fn declines_two_aggregates() {
 
 #[tokio::test]
 async fn declines_no_group_by() {
-    // SQL returns one row even when nothing joined; an einsum has none.
+    // SQL returns one row even when nothing joined; a fold has none.
     declined("SELECT SUM(a.v * b.v) FROM a JOIN b ON a.k = b.k").await;
 }
 
@@ -367,7 +370,7 @@ async fn allowlisted_function_in_factor() {
     let det =
         detected("SELECT a.i, SUM(tanh(a.v) * exp(b.v)) FROM a JOIN b ON a.k = b.k GROUP BY a.i")
             .await;
-    assert_eq!(det.einsum.to_string(), "a[i,k] · b[k] -> [i]");
+    assert_eq!(det.fold.to_string(), "SUM(a[i,k] · b[k]) -> [i]");
 }
 
 // A factor or filter moved onto its leaf runs on rows that may never join, so
@@ -434,4 +437,87 @@ async fn movable_functions_never_fail() {
         let got: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(got, n, "{sql}");
     }
+}
+
+#[tokio::test]
+async fn count_star() {
+    let det = detected("SELECT a.i, COUNT(*) FROM a JOIN b ON a.k = b.k GROUP BY a.i").await;
+    assert_eq!(det.fold.to_string(), "COUNT(a[i,k] · b[k]) -> [i]");
+    // COUNT of a product is a sum of 0/1 indicators: a semiring fold.
+    assert_eq!(det.fold.semiring(), Some(Semiring::SumProduct));
+    assert_eq!(
+        values(&det),
+        [
+            "CASE WHEN Int64(1) IS NOT NULL THEN Float64(1) END",
+            "Float64(1)"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn count_of_an_integer_product_and_of_strings() {
+    // COUNT is exact on any type, and only asks whether each factor is NULL.
+    let det = detected(
+        "SELECT ints.i, COUNT(ints.x * b.j) FROM ints JOIN b ON ints.k = b.k GROUP BY ints.i",
+    )
+    .await;
+    assert_eq!(det.fold.to_string(), "COUNT(ints[i,k] · b[k]) -> [i]");
+    assert_eq!(
+        values(&det),
+        [
+            "CASE WHEN ints.x IS NOT NULL THEN Float64(1) END",
+            "CASE WHEN b.j IS NOT NULL THEN Float64(1) END"
+        ]
+    );
+    let det =
+        detected("SELECT a.i, COUNT(strs.s) FROM a JOIN strs ON a.k = strs.k GROUP BY a.i").await;
+    assert_eq!(det.fold.to_string(), "COUNT(a[i,k] · strs[k]) -> [i]");
+}
+
+#[tokio::test]
+async fn avg_of_a_product() {
+    let det =
+        detected("SELECT a.i, AVG(a.v * b.v) AS m FROM a JOIN b ON a.k = b.k GROUP BY a.i").await;
+    assert_eq!(det.fold.to_string(), "AVG(a[i,k] · b[k]) -> [i]");
+    // AVG is SUM / COUNT, not itself a semiring aggregate.
+    assert_eq!(det.fold.semiring(), None);
+    assert_eq!(det.fold.aggregate(), Aggregate::Avg);
+    assert_eq!(det.value_output.name, "avg(a.v * b.v)");
+}
+
+#[tokio::test]
+async fn sum_is_a_semiring_fold() {
+    let det = detected("SELECT a.i, SUM(a.v * b.v) FROM a JOIN b ON a.k = b.k GROUP BY a.i").await;
+    assert_eq!(det.fold.semiring(), Some(Semiring::SumProduct));
+}
+
+#[tokio::test]
+async fn integer_avg_is_a_float_avg() {
+    // DataFusion averages integers as Float64, casting each one first, so the
+    // plan itself is a float AVG; the cast to Float64 cannot fail.
+    // Before type coercion adds the cast, the argument is an integer, which
+    // detection declines.
+    let sql = "SELECT ints.i, AVG(ints.x) FROM ints GROUP BY ints.i";
+    declined_before_optimization(sql).await;
+    let det = detect(&aggregate(sql, true).await).unwrap();
+    assert_eq!(values(&det), ["CAST(ints.x AS Float64)"]);
+}
+
+#[tokio::test]
+async fn declines_count_distinct() {
+    // The optimizer turns COUNT(DISTINCT) into a COUNT over a grouped leaf.
+    declined_before_optimization("SELECT a.i, COUNT(DISTINCT a.v) FROM a GROUP BY a.i").await;
+}
+
+#[tokio::test]
+async fn declines_count_of_fallible_cast() {
+    declined(
+        "SELECT a.i, COUNT(CAST(strs.s AS DOUBLE)) FROM a JOIN strs ON a.k = strs.k GROUP BY a.i",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn declines_count_of_cross_leaf_sum() {
+    declined("SELECT a.i, COUNT(a.v + b.v) FROM a JOIN b ON a.k = b.k GROUP BY a.i").await;
 }

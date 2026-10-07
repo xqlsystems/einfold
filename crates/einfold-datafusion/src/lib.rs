@@ -10,6 +10,7 @@
 //! and runs them with a fused join-and-sum operator. It is the only einfold
 //! crate that depends on a query engine.
 
+pub mod exec;
 pub mod kernel;
 
 /// The DataFusion version this crate is built against. ddx must link the same.

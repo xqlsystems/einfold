@@ -13,11 +13,13 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait = "0.1"
 datafusion = { workspace = true }
 einfold-ir = { workspace = true }
 futures = "0.3"
 
 [dev-dependencies]
+einfold-testkit = { path = "../einfold-testkit" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

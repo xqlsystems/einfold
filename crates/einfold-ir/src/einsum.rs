@@ -52,6 +52,7 @@ pub enum KeyEquality {
 /// Only the ordinary pair, `SUM` of `*`, exists today. Others (such as `MIN`
 /// of `+`, for shortest paths) may be added later.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Semiring {
     /// `SUM` of products: ordinary contraction.
     SumProduct,
@@ -87,7 +88,10 @@ impl Operand {
 }
 
 /// Why an [`Einsum`] could not be built.
+///
+/// More reasons may be added as the representation grows.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EinsumError {
     /// The einsum has no operands.
     NoOperands,

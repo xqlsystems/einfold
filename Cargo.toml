@@ -8,6 +8,7 @@ resolver = "3"
 members = [
     "crates/einfold-ir",
     "crates/einfold-datafusion",
+    "crates/einfold-testkit",
 ]
 
 [workspace.package]

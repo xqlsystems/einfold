@@ -16,12 +16,14 @@ The design matters for planning, but code must not depend on it: comments and do
 
 ## From issue to merge
 
-1. **Issue.** Work starts as an issue with:
-   - a spec;
-   - the design sections it implements;
-   - acceptance criteria;
-   - a size budget;
+1. **Issue.** Work starts as an issue that sets **goals, constraints and motivation**, not a specification:
+   - *motivation:* why the work matters, and which design sections it serves;
+   - *goals:* what should be true when it's done, stated as outcomes, not as APIs or algorithms;
+   - *constraints:* what must hold, such as SQL semantics, determinism, compatibility with code already merged, and the size budget;
+   - *done when:* how a reviewer will know, such as which properties the tests establish;
    - the branch it builds on.
+
+   Leave the design of the code (types, function signatures, algorithms) to the implementer, who should judge from the code and the design doc. A prescribed API biases the implementation. If an interface must be shared between parallel pieces of work, agree on it in the issue's discussion or in a small pull request that lands first.
 
    Milestones have tracking issues.
 2. **Branch.** One branch per issue, named `<milestone>/<item>-<topic>`, such as `m1/c1-hash-kernel`.

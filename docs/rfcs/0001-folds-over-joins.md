@@ -6,9 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # RFC 0001: Folds over joins, not just einsums
 
-- **Status:** Proposed
+- **Status:** Accepted in direction by @alxmrs ("take the general shape now"); the ontology review below is proposed
 - **Author:** 🧭 Claude (orchestrator), from @alxmrs's review of #6 and #7
-- **Design sections affected:** §1, §2.2, §6, §7.1, §7.6, §8.3, §9.1, §10.1, §10.2, §14; supplement §9.1 and §10.2
+- **Design sections affected:** most of them. The vocabulary (§6), output forms (§7.2), partial aggregates (§8.3), detection (§9.1), and EinFold (§10.2) change most; see "Refactoring the docs".
 
 ## Summary
 
@@ -61,57 +61,111 @@ What this level adds: eager aggregation, contraction-order planning, variable se
 
 ## Proposal
 
-1. **The central object is the fold over a join.** In the design, the vocabulary and the code, einfold optimizes *folds over joins*. An einsum is the sum-product semiring fold, the most important case and the one most of the docs explain. The project and operator names stay: *einfold* (einsum + fold) and *EinFold*.
+1. **The central object is the fold over a join.** In the design, the vocabulary and the code, einfold optimizes *folds over joins*. An einsum is the sum-product semiring fold: the most important case, and the one most of the docs teach with. The project and the operator keep their names: *einfold* (einsum + fold) and *EinFold*.
+2. **Detection classifies every query at the strongest level it provably meets.** Level 1 gets the fused operator; levels 2 and 3 also get the algebraic rewrites. M1 recognizes `SUM`, `COUNT` and `AVG`; `MIN`, `MAX` and existence follow in M2 with their semiring checks.
+3. **Each aggregate carries its SQL rules:** how NULL inputs behave, what an empty group returns, and whether results are exact (`COUNT`, `MIN` and `MAX` are exact on any type; float `SUM` and `AVG` are not). The exactness invariant (design §8.6) applies per aggregate. Some semirings hold only under conditions (`MAX` of products needs non-negative factors), which become facts detection must prove.
 
-2. **The intermediate representation names the levels explicitly.** Sketch:
+## Ontology review
 
-   ```rust
-   /// A fold over a join: GROUP BY `output`, folding `aggregate` over
-   /// `value(row)` for every row of the join of `operands`.
-   pub struct Fold {
-       operands: Vec<Operand>,              // unchanged: dims + equality per dim
-       output: Vec<Dim>,
-       equality: BTreeMap<Dim, KeyEquality>,
-       value: Value,
-       aggregate: Aggregate,
-   }
+With the fold as the center, I reviewed every concept in the docs and in the code in review, layer by layer. For each, the question is whether its name and its definition match the thing.
 
-   #[non_exhaustive]
-   pub enum Value {
-       /// A ⊗-product of one factor per operand: a semiring fold when
-       /// `aggregate` is the semiring's ⊕. Unlocks the algebraic rewrites.
-       Product(Semiring),
-       /// Any other expression of the joined row: fusion only.
-       Opaque,
-   }
+### The data layer (XQL): mostly right
 
-   #[non_exhaustive]
-   pub enum Aggregate { Sum, Count, Min, Max, Avg, BoolOr /* … */ }
-   ```
+*Dataset table*, *variable*, *dimension*, *coordinate*, *position*, *extent*, *chunk*, *tile*, *layout*, *support* and *fill value* describe the data, not the query, so the fold doesn't change them. Two need sharper definitions:
 
-   `Einsum` stays as a constructor, or an alias, for the sum-product case, so existing tests and docs read naturally. `Fold::semiring()` returns `Some` only when the value and aggregate together form a semiring fold, and the optimizer checks it before any algebraic rewrite.
+- **Dimension** means two things today: an axis of the data (`lat`), and, in the code, a set of columns that a query equates (`a.k = b.k`). In the fold ontology the second sense is primary. A **dimension** is one variable of a fold: a set of columns the query equates, together with how it compares them (`=` or `IS NOT DISTINCT FROM`). A data axis becomes a dimension when a query uses it. The FAQ literature calls these *variables*; we keep "dimension" because it's what array users say.
+- **Operand** was defined as "one variable over its own dimensions". In the fold ontology, an operand is any input to the fold: a table, a subquery, or a mask. A variable is the most common kind of operand, not the definition.
 
-3. **Partial aggregates are generic.** "Partial aggregate" remains the right name: it is the standard database term for an aggregate's state over part of the input (DataFusion's `Partial` and `Final` modes use it the same way), and it applies to every fold. In code, the state splits in two:
-   - **group existence** (`matched`), which is the same for every aggregate, because SQL creates a group exactly when some joined row reaches it;
-   - **the aggregate's state** (a sum; a sum and a count; a minimum; …), behind one trait with `update`, `merge` and `finish`.
+### The query layer: the fold replaces the einsum
 
-   `PartialSum` becomes one implementation of that trait.
+| Concept | Definition | Replaces |
+|---|---|---|
+| **Fold** (fold over a join) | Inputs (operands), their join (dimensions), output dimensions (the `GROUP BY`), a row value computed from each joined row, and an aggregate that folds the row values in each group | *einsum* as the central object |
+| **Aggregate** | A commutative monoid with SQL semantics: how to combine, its identity, NULL handling, the value of an empty group, and whether it's exact. `SUM`, `COUNT`, `MIN`, `MAX`, `AVG`, `BOOL_OR` | `SUM` hard-coded |
+| **Row value** | What each joined row contributes: either a **product of factors**, one per operand, or an arbitrary expression | the implicit product |
+| **Factor** | An operand's contribution to a product: an expression over that operand's columns only (formerly "derived factor" when computed) | unchanged |
+| **Semiring fold** | A fold whose row value is a ⊗-product of factors, and whose aggregate is a ⊕ that ⊗ distributes over. A *derived* property of the fold, not a field set independently | `Semiring` as a free-standing field |
+| **Einsum** | The sum-product semiring fold | was the center; now a special case |
+| **Mask** (support-only operand) | An operand whose factor is ⊗'s identity, so it filters which rows join and contributes no value. This is semiring-independent: 1 for sum-product, 0 for min-plus, `TRUE` for existence | "mask operand", defined only for products |
 
-4. **Detection recognizes folds, not just sums.** It accepts `SUM`, `COUNT`, `MIN`, `MAX` and `AVG`, plus the decompositions of level 3, and classifies each query at the strongest level it provably meets. A query that is only a level-1 fold gets the fused operator and nothing else; that is still a large win.
+### The evaluation layer: separate three things the code merges
 
-5. **Correctness rules travel with the aggregate.** Each aggregate carries its SQL semantics: how NULL inputs behave, what an empty group returns, and whether results are exact (`COUNT`, `MIN` and `MAX` are exact on any type; `SUM` and `AVG` of floats are not). The exactness invariant (design §8.6) applies per aggregate. One distinctive case is `MAX` of products, which is a semiring only when every factor is non-negative; that is a fact detection must prove before using it.
+| Concept | Definition | Today |
+|---|---|---|
+| **Group existence** | Whether any joined row reached a group. Identical for every aggregate, because SQL creates a group exactly when some row reaches it | the `matched` half of `PartialSum` |
+| **Aggregate state** | The aggregate's own partial state: a sum; a sum and a count; a minimum | the `value` half of `PartialSum` |
+| **Partial aggregate** | Group existence plus aggregate state, for part of the input, mergeable with other parts. The term stays, because it's the database-standard name and applies to every fold | `PartialSum` |
+| **Accumulator** | *How* a state's ⊕ is computed numerically: a plain `f64` sum, a binned reproducible sum, and so on. This is where determinism and precision live (design §8.6) | unnamed; was going to be inside `PartialSum` |
+| **Contraction** | One step of a semiring fold's evaluation: join two operands (⊗), and fold away the dimensions no one else needs (⊕). Defined for every semiring, not just sum-product | used only for sum-product |
+| **Contraction tree** | A binary tree of contractions that evaluates a semiring fold. Level-1 folds don't have one: their aggregate cannot move below joins | unchanged, but scoped |
+
+### The physical layer: name operators after what they do
+
+| Concept | Definition | Today |
+|---|---|---|
+| **EinFold** | The fused join-and-fold operator: a join whose rows update partial aggregates directly, so join rows never exist. Works for every fold | correct, but described for `SUM` only |
+| **EinFold's algorithms** | *Hash* (Gustavson's algorithm, generalized), *dense*, *block-sparse*. Dense and block-sparse need a semiring with fast dense kernels: GEMM for sum-product, and a tropical "GEMM" for min-plus, which hosts may lack | "EinFoldHashJoin" for the hash algorithm |
+| **Relational form** | einfold's output as standard joins and aggregates | unchanged |
+| **Extension form** | einfold's output as a Substrait extension relation, **`Fold`**, that carries a fold and its facts | "einsum form", "`Einsum` relation" |
+| **Reference executor** | einfold's own implementation of the extension form, in DataFusion | `EinsumExec` |
+
+### The system layer: right as is
+
+*Host*, *reader*, *fact*, *fact provider*, *target profile*, *program mode* and *spike* name roles in the system, and are unaffected.
+
+### Structural findings beyond naming
+
+1. **The semiring should be derived, not declared.** The code stores a `Semiring` field next to the operands. Whether a fold *is* a semiring fold follows from its row value and aggregate, and sometimes needs facts (non-negativity). A free-standing field can contradict them. The optimizer should ask the fold.
+2. **Group existence belongs to the group, not the sum.** Splitting existence from the aggregate state makes every aggregate inherit the subtle SQL rule (an all-NULL group is NULL, not absent) for free, instead of each one reimplementing it.
+3. **Output dimensions and output columns are different things.** `GROUP BY a.k, b.k` with `a.k = b.k` has two output columns but one output dimension. The code handles this in the rule (D1). The ontology should name both, so later work doesn't conflate them.
+4. **One key equality per dimension is a representation choice with a precondition.** SQL attaches `=` or `IS NOT DISTINCT FROM` to each join edge, not to a dimension. Storing one per dimension is valid only because detection declines dimensions whose edges disagree. That precondition should be stated where the representation is defined.
+5. **Facts attach at three granularities:**
+   - to a dimension: extent;
+   - to an operand: size, density;
+   - to an operand's use of a dimension: its coordinate map and its tiling, since two operands may tile the same dimension differently.
+
+   Fact kinds (M3) should be organized that way.
+
+## Renames
+
+Names in docs and code, old to new. Exact type and function shapes are the implementer's choice (AGENTS.md); these are the concepts the names must express.
+
+| Where | Old | New |
+|---|---|---|
+| Docs, everywhere | einsum (as the central object) | fold over a join; *einsum* only for the sum-product case |
+| Docs | einsum form; `Einsum` relation | extension form; `Fold` relation |
+| Docs | EinsumIR | fold IR (or just "the IR") |
+| Docs | EinFoldHashJoin | EinFold's hash algorithm |
+| Docs | mask operand | mask (a support-only operand) |
+| Docs, title | "Fast Tensor Contractions for the XQL Model" | "Fast Folds over Joins, for Tensors and the XQL Model" |
+| `einfold-ir` | `Einsum`, `EinsumError`, module `einsum` | `Fold`, `FoldError`, module `fold`, with a convenient way to build the sum-product case |
+| `einfold-ir` | `Semiring` field | the aggregate, plus the row value; the semiring derived from them |
+| `einfold-ir` | `PartialSum` | group existence plus an aggregate state, with `SUM`, `COUNT` and `AVG` states for M1 |
+| `einfold-datafusion` | `kernel::contract`, `SUM_COLUMN` | a kernel named for the fused fold, and an output column named for the aggregate's value |
+| `einfold-datafusion` | `EinsumExec` | `EinFoldExec` (the operator's name, with DataFusion's `Exec` suffix) |
+| `einfold-datafusion` | `EinsumNode`, `EinsumRule`, `EinsumPlanner` | `FoldNode`, `FoldRule`, `EinFoldPlanner` |
+| `einfold-datafusion` | `detect::Detected` | a name for "a fold found in a plan, bound to its inputs", such as `FoldMatch` |
+| `einfold-testkit` | cases with an `einsum` | cases with a `fold`, over `SUM`, `COUNT` and `AVG` |
+
+## Refactoring the docs
+
+Once this RFC is accepted:
+
+- **design.md:** the summary and title; §2.2, which still teaches with the einsum but introduces the fold right after; §6's vocabulary, rebuilt on the four layers above; §7.2's output forms; §8.3, with group existence, aggregate state and accumulator; §9.1, which classifies folds by level; §10.1, where eager aggregation is a semiring-fold rewrite; §10.2, where EinFold handles any fold; and §14, where the semiring question is answered.
+- **supplement.md:** the same sections in detail, plus each aggregate's SQL rules.
+- **demos.md:** the online softmax's gap becomes "a level-1 fold, supported by EinFold". Its algebraic optimizations are still a gap.
 
 ## Effect on M1
 
-M1 is in review. I propose to keep M1's *scope* (fast two-operand queries in DataFusion) while giving it the general *shape*:
+M1 keeps its scope (fast two-operand queries in DataFusion) and takes the general shape. Each item's issue is revised to state the new goals:
 
-- **A2 (#6):** rename `Einsum` to `Fold`, add `Value` and `Aggregate` (initially `Sum`, `Count` and `Avg`), and split `PartialSum` into existence plus an aggregate-state trait.
-- **C1 and C2 (#14, #16):** make the kernel generic over the aggregate's state. The hash join and group bookkeeping don't change.
-- **B1 (#15):** accept `SUM`, `COUNT` and `AVG` of products, and the value `1` for `COUNT(*)`. `MIN` and `MAX` follow in M2 with the semiring checks.
-- **E1 (#19):** the generator also produces `COUNT` and `AVG` queries.
-- **D1 (#20):** unchanged in structure.
-
-That adds perhaps 150–250 lines across the stack. The alternative is to land M1 as is, and generalize in M2. That's cheaper now, but it means renaming merged public types and rewriting reviewed code later.
+- **A2 (#6):** the fold, aggregates (`SUM`, `COUNT`, `AVG`), row values, and group existence separated from aggregate state; the semiring derived.
+- **C1 (#14):** the kernel folds any M1 aggregate. Its join and group bookkeeping are unchanged.
+- **C2 (#16):** renamed to `EinFoldExec`; otherwise unchanged.
+- **B1 (#15):** recognizes `SUM`, `COUNT` (including `COUNT(*)`) and `AVG` of products and of single-operand values, and classifies each at its strongest level.
+- **E1 (#19):** generates `COUNT` and `AVG` queries alongside `SUM`.
+- **D1 (#20):** the renames; otherwise unchanged.
+- **E2 (#12):** adds an `AVG` of products to the benchmark.
 
 ## Alternatives considered
 
@@ -119,16 +173,19 @@ That adds perhaps 150–250 lines across the stack. The alternative is to land M
 - **"Semiring fold" for everything.** That's accurate for level 2, but it would exclude `AVG`, the online softmax, and every level-1 fold that still benefits from fusion.
 - **"Aggregate-join query", or FAQ.** "FAQ" is the most precise term from the literature, but obscure to most readers. "Aggregate-join" is clear, but awkward in code. "Fold over a join" says the same thing, and matches the project's name.
 - **Keep "einsum" as the center, and add special cases.** That's simpler, but the special cases would multiply: `COUNT`, `AVG`, softmax. It also leaves the design's ontology wrong.
+- **"Variable" instead of "dimension".** It's the FAQ literature's term, but "variable" already means an XQL data variable (temperature) in this project.
 
 ## Consequences
 
 - **Correctness.** Each new aggregate needs its NULL, empty-group and exactness rules stated and tested. The equivalence harness extends naturally, since SQL itself is the oracle.
 - **Performance.** Level-1 folds get the fused operator's main win: no materialized join. Level-2 and level-3 folds get the full optimizer.
-- **Composability.** The fold and its partial states are the same abstraction that reduction at the source (design §10.5) and the `Einsum` Substrait relation (to be renamed `Fold`?) carry, so readers and hosts implement one concept.
+- **Composability.** The fold and its partial states are the same abstraction that reduction at the source (design §10.5) and the `Fold` Substrait relation carry, so readers and hosts implement one concept.
 - **Docs.** The design keeps teaching through einsums, the most familiar case, while stating the general object up front.
 
-**Open questions**
+## Resolved questions
 
-1. Should M1 take the general shape now, as proposed, or land as is and generalize in M2?
-2. What should the Substrait extension relation be called: `Einsum` or `Fold`?
-3. Should order-sensitive aggregates (`STRING_AGG`, `ARRAY_AGG` with `ORDER BY`) ever be in scope? They are folds, but not commutative ones.
+1. *Should M1 take the general shape now?* Yes (@alxmrs).
+2. *What should the Substrait relation be called?* Proposed: **`Fold`**, since it carries any fold, not just einsums.
+3. *Are order-sensitive aggregates in scope?* Proposed: not for now. `STRING_AGG` and `ARRAY_AGG` with `ORDER BY` are folds, but not commutative ones, so partial states can't be merged in any order. Revisit if a demo needs them.
+
+**Open for review:** the names in "Renames", especially `Fold`, `FoldMatch` and the new title, and the five structural findings.

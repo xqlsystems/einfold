@@ -40,33 +40,37 @@ The full glossary, with each term's einsum and relational equivalents. The desig
 
 | Term | Meaning | Einsum | Relational |
 |---|---|---|---|
-| **Dimension** | A named axis, such as `lat` or `time` | An index label (`i`, `j`) | A dimension column, which is a key column |
+| **Dimension** | One variable of a fold: a set of columns the query equates, with how it compares them. A data axis such as `lat` becomes a dimension when a query joins or groups on it | An index label (`i`, `j`) | A class of equated key columns |
 | **Coordinate** | A label along a dimension, such as `30.0°N` or a timestamp | — | A value in a dimension column |
 | **Position** | An integer offset `0 … n−1` along a dimension | The value an index ranges over | — |
 | **Extent** | The number of positions along a dimension | The size of an index | Exact distinct count of a dimension column |
 | **Variable** | A named array over a set of dimensions; Xarray distinguishes data variables (such as temperature) from coordinate variables (such as latitude) | A tensor | A value column, together with its dimensions |
 | **Dataset table** | The table a reader produces: one row per coordinate tuple over all of the dataset's dimensions, one column per variable | Several tensors | A wide table |
-| **Operand** | One variable over its own dimensions, as input to an einsum | An operand | A narrow table `(dims…, value)` |
+| **Operand** | One input to a fold: a table, a subquery, or a mask; often one variable over its own dimensions | An operand | A narrow table `(dims…, value)`, or any relation |
 | **Support** | The coordinate tuples that have a row | The entries that are not the fill value | The rows that exist |
 | **Fill value** | Zarr's value for chunks that were never written | Often called "zero" in sparse-tensor work | — |
 | **Tile** | A rectangular box of positions (section 8.2) | A slice or block | A partition |
 | **Chunk** | A storage tile in Zarr (in v3, possibly an inner chunk of a shard; section 6.2) | — | Usually one partition of a scan |
 | **Layout** | A function from positions to row order within a tile (section 8.2) | A strided array view | Row order of a scan |
 | **Fact** | Something known about an operand, tagged with how it is known (section 8.1) | — | Statistics, metadata |
-| **Einsum** | A sum of products over operands, with output dimensions | `ik,kj->ij` | `Aggregate(SUM(product))` over joins on dimensions |
-| **Mask operand** | einfold's internal form of a predicate that relates dimensions of different operands, such as a causal mask `q.t >= k.t`: the set of allowed coordinate pairs (section 9.1) | A 0/1 tensor multiplied in | A join with the set of allowed pairs |
+| **Fold** (over a join) | A join of operands, grouped by output dimensions, with an aggregate folding each group's row values ([RFC 0001](rfcs/0001-folds-over-joins.md)) | — | `Aggregate(AGG(row value))` over joins on dimensions |
+| **Aggregate** | How a group's values combine (`SUM`, `COUNT`, `AVG`, `MIN`, `MAX`), with SQL's rules for NULLs, empty groups and exactness | ⊕ | An aggregate function |
+| **Semiring fold** | A fold whose row value is a ⊗-product of per-operand factors, and whose aggregate is a ⊕ that ⊗ distributes over; derived, not declared | A tensor contraction over a semiring | An aggregate-join query that admits eager aggregation |
+| **Einsum** | The sum-product semiring fold | `ik,kj->ij` | `Aggregate(SUM(product))` over joins on dimensions |
+| **Mask** | An operand that only filters which rows join and contributes no value: its factor is ⊗'s identity (1 for sum-product, 0 for min-plus, `TRUE` for existence). einfold's internal form of a predicate relating dimensions of different operands, such as a causal mask `q.t >= k.t` (section 9.1) | A 0/1 tensor multiplied in | A join with the set of allowed pairs |
 | **Matmul pushdown** | Skipping rows whose value is exactly zero before the join of a contraction, whether the user writes the filter or einfold proves it safe (section 9.2) | Skipping zero entries | A filter pushed below a join |
 | **Derived factor** | An expression that reads only one operand's columns, treated as one of that operand's value columns (section 9.1) | One factor of a product | A computed column |
-| **Contraction tree** | A binary tree of pairwise contractions that evaluates an einsum | A contraction path | A tree of join-aggregates |
-| **EinFold join** (or **EinFold**) | The package's fused join-and-sum operator (section 10.2). The capitalized name is the operator; lowercase **einfold** is the package | One pairwise contraction | A groupjoin (a join fused with the group-by after it; section 10.1), generalized to groups that span both inputs |
-| **EinFoldHashJoin** | EinFold's hash algorithm, based on Gustavson's 1978 sparse matrix multiply (section 10.2) | Sparse contraction | — |
-| **`Einsum` relation** | The Substrait extension relation that carries an einsum and its facts | — | — |
-| **`EinsumExec`** | The DataFusion physical operator in einfold's reference executor | — | — |
-| **Partial aggregate** | A per-group state that can be combined later (section 8.3) | A partial sum | A partial-mode aggregate |
+| **Contraction tree** | A binary tree of pairwise contractions that evaluates a semiring fold. Folds that are not semiring folds have none | A contraction path | A tree of join-aggregates |
+| **EinFold** | The package's fused join-and-fold operator, for any fold (section 10.2). The capitalized name is the operator; lowercase **einfold** is the package | One pairwise contraction | A groupjoin (a join fused with the group-by after it; section 10.1), generalized to groups that span both inputs |
+| **EinFold's hash algorithm** | Based on Gustavson's 1978 sparse matrix multiply, generalized to folds (section 10.2) | Sparse contraction | — |
+| **`Fold` relation** | The Substrait extension relation that carries an einsum and its facts | — | — |
+| **`EinFoldExec`** | The DataFusion physical operator in einfold's reference executor | — | — |
+| **Partial aggregate** | A group's state over part of the input: group existence plus the aggregate's state, mergeable with other parts (section 8.3) | A partial sum | A partial-mode aggregate |
+| **Accumulator** | How an aggregate state's additions are computed numerically: plain `f64`, a binned reproducible sum, … (section 8.6) | — | — |
 | **Reader** | A project that turns arrays into tables (section 2.1) | — | A table provider |
 | **Host** | The engine that runs einfold's output (section 2.3) | — | — |
 | **Target profile** | Data describing what a host supports (section 7.4) | — | — |
-| **Relational form**, **einsum form** | einfold's two output forms: standard joins and aggregates, or the `Einsum` extension relation (section 7.2) | — | — |
+| **Relational form**, **extension form** | einfold's two output forms: standard joins and aggregates, or the `Fold` Substrait extension relation (section 7.2) | — | — |
 | **Program mode** | Optimizing a batch of plans that read each other's results together (section 7.3) | — | — |
 | **Spike** | A short, time-boxed experiment that answers one design question (section 13) | — | — |
 | **E-graph** | A data structure that stores many equivalent versions of an expression compactly, by grouping equal subexpressions into classes (section 7.6) | — | Like the "memo" in which a Cascades-style query optimizer (a common framework for plan search) stores equivalent plans |
@@ -114,7 +118,7 @@ These are facts about the data model that einfold's rewrites must respect.
 
 A profile also records whether the host scans a shared CTE once (section 9.5), and quirks of its plan reader that the writers must respect. For example, DuckDB's Substrait reader honors a relation's `emit` field (which selects and reorders output columns) only on projections. On joins, filters, sorts, fetches, cross joins and set operations it silently ignores `emit` and returns the leading columns (found by ddx, [ddx PR #117](https://github.com/xqlsystems/ddx/pull/117)). So einfold's Substrait writer puts `emit` only on projection relations for every host, and adds an explicit projection where it needs to reorder columns.
 
-Fallback is per subplan. If a host runs the `Einsum` relation for dense 64-bit floats but not for sparse integers, einfold emits the einsum form for the first subplan and the relational form for the second, in the same plan.
+Fallback is per subplan. If a host runs the `Fold` relation for dense 64-bit floats but not for sparse integers, einfold emits the extension form for the first subplan and the relational form for the second, in the same plan.
 
 ### 7.6 Rewrite engine: egglog, in a hybrid design
 
@@ -207,7 +211,7 @@ A **fact** is something known about an operand, tagged with how it is known. Eve
 - *Arrow metadata does not survive the trip* (S2, [`spikes/s02-carrier`](spikes/s02-carrier/README.md)). DuckDB drops all field and schema metadata at its Arrow boundary. Substrait's schema has no metadata field, so a plan carries none: metadata seemed to survive a round trip only because the consumer looked the table up again in its own catalog.
 - *Inside DataFusion, metadata is kept by column name, not by meaning.* It survives filters, limits, joins and casts, which change the rows or values a fact describes. Where a union's inputs disagree, the left input's metadata silently wins.
 
-So facts travel in einfold's own **fact table**, keyed by table and column, and filled by **per-reader fact providers**. xarray-sql's provider reads its Python context, duckdb-zarr's its metadata table functions (`read_zarr_metadata()`, `read_zarr_groups()`), and zarr-datafusion's its extended `DESCRIBE`. Arrow metadata can still be one *input* to a provider, read at the scan, and nowhere above it. For the einsum form, facts that the host needs at run time travel as fields of the `Einsum` relation itself.
+So facts travel in einfold's own **fact table**, keyed by table and column, and filled by **per-reader fact providers**. xarray-sql's provider reads its Python context, duckdb-zarr's its metadata table functions (`read_zarr_metadata()`, `read_zarr_groups()`), and zarr-datafusion's its extended `DESCRIBE`. Arrow metadata can still be one *input* to a provider, read at the scan, and nowhere above it. For the extension form, facts that the host needs at run time travel as fields of the `Fold` relation itself.
 
 Two rules follow:
 
@@ -230,8 +234,8 @@ A grid that is affine only up to rounding gets an Estimate-level affine fact for
 | Fill value, as emitted by the reader | Can a missing chunk be skipped? |
 |---|---|
 | No rows (the reader omits fill entries) | Yes. The table really has no rows there. |
-| Rows with value 0 | Its products are 0, so the work can be skipped. But the groups it reaches still exist, and still equal 0 where nothing else contributes. Represent the skipped tile by the partial aggregate "matched, value 0" (section 8.3). |
-| Rows with value NULL | Its products are NULL, so the work can be skipped. The groups it reaches still exist. Represent it by "matched, no value". |
+| Rows with value 0 | Its products are 0, so the work can be skipped. But the groups it reaches still exist, and still equal 0 where nothing else contributes. Represent the skipped tile by the partial aggregate "reached, value 0" (section 8.3). |
+| Rows with value NULL | Its products are NULL, so the work can be skipped. The groups it reaches still exist. Represent it by "reached, no value". |
 | Rows with value NaN | Not as if it were zero. Any group it reaches is NaN. The work can be skipped by setting those groups to NaN directly. |
 
 ### 8.2 Tiles
@@ -260,18 +264,20 @@ Slicing a summed dimension produces partial aggregates that must be combined (se
 
 ### 8.3 Partial aggregates
 
-A **partial aggregate** is the state of one output group, computed over part of the input and combined later. Eager aggregation (10.1), EinFold's accumulator (10.2), slicing (9.4), parallel partitions, and reduction at the source (10.5) all produce partial aggregates. So their SQL semantics are defined once, here. Their numerics are defined in section 8.6.
+A **partial aggregate** is the state of one output group, computed over part of the input and combined later. Eager aggregation (10.1), EinFold (10.2), slicing (9.4), parallel partitions, and reduction at the source (10.5) all produce partial aggregates. So their SQL semantics are defined once, here. Their numerics are defined in section 8.6.
 
-**State.** For `SUM` over products, a group's state is:
+**State.** A group's partial aggregate has two independent parts:
 
-- `matched`: did any joined row reach this group? This decides whether the group exists.
-- `value`: the running sum of the non-NULL products, or "none" if there were none. "None" means the final `SUM` is NULL.
+- **group existence** (`reached`): did any joined row reach this group? This decides whether the group exists, and is the same for every aggregate;
+- **the aggregate's state:** for `SUM`, the running sum of the non-NULL values, or "none"; for `COUNT`, the number of non-NULL values; for `AVG`, a sum and a count; for `MIN` and `MAX`, the extreme so far, or "none".
 
-**Update.** For each joined row, set `matched`. Then, if the product is not NULL, add it to `value` (the first non-NULL product assigns it). Setting `matched` before the NULL test is what keeps an all-NULL group in the output as NULL, rather than dropping it.
+**Update.** For each joined row, set `reached`. Then, if the row's value is not NULL, fold it into the aggregate's state. Setting `reached` before the NULL test is what keeps a group reached only by NULL values in the output: as NULL for `SUM`, `AVG`, `MIN` and `MAX`, and as 0 for `COUNT`.
 
-**Combine.** `matched` is OR-ed. `value` is added, with "none" as the identity. When einfold controls the combine (in its reference executor, and when determinism is requested), it combines partial aggregates in a fixed order: partition order, then tile order.
+**Combine.** `reached` is OR-ed. The aggregate states are merged with the aggregate's own operation, with its empty state as the identity. When einfold controls the combine (in its reference executor, and when determinism is requested), it combines partial aggregates in a fixed order: partition order, then tile order.
 
-**Numerics.** How `value` is accumulated (its precision, and whether its result depends on the order of additions) is set by section 8.6.
+**Finish.** `SUM` returns its sum, or NULL for "none". `COUNT` returns its count. `AVG` returns sum ÷ count, or NULL when the count is 0. A group never reached does not appear.
+
+**Numerics.** How a float state is accumulated (its precision, and whether its result depends on the order of additions) is the *accumulator*, set by section 8.6. `COUNT`, `MIN` and `MAX` are exact on any type.
 
 ### 8.4 Order is a layout
 
@@ -289,7 +295,7 @@ Within a Zarr chunk, row order comes from the chunk's memory order (section 6.2)
 - *Row order did not follow the rules, and the two hosts fail in opposite ways.* DataFusion knows a declared order: it tracks it through filters, projections and unions, and answers `ORDER BY` with a merge rather than a sort. But without `ORDER BY` it spreads rows across partitions, so they arrive scrambled. DuckDB keeps insertion order through every operator except an aggregate, but its planner doesn't know the order, and always sorts for `ORDER BY`.
 - *Neither keeps order through a hash aggregate,* which is what a contraction node in the relational form is.
 
-So row order is a fact only where a host promises it. On DataFusion, einfold asks for the order it needs: the operator declares a required input ordering, which costs a merge, not a sort, when the scan's order is declared. On DuckDB, einfold relies on order only if it adds the `ORDER BY` and pays for the sort. The output order of a contraction node is whatever EinFold emits (section 10.3), which only the einsum form can promise.
+So row order is a fact only where a host promises it. On DataFusion, einfold asks for the order it needs: the operator declares a required input ordering, which costs a merge, not a sort, when the scan's order is declared. On DuckDB, einfold relies on order only if it adds the `ORDER BY` and pays for the sort. The output order of a contraction node is whatever EinFold emits (section 10.3), which only the extension form can promise.
 
 ### 8.5 Structure and values
 
@@ -331,7 +337,7 @@ einfold follows JAX's split.
 
 **4. Deterministic by default where einfold executes.**
 
-- The reference executor (`EinsumExec`) and the `Einsum` relation's specification are deterministic by default, and the conformance suite checks that repeated runs give identical bits. einfold controls these, and conformance testing needs repeatability, much as JAX on TPU is deterministic in practice.
+- The reference executor (`EinFoldExec`) and the `Fold` relation's specification are deterministic by default, and the conformance suite checks that repeated runs give identical bits. einfold controls these, and conformance testing needs repeatability, much as JAX on TPU is deterministic in practice.
 - Ways to accumulate `value` deterministically, in order of preference:
   1. **An order-independent accumulator.** Reproducible summation gives the same bits in any order. It works either by binning values by exponent, as the ReproBLAS library (Demmel and Nguyen) does, or with an exact "superaccumulator" wide enough to hold any sum without rounding. Results are then deterministic, parallel, and accurate, and a rewrite that only reorders sums gives the original plan's exact bits. Spike S8 ([`spikes/s08-deterministic-sums`](spikes/s08-deterministic-sums/README.md)) measured the cost:
      - A **binned sum** gave identical bits under every order, thread count, and GPU atomic schedule tried, and on the test data equaled the correctly rounded sum.
@@ -399,10 +405,10 @@ The second shape is a sum of einsums, which ddx produces when a table is read in
 6. **Classify filters.**
    - A range or equality on a dimension column stays with its operand as a slice. An equality to a constant removes that dimension.
    - A predicate on a value column stays with its operand. It shrinks the operand's support, and the contraction is still an einsum.
-   - A predicate that relates *dimension* columns of different operands and is not an equality, such as a causal mask `q.t >= k.t` or a sliding window `abs(q.t - k.t) < w`, becomes a **mask operand**: the set of allowed coordinate pairs, joined in like any other operand. That is exactly what the SQL predicate means, including which groups exist. A mask computable from coordinates has a known support, so each tile is Exact-known to be fully allowed, fully masked, or partly masked. Turning a predicate on coordinates into one on positions needs an Exact fact that the coordinate map is monotonic, which nearly all one-dimensional coordinates satisfy (spike S4). A stored table of allowed pairs, such as a graph's edges, is a mask too. In the e-graph a mask is one more leaf, so every rewrite applies to it. Users never write mask operands; they write SQL predicates, and the mask is einfold's internal representation (principle 8).
+   - A predicate that relates *dimension* columns of different operands and is not an equality, such as a causal mask `q.t >= k.t` or a sliding window `abs(q.t - k.t) < w`, becomes a **mask**: the set of allowed coordinate pairs, joined in like any other operand. That is exactly what the SQL predicate means, including which groups exist. A mask computable from coordinates has a known support, so each tile is Exact-known to be fully allowed, fully masked, or partly masked. Turning a predicate on coordinates into one on positions needs an Exact fact that the coordinate map is monotonic, which nearly all one-dimensional coordinates satisfy (spike S4). A stored table of allowed pairs, such as a graph's edges, is a mask too. In the e-graph a mask is one more leaf, so every rewrite applies to it. Users never write masks; they write SQL predicates, and the mask is einfold's internal representation (principle 8).
    - A predicate that compares *values* of different operands, other than through equality on dimensions, does not match. Detection stops.
 7. **Map group keys.** Each group key must be a column in some dimension class. The classes it names form `O`.
-8. **Check the semiring.** A semiring is the pair of operations an einsum uses for "add" and "multiply". `SUM` over `*` is the default. `MIN` or `MAX` over `+` (tropical semirings, used for shortest paths) are recognized but left unmatched until section 14 decides on semirings.
+8. **Classify the fold.** A semiring is a pair of operations, "add" (⊕) and "multiply" (⊗), with ⊗ distributing over ⊕. The fold is a *semiring fold* when its row value is a ⊗-product of the factors from step 3 and its aggregate is ⊕: `SUM` of `*` (einsums), `COUNT` (sum-product over 0/1 indicators), and in M2 `MIN` or `MAX` of `+` (tropical semirings, used for shortest paths) and `MAX` of `*` when every factor is provably non-negative. `AVG` is *decomposable*: `SUM / COUNT` over the same join. Any other row value or mergeable aggregate is still a fold, and gets EinFold's fusion, but no algebraic rewrite. The classification is derived from the query, never declared.
 
 **Correctness.** Every rewrite in section 9 holds under bag semantics, so detection does not require unique coordinate tuples. Dense execution does (section 10.2). A join on `=` drops rows whose key is NULL, a join on `IS NOT DISTINCT FROM` matches NULL to NULL, and `GROUP BY` keeps NULL as its own group. The relational form keeps these semantics because it is relational, and dense execution requires non-NULL dimensions, which Zarr guarantees. Anything detection cannot prove is left unchanged.
 
@@ -535,7 +541,7 @@ Two design rules come from it:
 
 - **Shared scans.** ddx's two gradient contractions from section 3, `X̄[n,d] = Σ_h Ȳ[n,h]·W[d,h]` and `W̄[d,h] = Σ_n X[n,d]·Ȳ[n,h]`, both read `Ȳ`. Both can stream `Ȳ` against a hash table: one on `W` keyed by `h`, one on `X` keyed by `n`. One scan of `Ȳ` then feeds both results. Each row `(n, h, ȳ)` adds to row `n` of `X̄` through the `W` table, and to column `h` of `W̄` through the `X` table. In ddx these are two separate steps that each read the stored `Ȳ` step, so an optimizer rule seeing one plan at a time cannot share the scan. Program mode (section 7.3) can: it sees every step of the program. In general, group the einsums in one plan, or one program, that share an operand, and stream the shared operand. This is multiple-query optimization (Sellis, 1988), the classic technique of sharing work among queries run together, applied to einsums.
 - **Common subexpressions.** Put every node of every contraction tree in a canonical form, hash it, and compute identical nodes once (Deeds et al., §5.4). In egglog this comes for free: the e-graph stores each distinct subexpression once, so einsums placed in the same e-graph, including all the steps of a program, share them automatically.
-- **Realization.** Reference executor: an `EinsumExec` with several outputs. Relational form: the shared operand is emitted once as a CTE that both einsums reference. Whether the host then scans it once is recorded in the target profile.
+- **Realization.** Reference executor: an `EinFoldExec` with several outputs. Relational form: the shared operand is emitted once as a CTE that both einsums reference. Whether the host then scans it once is recorded in the target profile.
 
 ## 10. Physical realization, in detail
 
@@ -568,7 +574,7 @@ FROM A JOIN n1 ON A.j = n1.j GROUP BY A.i;
 
 **NULL semantics.** Check both fields of the partial aggregate (section 8.3).
 
-- *`matched`.* A pre-aggregated group of `B` exists exactly when some row of `B` has that key, so the join matches in both forms, for the same output groups.
+- *Group existence (`reached`).* A pre-aggregated group of `B` exists exactly when some row of `B` has that key, so the join matches in both forms, for the same output groups.
 - *`value`.*
   - If `a` is NULL, every `a·bⱼ` is NULL, and so is `a·Σbⱼ`. Both forms skip the contribution.
   - If all `bⱼ` are NULL, `Σbⱼ` is NULL, so `a·Σbⱼ` is NULL. Every `a·bⱼ` is also NULL. Both forms skip.
@@ -582,11 +588,11 @@ The rule is therefore exact in SQL semantics, up to floating-point rounding. For
 
 **Prior work.** Yan and Larson (eager and lazy aggregation); Chaudhuri and Shim (1994), who added group-by to cost-based query optimization; Moerkotte and Neumann (groupjoin); Blacher et al. (CTE decomposition); FAQ.
 
-### 10.2 The einsum form: EinFold
+### 10.2 The extension form: EinFold
 
-EinFold is the fused join-and-sum operator. It is what the `Einsum` relation asks a host to run, and what `EinsumExec` implements. For two-operand contractions it is the highest-value piece, and the only fix for problem 1.
+EinFold is the fused join-and-sum operator. It is what the `Fold` relation asks a host to run, and what `EinFoldExec` implements. For two-operand contractions it is the highest-value piece, and the only fix for problem 1.
 
-**Idea.** Fuse the `SUM` into the hash join so the `N·D·H` join rows never exist. For matrices this is Gustavson's row-by-row sparse matrix multiply (Gustavson, 1978), which sparse BLAS libraries still use.
+**Idea.** Fuse the aggregate into the hash join so the `N·D·H` join rows never exist: each joined row updates its group's partial aggregate (section 8.3) directly. This works for every fold, since it only needs partial states to merge. For matrices this is Gustavson's row-by-row sparse matrix multiply (Gustavson, 1978), which sparse BLAS libraries still use.
 
 **Dimension roles at a node** `A ⊗ B → K`, with shared dimensions `S`:
 
@@ -594,7 +600,7 @@ EinFold is the fused join-and-sum operator. It is what the `Einsum` relation ask
 - `F_A = (K ∩ dims(A)) \ S` and `F_B = (K ∩ dims(B)) \ S`: free dimensions from each side;
 - `S \ K`: contracted dimensions.
 
-#### Hash algorithm (EinFoldHashJoin)
+#### Hash algorithm (EinFold's hash algorithm)
 
 **Gustavson's algorithm.** It computes `C = AB` one row at a time, as `cᵢ. = Σ_{aᵢⱼ≠0} aᵢⱼ·bⱼ.`, where `cᵢ.` is row `i` of `C`. Row `i` of `C` is a linear combination of the rows of `B` picked out by the nonzeros in row `i` of `A`. Both inputs are stored row by row in compressed sparse row form (CSR: each row's nonzeros stored together, with an array marking where each row starts), so the inner loop only ever multiplies a nonzero by a nonzero. The work is proportional to `N`, the number of nonzero-by-nonzero products, plus small terms for empty rows: `O(p, r, N_A, N)` for a `p×q` by `q×r` product, where `N_A` is the number of nonzeros in `A`. Earlier algorithms matched rows of `A` against columns of `B`, and spent most of their time merging entries that never multiply. Gustavson's state for one row is:
 
@@ -611,10 +617,10 @@ build:  H ← hash table on B keyed by S; each entry is a list of (F_B, b)
 probe:  for each row (s_A, f_A, a) of A:
           for each (f_B, b) in H[s_A]:
             update the partial aggregate for (kₛ, f_A, f_B) with a·b      -- section 8.3
-emit:   each group with matched = true
+emit:   each group with reached = true
 ```
 
-The **build** step loads `B` into a hash table. The **probe** step streams `A` and looks each row up in that table. The hash table is `B` compressed along its contracted dimensions, which is what Gustavson's row-wise storage of `B` is. The probe loop is his row loop. The update follows section 8.3: set `matched` (Gustavson's `xb` and `JC`) before testing the product for NULL. Otherwise an all-NULL group would vanish instead of coming out NULL.
+The **build** step loads `B` into a hash table. The **probe** step streams `A` and looks each row up in that table. The hash table is `B` compressed along its contracted dimensions, which is what Gustavson's row-wise storage of `B` is. The probe loop is his row loop. The update follows section 8.3: set `reached` (Gustavson's `xb` and `JC`) before testing the row's value for NULL. Otherwise a group reached only by NULLs would vanish instead of coming out NULL (or 0, for `COUNT`).
 
 **Streaming.** If `A` arrives grouped by `(Kₛ, F_A)` (section 8.4), all contributions to one output row arrive together. Then only one row's state is live: Gustavson's `x`, `JC`, and `xb`, keyed by `F_B`. Use his arrays directly when `F_B` has a known extent `r`, and a small hash map otherwise. When the `(Kₛ, F_A)` key changes, emit the row. With the multiple-switch array there is nothing to reset.
 
@@ -631,7 +637,7 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 #### Dense and block-sparse algorithms
 
 - **Dense.** When both operands are dense over `S` and their free dimensions, with Exact coordinate maps that agree and unique coordinate tuples, skip hashing. View each tile through its layout and call a GEMM, batched over `Kₛ`. The layout's strides decide whether an input must be treated as transposed (section 8.4).
-- **Block-sparse.** When an operand's support is known by tile (for example, from missing Zarr chunks or a mask operand), run Gustavson's algorithm over tiles instead of rows. Hash the present tiles of `B` by their tile coordinates along `S`. For each present tile of `A`, call a dense GEMM against each matching tile of `B`. A tile has one of three states: absent (skipped), fully present (a dense kernel), or partly present (a masked kernel, which applies the mask within the tile). For a causal mask, the tiles above the diagonal are absent, those below are fully present, and only the diagonal tiles need masking, which is how FlashAttention tiles causal attention (Dao et al., 2022). Skipped tiles still contribute their partial aggregate, as the fill-value rules in section 8.1 require.
+- **Block-sparse.** When an operand's support is known by tile (for example, from missing Zarr chunks or a mask), run Gustavson's algorithm over tiles instead of rows. Hash the present tiles of `B` by their tile coordinates along `S`. For each present tile of `A`, call a dense GEMM against each matching tile of `B`. A tile has one of three states: absent (skipped), fully present (a dense kernel), or partly present (a masked kernel, which applies the mask within the tile). For a causal mask, the tiles above the diagonal are absent, those below are fully present, and only the diagonal tiles need masking, which is how FlashAttention tiles causal attention (Dao et al., 2022). Skipped tiles still contribute their partial aggregate, as the fill-value rules in section 8.1 require.
 - **Choosing.** Dense when both sides are dense with Exact extents. Block-sparse when support is known by tile. Otherwise hash. Spike S11 ([`spikes/s11-thresholds`](spikes/s11-thresholds/README.md)) measured the thresholds on CPU, for matrix products at uniform density:
   - dense GEMM overtakes Gustavson's algorithm at about **20% density**, at every size tested;
   - Gustavson's array-indexed algorithm is 2.5–17× faster than a hash join followed by a hash aggregate, so the hash-map variant is only a fallback for free dimensions without a known extent;
@@ -648,7 +654,7 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 
 **In the relational form.** The relational form cannot express EinFold. But on hosts whose profile says they fuse join and aggregate (such as `gpudb`, for some query shapes), the plain pairwise SQL already avoids materializing join rows.
 
-**Generality.** Gustavson also uses the algorithm for a "pseudo-multiplication": assembling the large sparse matrix of a finite-element simulation from small per-element matrices, where the "product" looks up an entry of an element matrix. Any operation with the same structure works. That supports carrying a semiring in the EinsumIR (section 14).
+**Generality.** Gustavson also uses the algorithm for a "pseudo-multiplication": assembling the large sparse matrix of a finite-element simulation from small per-element matrices, where the "product" looks up an entry of an element matrix. Any operation with the same structure works. That supports carrying a semiring in the fold IR (section 14).
 
 **Prior work.** Gustavson (1978): row-wise sparse multiply, the multiple-switch technique, the symbolic–numeric split, and sparse transpose as a distribution counting sort. Groupjoin. Sparse tensor compilers such as TACO (the Tensor Algebra Compiler), which generate code for sparse tensor expressions.
 
@@ -667,18 +673,18 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
   - switch from dense to sparse when it falls below a threshold. They found 5% empirically. Spike S11 puts einfold's crossover near 20% against Gustavson's algorithm, and near 5–10% against a hash join and aggregate, which matches theirs;
   - measure only before expensive contractions, and stop measuring once density exceeds 95%.
 - **Beyond the paper.** Staudt et al. only switch from dense to sparse. EinFold has both algorithms, so einfold can switch both ways, and can use the block-sparse algorithm for nodes that mix dense and sparse operands. Their other stated limitation is a fixed contraction order. With Measured facts and Bounds, the planner can re-plan the rest of the tree while it runs.
-- **Scope.** Inside an `EinsumExec` (or a host's `Einsum` relation) that runs a whole contraction tree. The relational form is unaffected, since hosts already run it as a sparse form.
+- **Scope.** Inside an `EinFoldExec` (or a host's `Fold` relation) that runs a whole contraction tree. The relational form is unaffected, since hosts already run it as a sparse form.
 - **Determinism.** Switching decisions depend only on the data, so the same data gives the same decisions and the same bits.
 
 ### 10.5 Reduction at the source
 
 - **Idea.** When a dimension is summed within a single operand, the reader can compute each storage tile's partial aggregate with a dense kernel on the decoded chunk, before the chunk is flattened into rows. The engine then only combines partial aggregates. This follows directly from principle 6.
 - **Mechanism.** Engines already split aggregation into a partial phase per partition and a final merge. Spike S12 ([`spikes/s12-aggregate-pushdown`](spikes/s12-aggregate-pushdown/README.md)) worked out the route on each host:
-  - *DataFusion.* `AggregateExec` runs in `Partial` and then `FinalPartitioned` mode, with a hash repartition between them. `TableProvider` has no aggregate hook, so the reader installs a physical optimizer rule that replaces only the `Partial` aggregate and its scan with a scan that emits partial aggregates, one per chunk. DataFusion's repartition and final phase stay, with their parallelism and spilling. The scan emits DataFusion's partial-state schema, which each aggregate function defines through its `state_fields`. For example, `SUM(double)` is one nullable `[sum]`, whose NULL is exactly the `matched` flag of section 8.3, and `AVG` is `[count, sum]`.
+  - *DataFusion.* `AggregateExec` runs in `Partial` and then `FinalPartitioned` mode, with a hash repartition between them. `TableProvider` has no aggregate hook, so the reader installs a physical optimizer rule that replaces only the `Partial` aggregate and its scan with a scan that emits partial aggregates, one per chunk. DataFusion's repartition and final phase stay, with their parallelism and spilling. The scan emits DataFusion's partial-state schema, which each aggregate function defines through its `state_fields`. For example, `SUM(double)` is one nullable `[sum]`, whose NULL coincides with "no non-NULL value yet" in section 8.3, and `AVG` is `[count, sum]`.
   - *DuckDB.* Its extension C API, which duckdb-zarr uses through Rust, offers projection pushdown only: no filters and no aggregates. So einfold's SQL-to-SQL mode rewrites the statement to call a reader-provided aggregating table function, such as a `read_zarr_reduce`, which returns plain partial columns that ordinary SQL then combines. This is the relational form of partial aggregates (section 8.3), and it works on any engine that can call a table function.
 - **Precedent.** zarr-datafusion's `ZarrAggregateExec` already computes `SUM`, `COUNT`, `MIN`, `MAX` and `AVG` itself when they sit directly over its scan. It replaces the whole aggregate, though, not only its partial phase. It folds rows rather than whole chunks. And it accumulates in `f64`, which loses exactness for integers beyond 2⁵³ and breaks the exactness invariant (section 8.6). einfold's version should replace the partial phase, reduce chunks with dense kernels, and accumulate integers exactly.
 - **Scope.** Contractions local to one operand, including those that variable separation (section 9.1) isolates. Also products of variables in the same Zarr group that share a chunk grid: an element-wise product plus a private sum is local to each chunk.
-- **Correctness.** Partial aggregates carry `matched` and `value` (section 8.3) and are combined in chunk order.
+- **Correctness.** Partial aggregates carry group existence and the aggregate's state (section 8.3), and are combined in chunk order.
 - **Why it matters.** For single-array reductions (time means, spatial averages, applying regridding weights), this attacks problem 3 at its source: the data is reduced before it is ever flattened.
 
 ### 10.6 Worst-case optimal joins (future)
@@ -699,7 +705,7 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 
 - Caching each training step's physical plan. Plans don't change between steps, so they need planning once. Once contractions are fast, the roughly 3 ms of planning per step would otherwise dominate. einfold's program-level cache (section 8.5) complements this by caching its own rewrite decisions across steps.
 - Forward-mode differentiation inside long chains of row-by-row operations. Forward mode carries derivatives alongside values instead of working backward, which keeps plans growing linearly, not quadratically, in the chain's length.
-- Emitting gradient contributions in a canonical, einsum-shaped form, so detection recognizes them cleanly. Later, ddx could emit the `Einsum` relation directly, as an option in its `ddx_ad::Options` settings.
+- Emitting gradient contributions in a canonical, einsum-shaped form, so detection recognizes them cleanly. Later, ddx could emit the `Fold` relation directly, as an option in its `ddx_ad::Options` settings.
 - Simplifying scalar derivative expressions, and choices specific to automatic differentiation such as saving versus recomputing a region (section 7.6).
 
 ## 13. Spikes and literature, in detail

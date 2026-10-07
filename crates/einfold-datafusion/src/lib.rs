@@ -9,6 +9,14 @@
 //! output's coordinates. This crate finds such queries in DataFusion's plans
 //! and runs them with a fused join-and-sum operator. It is the only einfold
 //! crate that depends on a query engine.
+//!
+//! More generally, it finds *folds over joins*: a join followed by `SUM`,
+//! `COUNT` or `AVG` of a product, grouped by some of the join's columns. The
+//! matrix product is the case of `SUM`. [`mod@detect`] finds them.
+
+pub mod detect;
+
+pub use detect::{detect, FoldMatch, OperandInput};
 
 pub mod exec;
 pub mod kernel;

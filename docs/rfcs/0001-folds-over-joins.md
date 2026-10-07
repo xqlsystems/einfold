@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # RFC 0001: Folds over joins, not just einsums
 
-- **Status:** Accepted in direction by @alxmrs ("take the general shape now"); the ontology review below is proposed
+- **Status:** Accepted (@alxmrs, 2026-10-07)
 - **Author:** 🧭 Claude (orchestrator), from @alxmrs's review of #6 and #7
 - **Design sections affected:** most of them. The vocabulary (§6), output forms (§7.2), partial aggregates (§8.3), detection (§9.1), and EinFold (§10.2) change most; see "Refactoring the docs".
 
@@ -185,7 +185,7 @@ M1 keeps its scope (fast two-operand queries in DataFusion) and takes the genera
 ## Resolved questions
 
 1. *Should M1 take the general shape now?* Yes (@alxmrs).
-2. *What should the Substrait relation be called?* Proposed: **`Fold`**, since it carries any fold, not just einsums.
-3. *Are order-sensitive aggregates in scope?* Proposed: not for now. `STRING_AGG` and `ARRAY_AGG` with `ORDER BY` are folds, but not commutative ones, so partial states can't be merged in any order. Revisit if a demo needs them.
+2. *What should the Substrait relation be called?* **`Fold`**, since it carries any fold, not just einsums.
+3. *Are order-sensitive aggregates in scope?* Not for now. `STRING_AGG` and `ARRAY_AGG` with `ORDER BY` are folds, but not commutative ones, so partial states can't be merged in any order. Revisit if a demo needs them.
 
-**Open for review:** the names in "Renames", especially `Fold`, `FoldMatch` and the new title, and the five structural findings.
+**Accepted with these notes:** the project keeps its name, *einfold*; only the design doc's subtitle changes.

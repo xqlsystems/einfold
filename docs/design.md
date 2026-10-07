@@ -73,9 +73,11 @@ Contracted axes become join keys; output axes become group keys. Blacher et al. 
 
 **Folds over joins.** Replace `SUM` with any aggregate, and the product with any expression of the joined row, and the query is still slow for the same reason: the join's rows are materialized before they are aggregated. einfold calls this general shape a **fold over a join**, and recognizes three levels of structure in it ([RFC 0001](rfcs/0001-folds-over-joins.md)):
 
-1. **A fold.** The aggregate's partial results can be merged, associatively and commutatively: `SUM`, `COUNT`, `MIN`, `MAX`, `AVG`, `BOOL_OR`. Every fold can be computed by fusing the join with the aggregate, so join rows never exist (section 10.2).
+1. **A fold.** The aggregate's partial results can be merged, associatively and commutatively: `SUM`, `COUNT`, `MIN`, `MAX`, `AVG`, `BOOL_OR`. In algebra, the partial state is a *commutative monoid*. Every fold can be computed by fusing the join with the aggregate, so join rows never exist (section 10.2).
 2. **A semiring fold.** The row value is a product, under some ⊗, of one factor per input, and the aggregate is a ⊕ that ⊗ distributes over: `a ⊗ (b ⊕ c) = (a ⊗ b) ⊕ (a ⊗ c)`. Einsums (`SUM` of `*`) are the main example. `COUNT` of a join, `MIN` of sums (shortest paths) and `MAX` of products are others. Distributivity is what makes it correct to aggregate an input before joining it, and to reorder the joins: the algebraic rewrites of sections 9 and 10.1.
-3. **A decomposable fold.** `AVG(a.v * b.v)` is `SUM(a.v * b.v) / COUNT(a.v * b.v)`, two semiring folds over one join, so it gets everything level 2 gets.
+3. **An algebraic fold.** `AVG(a.v * b.v)` is `SUM(a.v * b.v) / COUNT(a.v * b.v)`, two semiring folds over one join followed by a final division, so it gets everything level 2 gets.
+
+The levels follow the classes of aggregates in Gray et al.'s data-cube paper ("Data Cube: A Relational Aggregation Operator", 1997), which sorts aggregates by the state a partial result must carry. A *distributive* aggregate (`SUM`, `COUNT`, `MIN`, `MAX`, `BOOL_AND`) folds each value, perhaps lifted first (`COUNT` lifts it to 1), with one operation. An *algebraic* aggregate (`AVG`, and in principle variance, covariance and regression) is a fixed tuple of distributive ones plus a final function. Three classes are not folds einfold handles yet: *holistic* aggregates (`MEDIAN`, `COUNT(DISTINCT)`), whose state grows with the input; *approximate* ones (`approx_distinct`), whose state is a mergeable sketch; and *order-dependent* ones (`STRING_AGG`, `FIRST_VALUE`), which are out of scope.
 
 This doc teaches with einsums, the most familiar case, and says where the general fold differs.
 
@@ -160,7 +162,7 @@ einfold sits where three vocabularies meet: XQL and Xarray, einsum notation, and
 | **Fold** (over a join) | A join of operands, grouped by output dimensions, with an aggregate folding each group's row values (section 2.2) |
 | **Operand** | One input to a fold: a table, a subquery, or a mask. Often one data variable over its own axes |
 | **Dimension** | One variable of a fold: a set of columns the query equates, with how it compares them (`=` or `IS NOT DISTINCT FROM`). A data axis becomes a dimension when a query joins or groups on it. This doc says "dimension" where einsum literature says "index" |
-| **Aggregate** | How a group's values combine (`SUM`, `COUNT`, `AVG`, …), with SQL's rules for NULLs, empty groups and exactness |
+| **Aggregate** | How a group's values combine (`SUM`, `COUNT`, `AVG`, …), with SQL's rules for NULLs, empty groups and exactness. *Distributive* (one operation) or *algebraic* (distributive parts plus a final function), as section 2.2 explains |
 | **Row value**, **factor** | What each joined row contributes. When it is a product, each operand contributes one **factor**: an expression over that operand's columns alone |
 | **Semiring fold** | A fold whose row value is a ⊗-product of factors, and whose aggregate is a ⊕ that ⊗ distributes over. A property derived from the fold, which unlocks the algebraic rewrites |
 | **Einsum** | The sum-product semiring fold: `SUM` of products |
@@ -328,7 +330,7 @@ A **tile** is a rectangular box of positions. A Zarr chunk, a scan partition, a 
 A **partial aggregate** is the state of one output group, computed over part of the input and combined later. Eager aggregation, EinFold, slicing, parallel partitions and reduction at the source all produce them, so their SQL semantics are defined once. The state has two independent parts:
 
 - **group existence:** did any joined row reach the group? SQL creates a group exactly when one does, whatever the row's value, so this is the same for every aggregate;
-- **the aggregate's state:** a sum; a count; a sum and a count for `AVG`; a minimum.
+- **the aggregate's state:** one partial result per distributive part of the aggregate: a sum for `SUM`, a minimum for `MIN`, a sum and a count for `AVG`. Each part is a commutative monoid, and so is their product, so states merge in any grouping and order.
 
 A row marks its group as reached before its value is tested for NULL. So a group reached only by NULL values exists, with `SUM` and `AVG` NULL and `COUNT` 0, rather than vanishing. Keeping existence apart from the aggregate's state gives every aggregate this rule for free. *How* a state's additions are computed numerically is a third, separate choice: the **accumulator** (section 8.6).
 
@@ -368,7 +370,7 @@ flowchart LR
 
 ### 9.1 Detect and normalize
 
-Detection finds an aggregate (`SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, and logical folds) over a tree of joins, filters and projections, anywhere in a plan, and sums of such aggregates over `UNION ALL`. It turns each into a fold, and classifies it at the strongest level it can prove: a semiring fold, a decomposable fold such as `AVG`, or a fold that only allows fusing the join with the aggregate:
+Detection finds an aggregate (`SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, and logical folds) over a tree of joins, filters and projections, anywhere in a plan, and sums of such aggregates over `UNION ALL`. It turns each into a fold, and classifies it at the strongest level it can prove: a semiring fold, an algebraic fold such as `AVG`, or a fold that only allows fusing the join with the aggregate:
 
 - **It looks through projections** to find the product.
 - **It separates variables.** A dataset table repeats each variable across the dimensions it lacks. Detection splits each variable into its own operand, so a latitude weight becomes an operand over latitude only, and its repetition disappears.
@@ -423,7 +425,7 @@ Each node of the contraction tree becomes either a relational join-aggregate or 
 
 ### 10.1 The relational form: eager aggregation
 
-For a semiring fold, aggregate away a dimension as soon as no later step needs it. Over a whole contraction tree, each node becomes one CTE that joins its two inputs and groups by its kept dimensions. This is exact under SQL semantics, NULLs included, because ⊗ distributes over ⊕: for einsums, multiplication over addition (supplement section 10.1). It helps whenever a node aggregates a dimension away, as in chains of three or more operands, multi-way gradient contractions, and marginals. It does nothing for a plain matrix product, which needs EinFold. A decomposable fold is rewritten through its parts: `AVG(a·b)` becomes a `SUM` and a `COUNT` over the same tree (Yan and Larson's "eager count"), divided at the end. Folds that are neither keep their joins below a single aggregate.
+For a semiring fold, aggregate away a dimension as soon as no later step needs it. Over a whole contraction tree, each node becomes one CTE that joins its two inputs and groups by its kept dimensions. This is exact under SQL semantics, NULLs included, because ⊗ distributes over ⊕: for einsums, multiplication over addition (supplement section 10.1). It helps whenever a node aggregates a dimension away, as in chains of three or more operands, multi-way gradient contractions, and marginals. It does nothing for a plain matrix product, which needs EinFold. An algebraic fold is rewritten through its parts: `AVG(a·b)` becomes a `SUM` and a `COUNT` over the same tree (Yan and Larson's "eager count"), divided at the end. Folds that are neither keep their joins below a single aggregate.
 
 ### 10.2 The extension form: EinFold
 

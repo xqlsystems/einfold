@@ -20,7 +20,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, Rows, SortField};
 use datafusion::error::{DataFusionError, Result};
 use einfold_ir::{
-    Aggregate, AggregateValue, Dim, Fold, KeyEquality, Operand, PartialAggregate, RowValue,
+    Aggregate, Dim, Fold, KeyEquality, Op, Operand, PartialAggregate, RowValue, Value,
 };
 
 /// One operand's rows: one array per entry of the operand's dims, in order,
@@ -37,9 +37,11 @@ pub struct OperandArrays {
 /// nullable Float64; `COUNT` gives a non-null Int64, since SQL's `COUNT` is 0
 /// rather than NULL for a group of only NULL values.
 pub fn aggregate_field(aggregate: Aggregate) -> Field {
-    match aggregate {
-        Aggregate::Count => Field::new(aggregate.sql_name().to_lowercase(), DataType::Int64, false),
-        _ => Field::new(aggregate.sql_name().to_lowercase(), DataType::Float64, true),
+    let name = aggregate.to_string().to_lowercase();
+    if aggregate == Aggregate::COUNT {
+        Field::new(name, DataType::Int64, false)
+    } else {
+        Field::new(name, DataType::Float64, true)
     }
 }
 
@@ -120,7 +122,7 @@ fn live_rows(
 /// row order. Floating-point addition is not associative, so a fixed order of
 /// additions is what makes the bits repeatable.
 pub fn fold_join(fold: &Fold, a: &OperandArrays, b: &OperandArrays) -> Result<RecordBatch> {
-    if fold.row_value() != RowValue::Product {
+    if fold.row_value() != RowValue::Product(Op::Mul) {
         return plan_err("the hash kernel folds products of the two operands' values".into());
     }
     let [opa, opb] = fold.operands() else {
@@ -228,7 +230,7 @@ pub fn fold_join(fold: &Fold, a: &OperandArrays, b: &OperandArrays) -> Result<Re
                 reps.push((ra as u64, rb as u64));
             }
             let vb = b.value.is_valid(rb).then(|| b.value.value(rb));
-            states[g].update(va.zip(vb).map(|(x, y)| x * y));
+            states[g].update(va.zip(vb).map(|(x, y)| Value::Float(x * y)));
         }
     }
 
@@ -248,15 +250,17 @@ pub fn fold_join(fold: &Fold, a: &OperandArrays, b: &OperandArrays) -> Result<Re
     let values = states
         .iter()
         .map(|s| s.finish().expect("a group exists only if reached"));
-    columns.push(match aggregate {
-        Aggregate::Count => Arc::new(Int64Array::from_iter_values(values.map(|v| match v {
-            AggregateValue::Int(c) => c,
-            AggregateValue::Float(_) => unreachable!("COUNT finishes as an integer"),
-        }))),
-        _ => Arc::new(Float64Array::from_iter(values.map(|v| match v {
-            AggregateValue::Float(f) => f,
-            AggregateValue::Int(_) => unreachable!("SUM and AVG finish as floats"),
-        }))),
+    columns.push(if aggregate == Aggregate::COUNT {
+        Arc::new(Int64Array::from_iter_values(values.map(|v| match v {
+            Some(Value::Int(c)) => c,
+            _ => unreachable!("COUNT finishes as a non-NULL integer"),
+        })))
+    } else {
+        Arc::new(Float64Array::from_iter(values.map(|v| match v {
+            None => None,
+            Some(Value::Float(f)) => Some(f),
+            Some(_) => unreachable!("SUM and AVG of floats finish as floats"),
+        })))
     });
     fields.push(aggregate_field(aggregate));
     Ok(RecordBatch::try_new(
@@ -350,7 +354,12 @@ mod tests {
             .collect()
     }
 
-    type Value = AggregateValue;
+    /// A finished value as the tests compare it.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Value {
+        Float(Option<f64>),
+        Int(i64),
+    }
     type Out = Vec<(Cells, Value)>;
 
     /// The aggregate of one group's products, in SQL terms and independent of
@@ -359,9 +368,9 @@ mod tests {
         let present: Vec<f64> = products.iter().flatten().copied().collect();
         let sum = present.iter().copied().reduce(|x, y| x + y);
         match agg {
-            Aggregate::Sum => Value::Float(sum),
-            Aggregate::Count => Value::Int(present.len() as i64),
-            Aggregate::Avg => Value::Float(sum.map(|s| s / present.len() as f64)),
+            Aggregate::SUM => Value::Float(sum),
+            Aggregate::COUNT => Value::Int(present.len() as i64),
+            Aggregate::AVG => Value::Float(sum.map(|s| s / present.len() as f64)),
             _ => unreachable!(),
         }
     }
@@ -452,7 +461,7 @@ mod tests {
             e.operands().to_vec(),
             e.output().to_vec(),
             equality,
-            RowValue::Product,
+            RowValue::Product(Op::Mul),
             aggregate,
         )
         .unwrap()
@@ -470,7 +479,7 @@ mod tests {
     /// output as plain floats, for tests that also assert values.
     fn check(e: &Fold, a: Side, b: Side) -> Vec<(Cells, Option<f64>)> {
         let mut sum = vec![];
-        for agg in [Aggregate::Sum, Aggregate::Count, Aggregate::Avg] {
+        for agg in [Aggregate::SUM, Aggregate::COUNT, Aggregate::AVG] {
             let f = with_aggregate(e, agg);
             let batch = run(&f, a, b);
             let last = batch.num_columns() - 1;
@@ -482,7 +491,7 @@ mod tests {
                 assert_eq!(g.0, w.0, "{agg}");
                 assert!(same(&g.1, &w.1), "{agg}: {got:?} vs {want:?}");
             }
-            if agg == Aggregate::Sum {
+            if agg == Aggregate::SUM {
                 sum = got
                     .into_iter()
                     .map(|(k, v)| match v {
@@ -693,18 +702,18 @@ mod tests {
         check(&e, a, b);
         let key = |i| vec![Some(Cell::I(i))];
         assert_eq!(
-            want(&e, Aggregate::Count, a, b),
+            want(&e, Aggregate::COUNT, a, b),
             vec![(key(1), Value::Int(2)), (key(2), Value::Int(0))]
         );
         assert_eq!(
-            want(&e, Aggregate::Avg, a, b),
+            want(&e, Aggregate::AVG, a, b),
             vec![
                 (key(1), Value::Float(Some(6.0))),
                 (key(2), Value::Float(None))
             ]
         );
         // COUNT is a non-null Int64 even for the group of only NULLs.
-        let out = run(&with_aggregate(&e, Aggregate::Count), a, b);
+        let out = run(&with_aggregate(&e, Aggregate::COUNT), a, b);
         let counts = out.column(1).as_primitive::<Int64Type>();
         assert_eq!(counts.values().to_vec(), vec![2, 0]);
         assert_eq!(counts.null_count(), 0);
@@ -719,7 +728,7 @@ mod tests {
             e.output().to_vec(),
             [(Dim::new("k"), KeyEquality::Equal)].into(),
             RowValue::Expr,
-            Aggregate::Sum,
+            Aggregate::SUM,
         )
         .unwrap();
         let x = OperandArrays {

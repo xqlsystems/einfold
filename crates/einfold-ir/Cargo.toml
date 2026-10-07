@@ -4,7 +4,7 @@
 
 [package]
 name = "einfold-ir"
-description = "einfold's engine-independent representations: EinsumIR, facts, and partial aggregates"
+description = "einfold's engine-independent representations: folds over joins, aggregates, partial aggregates, and facts"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

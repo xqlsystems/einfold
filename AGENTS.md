@@ -16,7 +16,7 @@ The design matters for planning, but code must not depend on it: comments and do
 
 ## From issue to merge
 
-1. **Issue.** Work starts as an issue that sets **goals, constraints and motivation**, not a specification:
+1. **Issue.** Work starts as an issue that sets **goals, constraints and motivation**, not a specification, and says whether the work is a foundation or a leaf (see [Sequencing work](#sequencing-work)):
    - *motivation:* why the work matters, and which design sections it serves;
    - *goals:* what should be true when it's done, stated as outcomes, not as APIs or algorithms;
    - *constraints:* what must hold, such as SQL semantics, determinism, compatibility with code already merged, and the size budget;
@@ -31,6 +31,43 @@ The design matters for planning, but code must not depend on it: comments and do
 4. **Design review by the implementer.** Before marking a pull request ready, its author checks it against the design sections it implements, and says in the description how it adheres, or which RFC proposes the difference. Any agent or person may also review for the design; nobody is a required gate for it.
 5. **Ready for review.** Mark the pull request ready once CI is green and the design review is done.
 6. **Approval and merge** by a maintainer or code owner ([`.github/CODEOWNERS`](.github/CODEOWNERS)).
+
+## Sequencing work
+
+Concrete code review is where a design's specifics get settled, and it can't all happen in advance. Rebuilding work that was built on code whose design then changed is the most expensive thing we do. These rules keep review early and rework small. They're an experiment; change them as we learn.
+
+### Foundations and leaves
+
+Every pull request is one of two kinds, which its issue states:
+
+- A **foundation** defines something other work depends on: shared types, a trait, an operator's contract, a public API.
+- A **leaf** depends on foundations, but nothing depends on it: an implementation behind an agreed interface, tests, benchmarks, docs, a spike.
+
+### The review frontier
+
+Work may build at most **one layer past code a maintainer has reviewed**. Nothing may stack on a foundation until a maintainer has reviewed it and agreed its shape. The foundation doesn't need to be merged, but it does need that agreement. Leaves may proceed in parallel freely.
+
+The depth of unreviewed work is what causes rework, more than the number of open pull requests. As a secondary guard on review load, aim for **at most five pull requests awaiting maintainer review** at once.
+
+### Interfaces first
+
+The first pull request for a new component is its **interface**: public types, signatures and doc comments, with stub bodies (`todo!()` is fine there). It is small, and quick to review and to change. Implementation pull requests follow, once the interface is agreed.
+
+### A tracer bullet before breadth
+
+For each milestone, first build one **thin end-to-end path**: the smallest case that exercises every layer, such as one aggregate over two tables, from detection through execution. A maintainer reviews that whole slice, because design problems show up where the pieces meet. Only then widen it, in parallel.
+
+### While waiting for review
+
+Agents don't build on unreviewed foundations while they wait. First, ask whether any work is worth doing *now*. Waiting is often the better choice: more of the design will be settled later, so the same work done then costs less and is less likely to be redone. Agent time is limited and should be spent deliberately. **Doing nothing is a perfectly fine choice.**
+
+When work is worth doing now, choose things that don't depend on unreviewed foundations:
+
+- test generators and oracles;
+- benchmarks against the unmodified engine;
+- spikes;
+- docs;
+- reviewing each other's pull requests against the design, and for composability within the XQL ecosystem einfold belongs to (readers such as xarray-sql and duckdb-zarr, ddx, and the hosts), so that pieces fit together without one project bending to another.
 
 ## Size
 

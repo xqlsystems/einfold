@@ -2,67 +2,77 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Detect einsums in DataFusion logical plans.
+//! Find folds over joins in DataFusion logical plans.
 //!
-//! An einsum, in SQL, is
+//! A *fold over a join* is a join followed by an aggregate, grouped by some of
+//! the join's columns:
 //!
 //! ```sql
-//! SELECT i, j, SUM(a.v * b.v) FROM a JOIN b ON a.k = b.k GROUP BY i, j
+//! SELECT a.i, b.j, SUM(a.v * b.v) FROM a JOIN b ON a.k = b.k GROUP BY a.i, b.j
 //! ```
 //!
-//! a join of *operands* on equal key columns, summing a product of one factor
-//! per operand, grouped by some of the keys. [`detect`] reads one `Aggregate`
-//! node in that shape: `SUM(e)` over a tree of inner equi-joins, filters,
-//! projections and subquery aliases. Every node below that tree is a *leaf*: a
-//! subplan detection doesn't look inside (a table scan, a subquery with its own
-//! `GROUP BY`, ...). Each leaf becomes one operand. Detection only describes
-//! the einsum; replacing the node is the optimizer rule's job.
+//! [`detect`] reads one `Aggregate` node in that shape: `SUM`, `COUNT` or
+//! `AVG` over a tree of inner equi-joins, filters, projections and subquery
+//! aliases. Every node below that tree is a *leaf*: a subplan detection
+//! doesn't look inside (a table scan, a subquery with its own `GROUP BY`, ...).
+//! Each leaf becomes one *operand* of the fold. The aggregated expression must
+//! be a product of *factors*, each reading the columns of one operand only;
+//! the example above, a matrix product, is the most important case and is
+//! called an *einsum*. Detection only describes the fold; replacing the node
+//! is an optimizer rule's job.
 //!
-//! Detection declines (returns `None`) whenever it cannot prove that the einsum
+//! Detection declines (returns `None`) whenever it cannot prove that the fold
 //! means exactly what the plan means. In particular it preserves:
 //!
 //! - **which groups exist:** a group appears only if at least one joined row
-//!   reached it;
-//! - **which sums are NULL:** `SUM` skips NULL products, and is NULL only if
-//!   every product in the group was;
+//!   reached it, whatever the aggregate;
+//! - **NULLs:** every aggregate skips NULL inputs. A group whose inputs were
+//!   all NULL has a NULL `SUM` and `AVG`, and a `COUNT` of 0;
 //! - **how NULL keys join:** `=` never matches NULL, `IS NOT DISTINCT FROM`
 //!   matches NULL to NULL;
-//! - **duplicates:** every joined row counts, even if its key tuple repeats.
+//! - **duplicates:** every joined row counts, even if its key tuple repeats;
+//! - **errors:** nothing that could fail is moved to run on rows the plan never
+//!   evaluated it on.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, DFSchema, DFSchemaRef, NullEquality};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, NullEquality, ScalarValue};
+use datafusion::functions_aggregate::average::Avg;
+use datafusion::functions_aggregate::count::Count;
 use datafusion::functions_aggregate::sum::Sum;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
 use datafusion::logical_expr::{
-    BinaryExpr, Expr, ExprSchemable, Filter, JoinType, LogicalPlan, Operator,
+    when, BinaryExpr, Expr, ExprSchemable, Filter, JoinType, LogicalPlan, Operator,
 };
-use einfold_ir::{Dim, Einsum, KeyEquality, Operand, Semiring};
+use einfold_ir::{Aggregate, Dim, Fold, KeyEquality, Operand, RowValue};
 
-/// An `Aggregate` node read as an einsum, with what is needed to rebuild it.
+/// A fold found in a plan: the [`Fold`], bound to the plan's inputs and to the
+/// `Aggregate` node's output, so that a rule can replace the node.
 #[derive(Clone, Debug)]
-pub struct Detected {
-    /// The einsum. Each dimension is a *dimension class*: a set of columns that
-    /// the joins and filters force to be equal, such as `{a.k, b.k}` for
-    /// `a.k = b.k`. It is named after its first column. Operands are the
-    /// leaves in plan order.
-    pub einsum: Einsum,
-    /// One binding per operand, in the order of `einsum.operands()`.
+pub struct FoldMatch {
+    /// The fold. Each dimension is a set of columns that the joins and filters
+    /// force to be equal, such as `{a.k, b.k}` for `a.k = b.k`, named after its
+    /// first column. Operands are the leaves, in plan order. Its row value is
+    /// always a product of the operands' factors, so whether it is a semiring
+    /// fold follows from the aggregate ([`Fold::semiring`]): `SUM` and `COUNT`
+    /// are, `AVG` is `SUM / COUNT` of two that are.
+    pub fold: Fold,
+    /// One binding per operand, in the order of `fold.operands()`.
     pub operands: Vec<OperandInput>,
     /// One entry per group expression of the `Aggregate`, in its order: the
     /// `Aggregate`'s output column and the dimension it holds. Two group keys
-    /// in one dimension class hold the same dimension.
+    /// whose columns are equated hold the same dimension.
     pub group_outputs: Vec<(Column, Dim)>,
-    /// The `Aggregate`'s output column holding the `SUM`.
-    pub sum_output: Column,
+    /// The `Aggregate`'s output column holding the aggregate's value.
+    pub value_output: Column,
     /// The `Aggregate`'s output schema, which a rewrite must reproduce.
     pub schema: DFSchemaRef,
 }
 
-/// How one einsum operand reads its leaf of the plan.
+/// How one operand reads its leaf of the plan.
 #[derive(Clone, Debug)]
 pub struct OperandInput {
     /// The leaf subtree, with every filter that reads only its columns applied
@@ -71,34 +81,38 @@ pub struct OperandInput {
     pub plan: Arc<LogicalPlan>,
     /// The leaf's column for each entry of the operand's `dims`, in order.
     pub dim_columns: Vec<Column>,
-    /// The operand's factor, over `plan`'s columns only: a `Float64` that
-    /// multiplies into every product the operand's rows take part in. `1.0`
-    /// for an operand that only joins.
+    /// The operand's factor, a `Float64` expression over `plan`'s columns
+    /// only. Each joined row's value is the product of its operands' factors,
+    /// NULL if any factor is. An operand that only joins has factor `1.0`.
+    ///
+    /// For `COUNT`, only whether a value is NULL matters, so each factor is
+    /// `1.0` where the original factor is non-NULL and NULL where it is NULL.
+    /// This also lets `COUNT` count values of any type.
     pub value: Expr,
 }
 
-/// Try to read the `Aggregate` node `plan` as an einsum.
+/// Try to read the `Aggregate` node `plan` as a fold over a join.
 ///
-/// Matches `SUM(e)` over `Float64`, with plain-column group keys, over inner
-/// equi-joins, filters, projections and aliases down to opaque leaves. `e` must
-/// be a product whose factors each read one leaf. Returns `None` whenever the
-/// node is not provably an einsum, so the plan stays unchanged.
-pub fn detect(plan: &LogicalPlan) -> Option<Detected> {
+/// Matches `SUM(e)` and `AVG(e)` over `Float64`, and `COUNT(e)` or `COUNT(*)`
+/// over any type, with plain-column group keys, over inner equi-joins,
+/// filters, projections and aliases down to opaque leaves. `e` must be a
+/// product whose factors each read one leaf. Returns `None` whenever the node
+/// is not provably such a fold, so the plan stays unchanged.
+pub fn detect(plan: &LogicalPlan) -> Option<FoldMatch> {
     let LogicalPlan::Aggregate(agg) = plan else {
         return None;
     };
-    // Without GROUP BY, SQL returns one row (with a NULL sum) even when no row
-    // joined, but an einsum has a row only where some joined row reached.
-    // Decline until the IR can express that.
+    // Without GROUP BY, SQL returns one row even when no row joined (with a
+    // NULL sum, or a count of 0), but a fold has a row only where some joined
+    // row reached. Decline until the IR can express that.
     if agg.group_expr.is_empty() || agg.aggr_expr.len() != 1 {
         return None;
     }
-    let Expr::AggregateFunction(sum) = strip_alias(&agg.aggr_expr[0]) else {
+    let Expr::AggregateFunction(func) = strip_alias(&agg.aggr_expr[0]) else {
         return None;
     };
-    let p = &sum.params;
-    if !sum.func.inner().is::<Sum>()
-        || p.distinct
+    let p = &func.params;
+    if p.distinct
         || p.filter.is_some()
         || !p.order_by.is_empty()
         || p.null_treatment.is_some()
@@ -106,23 +120,34 @@ pub fn detect(plan: &LogicalPlan) -> Option<Detected> {
     {
         return None;
     }
-    // Only float sums: an integer or DECIMAL sum is exact in SQL, and a rewrite
-    // that reorders or regroups its additions could overflow where the
-    // original did not.
-    if p.args[0].get_type(agg.input.schema()).ok()? != DataType::Float64 {
+    let udf = func.func.inner();
+    let aggregate = if udf.is::<Sum>() {
+        Aggregate::Sum
+    } else if udf.is::<Avg>() {
+        Aggregate::Avg
+    } else if udf.is::<Count>() {
+        Aggregate::Count
+    } else {
+        return None;
+    };
+    // `SUM` and `AVG` only over floats: over integers or DECIMAL they are exact
+    // in SQL, and a rewrite that reorders or regroups the additions could
+    // overflow where the original did not. `COUNT` is exact on any type.
+    let arg_type = p.args[0].get_type(agg.input.schema()).ok()?;
+    if aggregate != Aggregate::Count && arg_type != DataType::Float64 {
         return None;
     }
 
     let mut b = Builder::default();
     let cols = b.visit(&agg.input, None)?;
     let input_schema = agg.input.schema();
-    let sum_expr = inline(&p.args[0], input_schema, &cols)?;
+    let arg = inline(&p.args[0], input_schema, &cols)?;
     let mut group_slots = Vec::new();
     for g in &agg.group_expr {
         let Expr::Column(_) = g else { return None };
         group_slots.push(slot_of(&inline(g, input_schema, &cols)?)?);
     }
-    b.finish(sum_expr, group_slots, agg.schema.clone())
+    b.finish(arg, aggregate, group_slots, agg.schema.clone())
 }
 
 /// One opaque leaf: an operand.
@@ -228,19 +253,20 @@ impl Builder {
         DFSchema::from_unqualified_fields(fields, HashMap::new()).ok()
     }
 
-    /// Build the einsum from the walked tree, the aggregated expression and the
-    /// group keys' slots.
+    /// Build the fold from the walked tree, the aggregate and its argument, and
+    /// the group keys' slots.
     fn finish(
         mut self,
-        sum_expr: Expr,
+        arg: Expr,
+        aggregate: Aggregate,
         group_slots: Vec<usize>,
         schema: DFSchemaRef,
-    ) -> Option<Detected> {
+    ) -> Option<FoldMatch> {
         // Classify filter conjuncts. `x = y` and `x IS NOT DISTINCT FROM y`
         // between columns merge their dimension classes (two columns of one
         // leaf make a diagonal, like `m.i = m.j`). A predicate over one leaf
         // moves onto that leaf. Anything else, such as `a.t >= b.t`, relates
-        // operands in a way an einsum can't express yet, so decline.
+        // operands in a way a fold can't express yet, so decline.
         let mut leaf_preds: Vec<Vec<Expr>> = vec![Vec::new(); self.leaves.len()];
         for pred in std::mem::take(&mut self.predicates) {
             if let Some((l, r, kind)) = column_equality(&pred) {
@@ -277,7 +303,7 @@ impl Builder {
         }
         let dims = self.name_classes(&kinds);
 
-        let factors = self.factors(sum_expr)?;
+        let factors = self.factors(arg, aggregate)?;
 
         let mut operands = Vec::new();
         let mut inputs = Vec::new();
@@ -325,18 +351,18 @@ impl Builder {
             .iter()
             .map(|(root, k)| (dims[root].clone(), *k))
             .collect();
-        let einsum = Einsum::new(operands, output, equality, Semiring::SumProduct).ok()?;
+        let fold = Fold::new(operands, output, equality, RowValue::Product, aggregate).ok()?;
         let group_outputs = group_dims
             .into_iter()
             .enumerate()
             .map(|(i, d)| (Column::from(schema.qualified_field(i)), d))
             .collect();
-        let sum_output = Column::from(schema.qualified_field(group_slots.len()));
-        Some(Detected {
-            einsum,
+        let value_output = Column::from(schema.qualified_field(group_slots.len()));
+        Some(FoldMatch {
+            fold,
             operands: inputs,
             group_outputs,
-            sum_output,
+            value_output,
             schema,
         })
     }
@@ -370,18 +396,25 @@ impl Builder {
         names
     }
 
-    /// Split the aggregated expression into one factor per leaf. Returns `None`
-    /// unless it is a product of `Float64` factors that each read at most one
-    /// leaf: `SUM(a.v * f(b.x, b.y))` splits, but `SUM(a.v + b.v)` and
+    /// Split the aggregate's argument into one factor per leaf. Returns `None`
+    /// unless it is a product of factors that each read at most one leaf:
+    /// `SUM(a.v * f(b.x, b.y))` splits, but `SUM(a.v + b.v)` and
     /// `SUM(exp(a.v * b.v))` don't. Any expression over one leaf's columns,
     /// such as `1 - b.z * b.z`, is one factor, since it is constant within
     /// that leaf's row. Factors of one leaf are multiplied together, and
     /// constant factors go to the first operand. Reordering a float product
     /// this way can change its last bits, but not its mathematical value.
-    fn factors(&self, sum_expr: Expr) -> Option<Vec<Option<Expr>>> {
+    ///
+    /// For `SUM` and `AVG`, every multiplication and factor must be `Float64`,
+    /// so that splitting doesn't change how the product is computed. For
+    /// `COUNT`, a product is NULL exactly when one of its factors is (and
+    /// nothing else: NaN and overflow are not NULL), so any product splits,
+    /// and each factor becomes `1.0` or NULL.
+    fn factors(&self, arg: Expr, aggregate: Aggregate) -> Option<Vec<Option<Expr>>> {
         let schema = self.slot_schema()?;
+        let count = aggregate == Aggregate::Count;
         let mut flat = Vec::new();
-        flatten_product(sum_expr, &schema, &mut flat)?;
+        flatten_product(arg, &schema, count, &mut flat)?;
         let mut factors: Vec<Option<Expr>> = vec![None; self.leaves.len()];
         let mut push = |i: usize, f: Expr| {
             factors[i] = Some(match factors[i].take() {
@@ -391,9 +424,19 @@ impl Builder {
         };
         let mut constants = Vec::new();
         for f in flat {
-            if f.get_type(&schema).ok()? != DataType::Float64 {
+            let f = if count {
+                // CASE WHEN f IS NOT NULL THEN 1.0 END
+                when(
+                    f.is_not_null(),
+                    Expr::Literal(ScalarValue::Float64(Some(1.0)), None),
+                )
+                .end()
+                .ok()?
+            } else if f.get_type(&schema).ok()? == DataType::Float64 {
+                f
+            } else {
                 return None;
-            }
+            };
             match self.leaves_of(&f)?.as_slice() {
                 [] => constants.push(f),
                 [leaf] => push(*leaf, f),
@@ -431,18 +474,18 @@ impl Builder {
     }
 }
 
-/// Flatten nested `Float64` multiplications into their factors.
-fn flatten_product(e: Expr, schema: &DFSchema, out: &mut Vec<Expr>) -> Option<()> {
+/// Flatten nested multiplications into their factors: all of them if `any`,
+/// otherwise only those of two `Float64`s.
+fn flatten_product(e: Expr, schema: &DFSchema, any: bool, out: &mut Vec<Expr>) -> Option<()> {
+    let float = |e: &Expr| e.get_type(schema).ok() == Some(DataType::Float64);
     match e {
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::Multiply,
             right,
-        }) if left.get_type(schema).ok()? == DataType::Float64
-            && right.get_type(schema).ok()? == DataType::Float64 =>
-        {
-            flatten_product(*left, schema, out)?;
-            flatten_product(*right, schema, out)
+        }) if any || (float(&left) && float(&right)) => {
+            flatten_product(*left, schema, any, out)?;
+            flatten_product(*right, schema, any, out)
         }
         e => {
             out.push(e);

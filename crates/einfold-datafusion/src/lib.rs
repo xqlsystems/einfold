@@ -10,11 +10,13 @@
 //! and runs them with a fused join-and-sum operator. It is the only einfold
 //! crate that depends on a query engine.
 //!
-//! [`mod@detect`] finds them: it reads an aggregate over joins as an einsum.
+//! More generally, it finds *folds over joins*: a join followed by `SUM`,
+//! `COUNT` or `AVG` of a product, grouped by some of the join's columns. The
+//! matrix product is the case of `SUM`. [`mod@detect`] finds them.
 
 pub mod detect;
 
-pub use detect::{detect, Detected, OperandInput};
+pub use detect::{detect, FoldMatch, OperandInput};
 
 /// The DataFusion version this crate is built against. ddx must link the same.
 pub const DATAFUSION_VERSION: &str = datafusion::DATAFUSION_VERSION;

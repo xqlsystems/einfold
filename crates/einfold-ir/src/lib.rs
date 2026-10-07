@@ -21,6 +21,8 @@
 //! so every engine integration can share it:
 //!
 //! - [`fold`]: the query itself, as a [`Fold`] over [`Operand`]s;
+//! - [`algebra`]: the operations folds combine values with ([`Op`]), and the
+//!   laws relating them ([`Semiring`]);
 //! - [`aggregate`]: the [`Aggregate`]s a fold can compute, with their SQL
 //!   rules;
 //! - [`partial`]: [`PartialAggregate`], the state of one group computed in
@@ -28,11 +30,13 @@
 //! - [`facts`]: what einfold knows about its inputs, and how surely.
 
 pub mod aggregate;
+pub mod algebra;
 pub mod facts;
 pub mod fold;
 pub mod partial;
 
 pub use aggregate::Aggregate;
+pub use algebra::{Distributivity, Identity, Op, Semiring};
 pub use facts::{Fact, Precision};
-pub use fold::{Dim, Fold, FoldError, KeyEquality, Operand, RowValue, Semiring};
+pub use fold::{Dim, Fold, FoldError, KeyEquality, Operand, RowValue};
 pub use partial::{AggregateState, AggregateValue, PartialAggregate};

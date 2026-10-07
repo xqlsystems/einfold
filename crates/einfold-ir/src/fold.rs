@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::aggregate::Aggregate;
+use crate::algebra::{Op, Semiring};
 
 /// A dimension of a fold: a set of columns that the query equates.
 ///
@@ -68,31 +69,16 @@ pub enum KeyEquality {
     NotDistinctFrom,
 }
 
-/// A pair of operations, "add" (⊕) and "multiply" (⊗), where ⊗ distributes
-/// over ⊕: `a ⊗ (b ⊕ c) = (a ⊗ b) ⊕ (a ⊗ c)`.
-///
-/// A fold whose row value is a ⊗-product of one factor per operand, and whose
-/// aggregate is ⊕, has this structure. It is what makes it correct to
-/// aggregate one operand before joining it with the others (`Σ_j a·b_j =
-/// a·Σ_j b_j`), and to choose the order of joins freely. Only `SUM` of `*`
-/// exists today; others, such as `MIN` of `+` for shortest paths, may follow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum Semiring {
-    /// `SUM` of `*`: ordinary arithmetic, as in linear algebra. `COUNT` of a
-    /// product is also this semiring, over 0/1 indicators of non-NULL values.
-    SumProduct,
-}
-
 /// What each joined row contributes to its group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RowValue {
-    /// A product of one *factor* per operand, where each factor is an
-    /// expression over that operand's columns alone. An operand with no
-    /// factor of its own contributes 1. This is the structure that the
-    /// algebraic rewrites need.
-    Product,
+    /// One *factor* per operand, combined with an operation: `a.v * b.v`
+    /// combines with [`Op::Mul`], `a.cost + b.cost` with [`Op::Add`]. Each
+    /// factor is an expression over that operand's columns alone, and an
+    /// operand with no factor of its own contributes the operation's
+    /// identity. This is the structure that the algebraic rewrites need.
+    Product(Op),
     /// Any other expression over the joined row, such as `exp(a.v * b.v)`.
     /// Such a fold can still be computed without materializing the join, but
     /// admits no algebraic rewrites.
@@ -242,8 +228,8 @@ impl Fold {
             operands,
             output,
             equality,
-            RowValue::Product,
-            Aggregate::Sum,
+            RowValue::Product(Op::Mul),
+            Aggregate::SUM,
         )
     }
 
@@ -270,13 +256,17 @@ impl Fold {
     /// The semiring this fold computes in, if any.
     ///
     /// A fold is a semiring fold when its row value is a product of
-    /// per-operand factors and its aggregate is the semiring's "add". Only
-    /// then may an optimizer aggregate an operand before joining it, or
-    /// reorder the joins. `AVG` is not a semiring aggregate, but is exactly
-    /// `SUM / COUNT`, two semiring folds over the same join.
+    /// per-operand factors under some ⊗, and its aggregate folds with a ⊕
+    /// that ⊗ distributes over. Only then may an optimizer aggregate an
+    /// operand before joining it, or reorder the joins. `COUNT` of a product
+    /// is a sum of 1s, so it is a sum-product fold. `AVG` is not a semiring
+    /// aggregate itself, but is computed from two that are; see
+    /// [`Aggregate::parts`]. Some semirings hold only for non-negative values
+    /// ([`Semiring::requires_non_negative`]), which callers must prove first.
     pub fn semiring(&self) -> Option<Semiring> {
         match (self.row_value, self.aggregate) {
-            (RowValue::Product, Aggregate::Sum | Aggregate::Count) => Some(Semiring::SumProduct),
+            (RowValue::Product(mul), Aggregate::Fold(add)) => Semiring::new(add, mul),
+            (RowValue::Product(Op::Mul), Aggregate::Count) => Some(Semiring::SUM_PRODUCT),
             _ => None,
         }
     }
@@ -340,7 +330,8 @@ impl fmt::Display for Fold {
             .map(|o| format!("{}[{}]", o.name, join(&o.dims)))
             .collect();
         let value = match self.row_value {
-            RowValue::Product => ops.join(" · "),
+            RowValue::Product(Op::Mul) => ops.join(" · "),
+            RowValue::Product(op) => ops.join(&format!(" {op} ")),
             RowValue::Expr => format!("f({})", ops.join(", ")),
         };
         write!(
@@ -384,17 +375,34 @@ mod tests {
     #[test]
     fn semiring_is_derived_from_row_value_and_aggregate() {
         let make = |v, a| Fold::new(ab(), vec![d("i")], eq_all(&["i", "j", "k"]), v, a).unwrap();
-        let p = RowValue::Product;
+        let times = RowValue::Product(Op::Mul);
+        let plus = RowValue::Product(Op::Add);
         assert_eq!(
-            make(p, Aggregate::Sum).semiring(),
-            Some(Semiring::SumProduct)
+            make(times, Aggregate::SUM).semiring(),
+            Some(Semiring::SUM_PRODUCT)
         );
         assert_eq!(
-            make(p, Aggregate::Count).semiring(),
-            Some(Semiring::SumProduct)
+            make(times, Aggregate::Count).semiring(),
+            Some(Semiring::SUM_PRODUCT)
         );
-        assert_eq!(make(p, Aggregate::Avg).semiring(), None);
-        assert_eq!(make(RowValue::Expr, Aggregate::Sum).semiring(), None);
+        assert_eq!(
+            make(plus, Aggregate::MIN).semiring(),
+            Some(Semiring::MIN_PLUS)
+        );
+        assert_eq!(
+            make(plus, Aggregate::MAX).semiring(),
+            Some(Semiring::MAX_PLUS)
+        );
+        let max_times = make(times, Aggregate::MAX).semiring().unwrap();
+        assert!(max_times.requires_non_negative());
+        // `+` does not distribute over `+`: SUM(a + b) is a fold, not a semiring fold.
+        assert_eq!(make(plus, Aggregate::SUM).semiring(), None);
+        assert_eq!(make(times, Aggregate::Avg).semiring(), None);
+        assert_eq!(make(RowValue::Expr, Aggregate::SUM).semiring(), None);
+        assert_eq!(
+            make(plus, Aggregate::MIN).to_string(),
+            "MIN(A[i,k] + B[k,j]) -> [i]"
+        );
         assert_eq!(
             make(RowValue::Expr, Aggregate::Avg).to_string(),
             "AVG(f(A[i,k], B[k,j])) -> [i]"

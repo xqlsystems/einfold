@@ -1,0 +1,34 @@
+{
+ "env": {
+  "duckdb": "1.5.6",
+  "gpudb": "0.7.0",
+  "python": "3.13.15",
+  "build_info": "compiled=cpu,cuda runtime=cuda exact=true join=true global=true narrow=true device_memory=15637086208 store=true rebuilds=0/0 device='Tesla T4' avgf=64"
+ },
+ "s5": {
+  "matmul (join + GROUP BY + SUM)": {"native_ms": 13427.6, "gpudb_ms": 13350.8, "speedup": 1.01, "same_result": true, "rewritten": false, "reason": "threshold", "detail": "the join returns 512000000 rows from tables of at most 8000000"},
+  "matrix-vector (join onto unique key)": {"native_ms": 145.6, "gpudb_ms": 147.0, "speedup": 0.99, "same_result": true, "rewritten": false, "reason": "double", "detail": "a DOUBLE this path does not carry"},
+  "eager aggregation (pre-aggregated subquery)": {"native_ms": 142.4, "gpudb_ms": 148.3, "speedup": 0.96, "same_result": true, "rewritten": false, "reason": "shape", "detail": "not a shape the rewrite expresses: join leaf is SUBQUERY, not a base table"},
+  "contraction order as CTE": {"native_ms": 13269.9, "gpudb_ms": 13268.1, "speedup": 1.0, "same_result": true, "rewritten": false, "reason": "threshold", "detail": "the join returns 512000000 rows from tables of at most 8000000"},
+  "partial aggregate with matched count": {"native_ms": 160.5, "gpudb_ms": 160.3, "speedup": 1.0, "same_result": true, "rewritten": false, "reason": "double", "detail": "a DOUBLE this path does not carry"},
+  "mask operand (causal predicate)": {"native_ms": 7036.4, "gpudb_ms": 6449.8, "speedup": 1.09, "same_result": true, "rewritten": false, "reason": "threshold", "detail": "the join returns 512000000 rows from tables of at most 8000000"},
+  "reduction over k, DOUBLE": {"native_ms": 92.6, "gpudb_ms": 94.7, "speedup": 0.98, "same_result": true, "rewritten": false, "reason": "double", "detail": "a DOUBLE this path does not carry"},
+  "reduction over k, BIGINT": {"native_ms": 90.2, "gpudb_ms": 21.0, "speedup": 4.3, "same_result": true, "rewritten": true, "reason": "", "engine": "scalar", "form": "plain", "detail": "the resident GROUP BY"},
+  "reduction over k, DECIMAL": {"native_ms": 93.7, "gpudb_ms": 92.0, "speedup": 1.02, "same_result": true, "rewritten": false, "reason": "double", "detail": "a DOUBLE this path does not carry"},
+  "retiling partition key": {"native_ms": 237.1, "gpudb_ms": 244.5, "speedup": 0.97, "same_result": true, "rewritten": false, "reason": "double", "detail": "a DOUBLE this path does not carry"},
+  "global sum": {"native_ms": 25.5, "gpudb_ms": 25.5, "speedup": 1.0, "same_result": true, "rewritten": false, "reason": "double", "detail": "a DOUBLE this path does not carry: the GROUP BY under the expressions declined"},
+  "attention scores Q·Kᵀ": {"native_ms": 2189.3, "gpudb_ms": 2444.3, "speedup": 0.9, "same_result": true, "rewritten": false, "reason": "threshold", "detail": "the statement names no table at or above the 1000000-row floor"},
+  "window max (softmax)": {"native_ms": 6084.0, "gpudb_ms": 5686.8, "speedup": 1.07, "same_result": true, "rewritten": false, "reason": "shape", "detail": "not a shape the rewrite expresses: window function"}
+ },
+ "s5_determinism": {
+  "grouped DOUBLE sum / gpudb": {"distinct_results_in_10": 9, "rewritten": false},
+  "grouped DOUBLE sum / native DuckDB": {"distinct_results_in_10": 9},
+  "global DOUBLE sum / gpudb": {"distinct_results_in_10": 7, "rewritten": false},
+  "global DOUBLE sum / native DuckDB": {"distinct_results_in_10": 8},
+  "grouped DECIMAL sum / gpudb": {"distinct_results_in_10": 8, "rewritten": false},
+  "grouped DECIMAL sum / native DuckDB": {"distinct_results_in_10": 7},
+  "matmul DOUBLE / gpudb": {"distinct_results_in_10": 10, "rewritten": false},
+  "matmul DOUBLE / native DuckDB": {"distinct_results_in_10": 10}
+ },
+ "s8_gpu": "device: Tesla T4 (sm_75, 40 SMs)\n\n| Accumulator | ms (median of 20) | GB/s | vs atomic | Distinct results in 20 runs | Result |\n|---|---|---|---|---|---|\n| atomic (scheduler order) | 1.51 | 264 | 1.0x | 6 | -135594282815384.44 |\n| fixed tree | 1.52 | 263 | 1.0x | 1 | -135594282815384.52 |\n| binned, max from facts | 5.44 | 74 | 3.6x | 1 | -135594282815384.56 |\n| superaccumulator | 39.35 | 10 | 26.0x | 1 | -135594282815384.56 |\n"
+}

@@ -13,10 +13,10 @@ A spike is a short, time-boxed experiment that answers one design question (desi
 | [S1, S13, S14](s01-readers/README.md) | What readers pass to the plan | Done | No reader carries facts in Arrow metadata; readers disagree on NULL vs. NaN, lower-dimensional variables, statistics, pushdown and time types |
 | [S2, S3](s02-carrier/README.md) | Fact carriers; layout propagation | Done | Arrow metadata is lost in DuckDB and Substrait, and kept too eagerly in DataFusion, so facts use a side channel. Layout rules hold for coordinates; row order is host-specific |
 | [S4](s04-coords/README.md) | Coordinate maps in ERA5 and CMIP6 | Done | Affine must be bitwise; calendar maps for monthly times; sorted tables are the general exact form |
-| [S5](s05-gpudb/README.md) | gpudb shapes | Partly done | Needs compute capability 7.5+; never rewrites float `SUM`. GPU half: [Colab notebook](s05-gpudb/s05_s08_colab.ipynb) |
+| [S5](s05-gpudb/README.md) | gpudb shapes | Done (Colab T4) | 1 of 13 einfold shapes ran on GPU (`BIGINT` reduction, 4.3×); `DOUBLE` sums, expanding joins, subquery operands and windows are declined |
 | S6 | GQE and Substrait extension relations | Blocked | Needs access to NVIDIA's GPU Query Engine |
 | [S7](s07-unparser/README.md) | DataFusion's Unparser to DuckDB | Done | Unoptimized plans round-trip (34 of 34); optimized plans don't (31 rejected, one silently wrong) |
-| [S8](s08-deterministic-sums/README.md) | Cost of deterministic sums | Done | Binned sums: deterministic and accurate, 3–4.4× a plain sum on CPU, 3.5× on GPU |
+| [S8](s08-deterministic-sums/README.md) | Cost of deterministic sums | Done | Binned sums: deterministic and accurate, 3–4.4× a plain sum on CPU, 3.5–3.6× on GPU (GTX 1080 Ti, T4) |
 | S9 | Zax-SQL | Blocked | Needs an Earthmover account |
 | [S10](s10-plan-protection/README.md) | Plan protection | Done | Hosts keep CTE orders; DuckDB needs `MATERIALIZED` (56 s → 0.09 s planning) |
 | [S11](s11-thresholds/README.md) | Dense vs. hash thresholds | Done | Dense wins above ~20% density vs. Gustavson; Gustavson beats hash join + aggregate by 2.5–17× |

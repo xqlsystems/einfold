@@ -18,7 +18,7 @@ The name joins *einsum* with *fold*, functional programming's word for a reducin
 
 ## Status
 
-Design phase. There is no product code yet. Sixteen of twenty design spikes are done; their code and reports are in [`docs/spikes/`](docs/spikes/README.md).
+Design phase. There is no product code yet. Seventeen of twenty design spikes are done; their code and reports are in [`docs/spikes/`](docs/spikes/README.md).
 
 ## Documents
 

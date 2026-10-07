@@ -32,7 +32,7 @@ einfold makes tensor computation fast inside SQL engines, on any hardware those 
 
 **Origin.** einfold grew out of [ddx](https://github.com/xqlsystems/ddx), an XQL Systems project for automatic differentiation of SQL queries. Given a query that computes a function (for example a small neural network written as joins and aggregates), ddx produces the queries that compute its gradients. Training a model this way is mostly contractions, and their slowness motivated einfold. ddx benefits from einfold but does not depend on it.
 
-**Status.** Sixteen of twenty design spikes are done (section 13). Their outcomes are folded into this doc; their reports are in [`docs/spikes/`](spikes/README.md).
+**Status.** Seventeen of twenty design spikes are done (section 13). Their outcomes are folded into this doc; their reports are in [`docs/spikes/`](spikes/README.md).
 
 ## 2. Background
 
@@ -79,7 +79,7 @@ einfold's output must run on engines we do not control. Hosts take plans as **SQ
 | Apache DataFusion | CPU | its own plans, SQL, Substrait | Rust, built on Arrow, designed to be extended with optimizer rules and operators. xarray-sql, zarr-datafusion and Zax-SQL use it |
 | NVIDIA GPU Query Engine (GQE) | GPU | Substrait, SQL | Built on libcudf, NVIDIA's GPU DataFrame library; plans with DataFusion |
 | DuckDB | CPU | SQL, Substrait | An in-process analytical database |
-| DuckDB + [gpudb](https://github.com/singhpratech/duckdbgpumetaldbram) | GPU (CUDA, Metal) | SQL | Rewrites SQL statements before DuckDB plans them. Never moves float `SUM` to the GPU |
+| DuckDB + [gpudb](https://github.com/singhpratech/duckdbgpumetaldbram) | GPU (CUDA, Metal) | SQL | Rewrites SQL statements before DuckDB plans them. Never moves float `SUM` to the GPU, and matches only base-table joins that don't expand much, so few einsums qualify today (spike S5) |
 | DuckDB + [Sirius](https://github.com/sirius-db/sirius) | GPU (CUDA) | DuckDB plans, via Substrait | Intercepts DuckDB's plans and runs supported operators on GPU, falling back to the CPU |
 
 So einfold must write both **Substrait and SQL**. Details on each host are in the supplement (section 2.3).
@@ -452,9 +452,8 @@ What stays in ddx, such as caching each training step's physical plan, is listed
 
 ## 13. Spikes
 
-A spike is a short, time-boxed experiment that answers one design question. Sixteen of twenty are done, one is partly done, and three are blocked on access:
+A spike is a short, time-boxed experiment that answers one design question. Seventeen of twenty are done, and three are blocked on access:
 
-- S5, gpudb's GPU path, has a ready-to-run Colab notebook.
 - S6 (GQE) needs access to NVIDIA's GPU Query Engine.
 - S9 (Zax-SQL) needs an Earthmover account.
 - S15 (Sirius) needs a GPU of compute capability 7.5 or newer.
@@ -491,7 +490,7 @@ Each benchmark runs with einfold off and on, on the same host. That is the measu
 
 ### 16.1 Milestones
 
-1. **M0: Spikes S1–S20.** Done except S5 (GPU half ready on Colab), S6, S9 and S15 (blocked on access). Outcome: facts travel in a side channel filled by per-reader providers (section 8.1); target profiles record plan protection (section 9.3), unparsing rules (section 7.3) and aggregate pushdown routes (section 10.5). The target-profile schema itself is the first task of M1.
+1. **M0: Spikes S1–S20.** Done except S6, S9 and S15, which are blocked on access. Outcome: facts travel in a side channel filled by per-reader providers (section 8.1); target profiles record plan protection (section 9.3), unparsing rules (section 7.3) and aggregate pushdown routes (section 10.5). The target-profile schema itself is the first task of M1.
 2. **M1: EinFold.** Detection (including single-operand factors, `IS NOT DISTINCT FROM` joins, and sums over `UNION ALL`) and EinFold's hash algorithm as a DataFusion rule and `EinsumExec`, for two-operand contractions over sparse tables. Verified as in section 11, and benchmarked on ddx's `matmul` and `attn`.
 3. **M2: Relational form and program mode.** The egglog rule set for normalization, eager aggregation, and pruning, plus the greedy contraction planner, and program mode with program-level caching, written as DataFusion plans, Substrait, and DuckDB SQL. Variable separation and distributivity (9.1), mask operands (9.1), shared scans (9.5), and support pruning, including exact zeros (9.2). Same benchmarks on DuckDB, DuckDB+gpudb, DuckDB+Sirius, and GQE. Plan protection per S10: `MATERIALIZED` CTEs on DuckDB, plain CTEs on DataFusion.
 4. **M3: Facts.** `einfold-zarr`, layouts, fill-value rules, SQL constraints and per-chunk value statistics, Bounds and degree statistics, and EinFold's dense and block-sparse algorithms. Reduction at the source (10.5). Integration with xarray-sql, zarr-datafusion, and duckdb-zarr. ERA5 benchmarks.
@@ -524,7 +523,8 @@ Agreed priority, highest first. Each lives in the section that owns it:
 - **Facts lost in transit, or stale.** S2 found that no in-plan carrier survives every host, and that DataFusion keeps metadata above operators that invalidate it. Mitigation: the side-channel fact table, and facts tied to the plan node where they hold (section 8.1).
 - **Readers disagree.** The same store reads differently through each reader (S1). Mitigation: per-reader fact providers, and the shared equivalence suite run through every reader.
 - **Unparser bugs.** DataFusion's `Unparser` can write SQL that silently changes results (S7). Mitigation: unparse only unoptimized plans, and check every unparsed plan.
-- **GPU hosts need recent GPUs.** gpudb and Sirius need compute capability 7.5+ (S5), so einfold's GPU testing needs cloud GPUs.
+- **GPU hosts need recent GPUs.** gpudb and Sirius need compute capability 7.5+ (S5), so einfold's GPU testing needs cloud GPUs. A free Colab T4 sufficed for S5.
+- **gpudb gives einfold's float workloads no GPU speedup today.** On a T4, gpudb ran only an integer reduction on the GPU. It declined every `DOUBLE` sum, many-to-many joins, and subquery operands (S5). Mitigation: M6's work with gpudb's maintainer on the einsum form, or on `DOUBLE` sums with S8's binned accumulator; meanwhile, the relational form's value on DuckDB+gpudb is the CPU-side plan shape.
 - **Float sums on GPU hosts.** Deterministic float sums on GPU need host support. gpudb avoids the question by never rewriting float `SUM`, which also keeps float einsums off its GPU path. Mitigation: determinism is a setting, not a default, on hosts (section 8.6); S8's binned sum is a concrete proposal for hosts, cheap even with GPU atomics.
 
 ## 18. References

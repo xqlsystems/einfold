@@ -50,7 +50,7 @@ async fn float_keys_compare_bitwise() {
     }
 }
 
-/// In `a JOIN b ON a.k = b.k JOIN c ON c.j IS NOT DISTINCT FROM a.j`, the
+/// Issue #21. In `a JOIN b ON a.k = b.k JOIN c ON c.j IS NOT DISTINCT FROM a.j`, the
 /// lower `=` join must drop the NULL key, so the result is empty. DataFusion
 /// 54.1.0 returns one row: the physical plan marks the `=` join
 /// `NullsEqual: true`. The same query with `=` in both joins is correct.
@@ -68,7 +68,7 @@ async fn mixed_null_equality_across_joins_is_wrong() {
     );
 }
 
-/// A chain of joins that uses `IS NOT DISTINCT FROM` loses its NULL matches:
+/// Issue #22. A chain of joins that uses `IS NOT DISTINCT FROM` loses its NULL matches:
 /// `a JOIN b ON a.k IS NOT DISTINCT FROM b.k CROSS JOIN c` should keep the
 /// NULL-to-NULL pair, but DataFusion 54.1.0 returns no rows.
 #[tokio::test]

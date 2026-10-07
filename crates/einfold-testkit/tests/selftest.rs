@@ -7,6 +7,7 @@
 
 use einfold_testkit::{assert_same_result, case_seed, check, naive_reference, sql_reference, Case};
 
+/// Both oracles agree on `n` cases of `operands` operands, from `seed`.
 fn oracles_agree(n: usize, seed: u64, operands: usize) {
     for i in 0..n {
         let cs = case_seed(seed, i);
@@ -63,6 +64,61 @@ fn generator_is_deterministic_and_varied() {
     };
     assert!((0..50).any(|s| nulls(&Case::generate(s))));
     assert!((0..50).any(|s| Case::generate(s).tables.iter().any(|t| t.num_rows() == 0)));
+}
+
+#[test]
+fn all_three_aggregates_are_generated_with_their_sql_types() {
+    use einfold_ir::Aggregate;
+    for agg in [Aggregate::Sum, Aggregate::Count, Aggregate::Avg] {
+        let case = (0..200)
+            .map(Case::generate)
+            .find(|c| c.fold.aggregate() == agg)
+            .expect("generated");
+        let ty = sql_reference(&case)
+            .schema()
+            .fields()
+            .last()
+            .unwrap()
+            .data_type()
+            .clone();
+        let want = if agg == Aggregate::Count {
+            "Int64"
+        } else {
+            "Float64"
+        };
+        assert_eq!(ty.to_string(), want, "{agg}");
+        assert_eq!(
+            naive_reference(&case)
+                .schema()
+                .fields()
+                .last()
+                .unwrap()
+                .data_type(),
+            &ty
+        );
+    }
+}
+
+#[test]
+fn count_of_all_null_group_is_zero_and_not_a_float() {
+    use datafusion::arrow::array::{Float64Array, Int64Array};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+    let mk = |count: bool| {
+        let (ty, col): (_, datafusion::arrow::array::ArrayRef) = if count {
+            (DataType::Int64, Arc::new(Int64Array::from(vec![0])))
+        } else {
+            (DataType::Float64, Arc::new(Float64Array::from(vec![0.0])))
+        };
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", ty, true)])),
+            vec![col],
+        )
+        .unwrap()
+    };
+    assert!(einfold_testkit::compare(&mk(true), &mk(true)).is_ok());
+    assert!(einfold_testkit::compare(&mk(true), &mk(false)).is_err());
 }
 
 #[test]

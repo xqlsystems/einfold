@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # PR checks: REUSE compliance, formatting, lints, docs, and tests on stable,
-# beta and the MSRV. Action versions are pinned by commit, as in ddx.
+# beta and the MSRV (minimum supported Rust version). Action versions are
+# pinned by commit, following ddx (https://github.com/xqlsystems/ddx), the
+# XQL Systems project for automatic differentiation of SQL queries.
 name: CI
 
 on:

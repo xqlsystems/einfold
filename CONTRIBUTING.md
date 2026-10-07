@@ -8,6 +8,8 @@ SPDX-License-Identifier: Apache-2.0
 
 Thank you for being here! einfold is built in the open, and contributions of every size are welcome, including your first one. This guide shows you how to get set up and how changes get in.
 
+By contributing, you agree to follow the XQL Systems [code of conduct](https://github.com/xqlsystems/.github/blob/main/CODE_OF_CONDUCT.md).
+
 If you are an AI agent, or you work with agents, also read [`AGENTS.md`](AGENTS.md), which describes the more structured process agents follow.
 
 ## Ways to contribute
@@ -31,11 +33,17 @@ If you're not sure where to start, look for issues labeled [`good first issue`](
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
 
-2. **Clone the repository:**
+2. **Clone the repository.** We recommend SSH, which lets you push without typing a password once you've [added an SSH key to GitHub](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/adding-a-new-ssh-key-to-your-github-account):
+
+   ```sh
+   git clone git@github.com:xqlsystems/einfold.git
+   cd einfold
+   ```
+
+   Or clone over HTTPS, which needs no setup:
 
    ```sh
    git clone https://github.com/xqlsystems/einfold.git
-   cd einfold
    ```
 
 3. **Build and run the tests:**
@@ -46,10 +54,10 @@ If you're not sure where to start, look for issues labeled [`good first issue`](
 
    The first build compiles Apache DataFusion, the query engine einfold plugs into. Expect it to take several minutes and a few gigabytes of disk. Later builds are much faster.
 
-4. **Optional: install `reuse`,** the tool that checks every file's license header. CI runs it for you, so this is only for checking locally:
+4. **Optional: install `reuse`,** the tool that checks every file's license header. CI runs it for you, so this is only for checking locally. We use [uv](https://docs.astral.sh/uv/), the Python package manager, for Python tools:
 
    ```sh
-   pipx install reuse     # or: uv tool install reuse
+   uv tool install reuse
    reuse lint
    ```
 
@@ -98,13 +106,13 @@ einfold rewrites other engines' query plans, so above all it must never change a
 einfold distinguishes two kinds of test, following Dan Luu's ["AI coding"](https://danluu.com/ai-coding/) notes:
 
 - **Hand tests** are examples written one at a time: this input gives that output. They help build and check the code, and they're welcome. They should be readable. Reviewers run them, but don't scrutinize each one.
-- **Tests,** in the stronger sense, check properties over many inputs: property-based tests, fuzzing, and simulation, such as einfold's equivalence harness (`crates/einfold-testkit`), which compares rewritten queries against SQL itself on random inputs. These get careful review, because they are what find bugs. Good ones state an invariant and hunt for inputs that break it.
+- **Tests,** in the stronger sense, check properties over many inputs: property-based tests, fuzzing, and simulation tests, such as einfold's equivalence harness (`crates/einfold-testkit`), which compares rewritten queries against SQL itself on random inputs. These get careful review, because they are what find bugs. Good ones state an invariant and hunt for inputs that break it.
 
-Random tests must be reproducible: seed the generator, and print the seed when a test fails.
+Random tests must be reproducible: seed the generator, and print the seed when a test fails. For why simulation testing finds bugs other tests miss, see the talk ["The Rocket Science of Simulation Testing"](https://www.hytradboi.com/2025/c222d11a-6f4d-4211-a243-f5b7fafc8d79-rocket-science-of-simulation-testing) (HYTRADBOI 2025).
 
 ## Bugs in dependencies
 
-If you find a bug in a dependency, such as DataFusion, please file it **here first**, with the `upstream` label, and include a minimal reproduction. A maintainer reviews it and, if it holds up, reports it to the other project. This keeps other projects' maintainers from receiving duplicate or mistaken reports.
+If you find a bug in a dependency, such as DataFusion, you're welcome to report it to that project directly. If it affects einfold, please also open an issue here with the `upstream` label and a link, so we can track it.
 
 ## Changing the design
 

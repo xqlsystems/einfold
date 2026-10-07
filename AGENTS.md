@@ -66,6 +66,10 @@ A maintainer must be able to understand a file without the design doc. So:
 - **Say what the code means in SQL terms** where that helps: which query it is equivalent to, and how NULLs and duplicates behave.
 - **Keep comments true.** Update them with the code.
 
+## Introduce every reference
+
+In code, docs, issues and pull requests, introduce every project, paper, tool or term the first time it appears: say what it is in a few words, and link to it. A reader should never have to look up a name to follow the text. For example, write "ddx, an XQL Systems project for automatic differentiation of SQL queries", not just "ddx".
+
 ## Tests
 
 Follow the two kinds described in [`CONTRIBUTING.md`](CONTRIBUTING.md#tests). A maintainer reviews property-based, fuzz and simulation tests closely, and only runs hand tests. So:
@@ -76,7 +80,7 @@ Follow the two kinds described in [`CONTRIBUTING.md`](CONTRIBUTING.md#tests). A 
 
 ## Bugs in dependencies
 
-File them **in this repository**, never directly upstream, with the `upstream` label. Include a minimal reproduction, and a test in einfold that pins the current behavior and fails once it is fixed. A maintainer decides whether to report it upstream.
+Unlike people (see [`CONTRIBUTING.md`](CONTRIBUTING.md)), agents file them **in this repository**, never directly upstream, with the `upstream` label. This spares other projects' maintainers from duplicate or mistaken reports. Include a minimal reproduction, and a test in einfold that pins the current behavior and fails once it is fixed. A maintainer decides whether to report it upstream.
 
 ## Building locally
 

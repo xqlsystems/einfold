@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "s24-deterministic-kernels"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike S24: what do bit-for-bit repeatable dense kernels cost on ddx's contractions?"
+
+# A standalone crate, not a member of einfold's workspace.
+[workspace]
+
+[dependencies]
+matrixmultiply = "0.3"
+arrow-array = "58"
+
+[profile.release]
+debug = false

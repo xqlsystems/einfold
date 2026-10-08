@@ -36,6 +36,18 @@ The design matters for planning, but code must not depend on it: comments and do
 
 Concrete code review is where a design's specifics get settled, and it can't all happen in advance. Rebuilding work that was built on code whose design then changed is the most expensive thing we do. These rules keep review early and rework small. They're an experiment; change them as we learn.
 
+### One author on the critical path
+
+The **critical path** is the chain of foundations a milestone builds in order (for M1: IR, detection, kernel, operator, rule). One lead agent writes it, one small pull request at a time, rather than handing pieces to parallel implementer agents. A fresh agent spends much of its budget relearning context the lead already has, and parallel authors mostly produce work that waits for review and then has to be redone as the design settles.
+
+Spawn a separate agent only where independence or isolation pays:
+
+- **adversarial testing:** fuzzers, property tests and oracles, which gain from *not* sharing the author's assumptions;
+- **long-running work** whose output would flood the lead's context, such as benchmark sweeps;
+- **independent leaves,** once the foundations they build on are merged.
+
+This is an experiment, started after M1's first round of parallel implementation. Revisit it as we learn.
+
 ### Foundations and leaves
 
 Every pull request is one of two kinds, which its issue states:
@@ -55,7 +67,7 @@ The first pull request for a new component is its **interface**: public types, s
 
 ### A tracer bullet before breadth
 
-For each milestone, first build one **thin end-to-end path**: the smallest case that exercises every layer, such as one aggregate over two tables, from detection through execution. A maintainer reviews that whole slice, because design problems show up where the pieces meet. Only then widen it, in parallel.
+For each milestone, first build one **thin end-to-end path**: the smallest case that exercises every layer, such as one aggregate over two tables, from detection through execution. A maintainer reviews that whole slice, because design problems show up where the pieces meet. Only then widen it.
 
 ### While waiting for review
 
@@ -82,10 +94,10 @@ Agents start every GitHub comment, issue and pull request description with their
 
 | | Name | Role |
 |---|---|---|
-| 🧭 | Claude | Orchestrator: plans work, writes issue specs, reviews for the design |
-| 🔨 | Forge | Implementer for semantics-heavy work |
-| 🪛 | Wrench | Implementer for well-specified components |
-| 🧪 | Assay | Tests, harnesses and benchmarks |
+| 🧭 | Claude | Lead: writes the critical path, plans work, reviews for the design |
+| 🧪 | Assay | Independent tests, harnesses and benchmarks |
+| 🔨 | Forge | Implementer for semantics-heavy work (inactive) |
+| 🪛 | Wrench | Implementer for well-specified components (inactive) |
 
 Review agents run by maintainers introduce themselves with their own emoji.
 

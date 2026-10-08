@@ -11,7 +11,7 @@ SPDX-License-Identifier: Apache-2.0
 **Answer.** For a matrix product with both inputs at uniform density `d`:
 
 - **Dense GEMM overtakes Gustavson's algorithm at about `d = 0.2`** (20% of entries present), at every size tested.
-- **Gustavson's algorithm beats a SQL-style hash join with hash aggregation by 2.5–17×** across densities, and is faster than dense below the crossover.
+- **Gustavson's algorithm beats a SQL-style hash join with hash aggregation by 2.5–17×** across densities, and is faster than dense below the crossover. The hash join here is this spike's own single-threaded loop, not a SQL engine; spike S21 measures the engines themselves.
 - **Dense overtakes the hash join with hash aggregation much earlier, at `d ≈ 0.05–0.1`.** That is close to the 5% Staudt et al. found for their switch, which was against a different sparse implementation.
 - Tracking which output groups exist roughly **doubles** the dense algorithm's cost. An Exact fact that both inputs are complete removes that cost.
 

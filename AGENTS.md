@@ -10,76 +10,26 @@ How AI agents work on einfold. Everything in [`CONTRIBUTING.md`](CONTRIBUTING.md
 
 ## Know the design
 
-[`docs/design.md`](docs/design.md) describes what einfold is and why, and [`docs/supplement.md`](docs/supplement.md) holds the details, numbered to match. Read the sections relevant to your task before you start. Code implements the design. If the code needs to differ from it, propose the change as an RFC ([`docs/rfcs/README.md`](docs/rfcs/README.md)) instead of drifting silently.
+[`docs/design.md`](docs/design.md) describes what einfold is and why, and [`docs/supplement.md`](docs/supplement.md) holds the details, numbered to match. [`docs/lessons.md`](docs/lessons.md) records what review and testing have taught us that the design doesn't say. Read the sections relevant to your task before you start. Code implements the design. If the code needs to differ from it, propose the change as an RFC ([`docs/rfcs/README.md`](docs/rfcs/README.md)) instead of drifting silently.
 
 The design matters for planning, but code must not depend on it: comments and docs in code are self-contained (see [Code comments](#code-comments)).
 
-## From issue to merge
+## From request to merge
 
-1. **Issue.** Work starts as an issue that sets **goals, constraints and motivation**, not a specification, and says whether the work is a foundation or a leaf (see [Sequencing work](#sequencing-work)):
-   - *motivation:* why the work matters, and which design sections it serves;
-   - *goals:* what should be true when it's done, stated as outcomes, not as APIs or algorithms;
-   - *constraints:* what must hold, such as SQL semantics, determinism, compatibility with code already merged, and the size budget;
-   - *done when:* how a reviewer will know, such as which properties the tests establish;
-   - the branch it builds on.
-
-   Leave the design of the code (types, function signatures, algorithms) to the implementer, who should judge from the code and the design doc. A prescribed API biases the implementation. If an interface must be shared between parallel pieces of work, agree on it in the issue's discussion or in a small pull request that lands first.
-
-   Milestones have tracking issues.
-2. **Branch.** One branch per issue, named `<milestone>/<item>-<topic>`, such as `m1/c1-hash-kernel`.
-3. **Draft pull request,** linked to its issue (`Closes #N`), and based on the branch it builds on. Pull requests may stack; when a base merges, GitHub retargets the pull requests on top of it.
-4. **Design review by the implementer.** Before marking a pull request ready, its author checks it against the design sections it implements, and says in the description how it adheres, or which RFC proposes the difference. Any agent or person may also review for the design; nobody is a required gate for it.
-5. **Ready for review.** Mark the pull request ready once CI is green and the design review is done.
-6. **Approval and merge** by a maintainer or code owner ([`.github/CODEOWNERS`](.github/CODEOWNERS)).
+1. **Start** from a maintainer's request or an issue. An issue states goals, constraints and motivation, not an API: the design of the code is the implementer's to judge.
+2. **Branch** per pull request, named `<milestone>/<topic>`, such as `m1/hash-kernel`.
+3. **Self-review against the design.** Before asking for review, check the pull request against the design sections it implements, and say in the description how it adheres, or which RFC proposes the difference.
+4. **Ready for review** once CI is green.
+5. **Approval and merge** by a maintainer or code owner ([`.github/CODEOWNERS`](.github/CODEOWNERS)).
 
 ## Sequencing work
 
-Concrete code review is where a design's specifics get settled, and it can't all happen in advance. Rebuilding work that was built on code whose design then changed is the most expensive thing we do. These rules keep review early and rework small. They're an experiment; change them as we learn.
+Concrete code review is where a design's specifics get settled, and it can't all happen in advance. Rebuilding work on code whose design then changed is the most expensive thing we do. So:
 
-### One author on the critical path
-
-The **critical path** is the chain of foundations a milestone builds in order (for M1: IR, detection, kernel, operator, rule). One lead agent writes it, one small pull request at a time, rather than handing pieces to parallel implementer agents. A fresh agent spends much of its budget relearning context the lead already has, and parallel authors mostly produce work that waits for review and then has to be redone as the design settles.
-
-Spawn a separate agent only where independence or isolation pays:
-
-- **adversarial testing:** fuzzers, property tests and oracles, which gain from *not* sharing the author's assumptions;
-- **long-running work** whose output would flood the lead's context, such as benchmark sweeps;
-- **independent leaves,** once the foundations they build on are merged.
-
-This is an experiment, started after M1's first round of parallel implementation. Revisit it as we learn.
-
-### Foundations and leaves
-
-Every pull request is one of two kinds, which its issue states:
-
-- A **foundation** defines something other work depends on: shared types, a trait, an operator's contract, a public API.
-- A **leaf** depends on foundations, but nothing depends on it: an implementation behind an agreed interface, tests, benchmarks, docs, a spike.
-
-### The review frontier
-
-Work may build at most **one layer past code a maintainer has reviewed**. Nothing may stack on a foundation until a maintainer has reviewed it and agreed its shape. The foundation doesn't need to be merged, but it does need that agreement. Leaves may proceed in parallel freely.
-
-The depth of unreviewed work is what causes rework, more than the number of open pull requests. As a secondary guard on review load, aim for **at most five pull requests awaiting maintainer review** at once.
-
-### Interfaces first
-
-The first pull request for a new component is its **interface**: public types, signatures and doc comments, with stub bodies (`todo!()` is fine there). It is small, and quick to review and to change. Implementation pull requests follow, once the interface is agreed.
-
-### A tracer bullet before breadth
-
-For each milestone, first build one **thin end-to-end path**: the smallest case that exercises every layer, such as one aggregate over two tables, from detection through execution. A maintainer reviews that whole slice, because design problems show up where the pieces meet. Only then widen it.
-
-### While waiting for review
-
-Agents don't build on unreviewed foundations while they wait. First, ask whether any work is worth doing *now*. Waiting is often the better choice: more of the design will be settled later, so the same work done then costs less and is less likely to be redone. Agent time is limited and should be spent deliberately. **Doing nothing is a perfectly fine choice.**
-
-When work is worth doing now, choose things that don't depend on unreviewed foundations:
-
-- test generators and oracles;
-- benchmarks against the unmodified engine;
-- spikes;
-- docs;
-- reviewing each other's pull requests against the design, and for composability within the XQL ecosystem einfold belongs to (readers such as xarray-sql and duckdb-zarr, ddx, and the hosts), so that pieces fit together without one project bending to another.
+- **Don't build past unreviewed foundations.** A *foundation* is something other work depends on: shared types, a trait, an operator's contract. Build at most one layer past code a maintainer has reviewed and agreed the shape of.
+- **Interfaces first.** The first pull request for a new component is its interface: public types, signatures and doc comments, with stub bodies.
+- **A tracer bullet before breadth.** For each milestone, first build one thin end-to-end path, such as one aggregate over two tables from detection through execution, and have it reviewed whole. Design problems show up where the pieces meet. Widen it afterwards.
+- **Waiting is fine.** While a foundation awaits review, work that doesn't depend on it (tests, benchmarks, spikes, docs) is an option, but doing nothing is a perfectly fine choice.
 
 ## Size
 
@@ -90,16 +40,7 @@ Aim for about **400 changed lines of non-test code** per pull request. When work
 
 ## Identities
 
-Agents start every GitHub comment, issue and pull request description with their emoji and name, so the record shows who said what. Pick an emoji not already in use, and keep it for the life of the agent. The team so far:
-
-| | Name | Role |
-|---|---|---|
-| 🧭 | Claude | Lead: writes the critical path, plans work, reviews for the design |
-| 🧪 | Assay | Independent tests, harnesses and benchmarks |
-| 🔨 | Forge | Implementer for semantics-heavy work (inactive) |
-| 🪛 | Wrench | Implementer for well-specified components (inactive) |
-
-Review agents run by maintainers introduce themselves with their own emoji.
+Agents start every GitHub comment, issue and pull request description with an emoji and a name, so the record shows who said what. Pick an emoji not already in use, and keep it for the life of the agent.
 
 ## Pull request descriptions and commits
 
@@ -135,6 +76,6 @@ Unlike people (see [`CONTRIBUTING.md`](CONTRIBUTING.md)), agents file them **in 
 
 ## Building locally
 
-- When several agents work at once in separate git worktrees, give each worktree **its own** Cargo target directory. Cargo assigns the same build hash to a crate in different worktrees, so a shared target directory can run another worktree's build of your crate.
+- When working in several git worktrees at once, give each worktree **its own** Cargo target directory. Cargo assigns the same build hash to a crate in different worktrees, so a shared target directory can run another worktree's build of your crate.
 - DataFusion is large: limit parallel build jobs (`CARGO_BUILD_JOBS`) on machines with little memory.
 - Run the CI checks before pushing: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps`, and `reuse lint`.

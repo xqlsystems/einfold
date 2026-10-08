@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "s21-host-baseline"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike S21: what do host engines take on ddx's contractions, next to hand-written dense loops?"
+
+# A standalone crate, not a member of einfold's workspace.
+[workspace]
+
+[dependencies]
+datafusion = "=54.1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+matrixmultiply = "0.3"
+
+[profile.release]
+debug = false

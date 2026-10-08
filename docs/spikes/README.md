@@ -19,7 +19,7 @@ A spike is a short, time-boxed experiment that answers one design question (desi
 | [S8](s08-deterministic-sums/README.md) | Cost of deterministic sums | Done | Binned sums: deterministic and accurate, 3–4.4× a plain sum on CPU, 3.5–3.6× on GPU (GTX 1080 Ti, T4) |
 | S9 | Zax-SQL | Blocked | Needs an Earthmover account |
 | [S10](s10-plan-protection/README.md) | Plan protection | Done | Hosts keep CTE orders; DuckDB needs `MATERIALIZED` (56 s → 0.09 s planning) |
-| [S11](s11-thresholds/README.md) | Dense vs. hash thresholds | Done | Dense wins above ~20% density vs. Gustavson; Gustavson beats hash join + aggregate by 2.5–17× |
+| [S11](s11-thresholds/README.md) | Dense vs. hash thresholds | Done | Dense wins above ~20% density vs. Gustavson; Gustavson beats the spike's own hash join + aggregate loop (not a SQL engine) by 2.5–17× |
 | [S12](s12-aggregate-pushdown/README.md) | Reader aggregate pushdown | Done | Replace DataFusion's `Partial` aggregate via an optimizer rule; on DuckDB, rewrite SQL to a reader table function |
 | S15 | Sirius | Blocked | Needs a GPU of compute capability 7.5+ and a libcudf build: a Colab T4 or a cloud VM |
 | [S16](s16-egglog/README.md) | egglog as the rewrite engine | Done | Adopt egglog in a hybrid design |
@@ -27,5 +27,6 @@ A spike is a short, time-boxed experiment that answers one design question (desi
 | [S18](s18-planning-time/README.md) | egglog planning time | Done | 0.5–1.2 ms per query with rules preloaded, under the hosts' own planning time |
 | [S19](s19-float-sums/README.md) | Float sums in hosts and JAX | Done | No SQL engine guarantees repeatable float sums; determinism is a setting |
 | [S20](s20-tiles/README.md) | Tiles in egglog | Done | Reproduces Cubed's plans exactly; never exceeds the budget; finds cheaper plans |
+| [S21](s21-host-baseline/README.md) | The host baseline | Done | Dense positional kernels beat DataFusion and DuckDB by 4–14× on ddx's matrix products and 13–48× on attention; M1's hash kernel was 0.11–0.6× |
 
 Machine for the local spikes: Intel Core i7-8700 (6 cores, 12 threads), 15 GB RAM, NVIDIA GTX 1080 Ti, NixOS.

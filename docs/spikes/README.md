@@ -32,5 +32,6 @@ A spike is a short, time-boxed experiment that answers one design question (desi
 | [S23](s23-float-guards/README.md) | Float guards for eager aggregation | Done | Eager aggregation turns 0 into NaN, NaN into 0 and finite into inf on both hosts; a finiteness-and-magnitude guard prevents it in every random case and costs 6% of the contraction |
 | [S24](s24-deterministic-kernels/README.md) | Deterministic dense kernels | Done | Fixed shape-chosen blocks and position order make S21's kernels bit-for-bit repeatable at no cost; a one-pass reproducible accumulator costs 2–7× on matmul, 7–25× on attention |
 | [S25](s25-ddx-emits-fold/README.md) | ddx emits the fold | Done | A 300-line fold node built from ddx's program metadata matches ddx on 300 random NULL/NaN cases and runs its matmul gradient steps 33–57× faster; covers 86% of matmul's step time, 4% of attention's |
+| [S26](s26-geospatial-breakdown/README.md) | Where xarray-sql's geospatial time goes | Done | Engine compute is 1.5–4% of the published gaps on ERA5 group-bys and joins; the rest is the read path. Recovering positions from coordinates costs more than DataFusion's hash aggregation |
 
 Machine for the local spikes: Intel Core i7-8700 (6 cores, 12 threads), 15 GB RAM, NVIDIA GTX 1080 Ti, NixOS.

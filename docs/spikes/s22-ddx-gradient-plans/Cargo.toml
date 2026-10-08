@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "s22-ddx-gradient-plans"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike S22: where does ddx's gradient time go, and what would einfold have to match?"
+
+# A standalone crate, not a member of einfold's workspace.
+[workspace]
+
+[dependencies]
+datafusion = "=54.1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# ddx's public main at the time of the spike.
+ddx-datafusion = { git = "https://github.com/xqlsystems/ddx", rev = "c6657c97c1d45daffe5cd8d6339240b36037e9c7" }
+
+[profile.release]
+debug = false

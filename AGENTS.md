@@ -10,26 +10,16 @@ How AI agents work on einfold. Everything in [`CONTRIBUTING.md`](CONTRIBUTING.md
 
 ## Know the design
 
-[`docs/design.md`](docs/design.md) describes what einfold is and why, and [`docs/supplement.md`](docs/supplement.md) holds the details, numbered to match. [`docs/lessons.md`](docs/lessons.md) records what review and testing have taught us that the design doesn't say. Read the sections relevant to your task before you start. Code implements the design. If the code needs to differ from it, propose the change as an RFC ([`docs/rfcs/README.md`](docs/rfcs/README.md)) instead of drifting silently.
+[`docs/design.md`](docs/design.md) describes what einfold is and why, and [`docs/supplement.md`](docs/supplement.md) holds the details, numbered to match. [`docs/lessons.md`](docs/lessons.md) records what review and testing have taught us that the design doesn't say. Read the sections relevant to your task before you start. Code implements the design. If the code needs to differ from it, change the design doc in the same or an earlier pull request, instead of drifting silently.
 
 The design matters for planning, but code must not depend on it: comments and docs in code are self-contained (see [Code comments](#code-comments)).
 
 ## From request to merge
 
-1. **Start** from a maintainer's request or an issue. An issue states goals, constraints and motivation, not an API: the design of the code is the implementer's to judge.
+1. **Start** from a maintainer's request, a milestone in the design, or an issue. An issue states goals, constraints and motivation, not an API: the design of the code is the implementer's to judge.
 2. **Branch** per pull request, named `<milestone>/<topic>`, such as `m1/hash-kernel`.
-3. **Self-review against the design.** Before asking for review, check the pull request against the design sections it implements, and say in the description how it adheres, or which RFC proposes the difference.
-4. **Ready for review** once CI is green.
-5. **Approval and merge** by a maintainer or code owner ([`.github/CODEOWNERS`](.github/CODEOWNERS)).
-
-## Sequencing work
-
-Concrete code review is where a design's specifics get settled, and it can't all happen in advance. Rebuilding work on code whose design then changed is the most expensive thing we do. So:
-
-- **Don't build past unreviewed foundations.** A *foundation* is something other work depends on: shared types, a trait, an operator's contract. Build at most one layer past code a maintainer has reviewed and agreed the shape of.
-- **Interfaces first.** The first pull request for a new component is its interface: public types, signatures and doc comments, with stub bodies.
-- **A tracer bullet before breadth.** For each milestone, first build one thin end-to-end path, such as one aggregate over two tables from detection through execution, and have it reviewed whole. Design problems show up where the pieces meet. Widen it afterwards.
-- **Waiting is fine.** While a foundation awaits review, work that doesn't depend on it (tests, benchmarks, spikes, docs) is an option, but doing nothing is a perfectly fine choice.
+3. **Ready for review** once CI is green.
+4. **Approval and merge** by a maintainer or code owner ([`.github/CODEOWNERS`](.github/CODEOWNERS)).
 
 ## Size
 

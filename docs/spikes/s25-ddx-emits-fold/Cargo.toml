@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "s25-ddx-emits-fold"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike S25: if ddx emitted its gradient contractions as a fold node, how much would that take and give?"
+
+# A standalone crate, not a member of einfold's workspace.
+[workspace]
+
+[dependencies]
+async-trait = "0.1"
+datafusion = "=54.1.0"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# ddx's public main at the time of the spike.
+ddx-datafusion = { git = "https://github.com/xqlsystems/ddx", rev = "c6657c97c1d45daffe5cd8d6339240b36037e9c7" }
+
+[profile.release]
+debug = false

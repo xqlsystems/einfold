@@ -30,5 +30,6 @@ A spike is a short, time-boxed experiment that answers one design question (desi
 | [S21](s21-host-baseline/README.md) | The host baseline | Done | Dense positional kernels beat DataFusion and DuckDB by 4–14× on ddx's matrix products and 13–48× on attention; M1's hash kernel was 0.11–0.6× |
 | [S22](s22-ddx-gradient-plans/README.md) | ddx's gradient plans | Done | ddx's gradient steps recompute the forward join for a redundant NULL test; the two-table form is 3.7× faster and a dense kernel 68×. A two-table detector matches 13–32% of step time |
 | [S23](s23-float-guards/README.md) | Float guards for eager aggregation | Done | Eager aggregation turns 0 into NaN, NaN into 0 and finite into inf on both hosts; a finiteness-and-magnitude guard prevents it in every random case and costs 6% of the contraction |
+| [S25](s25-ddx-emits-fold/README.md) | ddx emits the fold | Done | A 300-line fold node built from ddx's program metadata matches ddx on 300 random NULL/NaN cases and runs its matmul gradient steps 33–57× faster; covers 86% of matmul's step time, 4% of attention's |
 
 Machine for the local spikes: Intel Core i7-8700 (6 cores, 12 threads), 15 GB RAM, NVIDIA GTX 1080 Ti, NixOS.

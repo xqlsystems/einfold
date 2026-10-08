@@ -20,7 +20,7 @@ You don't need to write Rust to help:
 - **Improve the docs.** Fixing a typo or clarifying a sentence is a real contribution that helps everyone who reads it after you.
 - **Write tests.** Tests that find bugs are among the most valuable things you can add (see [Tests](#tests)).
 - **Report bugs in our dependencies** (see [Bugs in dependencies](#bugs-in-dependencies)).
-- **Propose a design change** through an RFC (see [Changing the design](#changing-the-design)).
+- **Propose a design change** (see [Changing the design](#changing-the-design)).
 - **Send a pull request** with a fix or a feature.
 
 If you're not sure where to start, look for issues labeled [`good first issue`](https://github.com/xqlsystems/einfold/labels/good%20first%20issue), or open an issue and ask.
@@ -116,7 +116,7 @@ If you find a bug in a dependency, such as DataFusion, you're welcome to report 
 
 ## Changing the design
 
-[`docs/design.md`](docs/design.md) describes what einfold is and why, and [`docs/supplement.md`](docs/supplement.md) holds the details. To change the design, write a short RFC (request for comments); see [`docs/rfcs/README.md`](docs/rfcs/README.md). An RFC is easier to discuss than a diff of the design doc. Once it's accepted, the design doc is updated to match.
+[`docs/design.md`](docs/design.md) describes what einfold is and why, and [`docs/supplement.md`](docs/supplement.md) holds the details. To change the design, open an issue to discuss it, or a pull request that edits the design doc directly.
 
 ## License
 

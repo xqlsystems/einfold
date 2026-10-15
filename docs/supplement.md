@@ -362,6 +362,18 @@ einfold follows JAX's split.
 
 **6. Warn where small differences become big ones.** In SQL, a sum that varies in its last bit can flip a comparison. Sums feed `WHERE` and `HAVING` filters, `ORDER BY … LIMIT`, `MIN` and `MAX` ties, `GROUP BY` on computed keys, and joins on computed values. Then a last-bit difference becomes different rows. ddx, for example, needs a tie-breaking rule for `MIN` and `MAX` because sums across partitions vary. einfold traces each float sum through the plan, and when one feeds such a decision without determinism requested, it warns and suggests deterministic mode. It does not change the plan on its own, since hosts don't either.
 
+**7. Sums of exponentials: the scaled accumulator.** A softmax-weighted sum `Σ_j e^(s_j)·y_j` and its normalizer `Σ_j e^(s_j)` are kept as `(m, a, z)`: a shift `m`, and the sums `a = Σ e^(s_j − m)·y_j` and `z = Σ e^(s_j − m)`. Folding in a tile of terms whose largest score is `m_t` sets `m' = max(m, m_t)`, multiplies `a` and `z` by `e^(m − m')`, and adds the tile's terms shifted by `m'`. Merging two states works the same way, so the state is a commutative monoid with identity `(−∞, 0, 0)`, and partial states combine in any grouping. The result is `a / z`.
+
+- *No overflow.* Every exponent is at most 0, so no term exceeds 1 in magnitude times `|y|`. SQL's own spelling subtracts the row's final maximum for the same reason. The unshifted sum `Σ e^(s)` is never computed, since it overflows for `s` above about 709.
+- *Error.* The host computes each weight `e^(s_j − m_final)` with one rounding of `exp` and one of the subtraction, then sums. The accumulator computes `e^(s_j − m_k)` for the shift `m_k` current when term `j` arrived, then multiplies by one rescaling factor per later raise of the shift. Each factor adds one rounding of `exp` and one of a product. With `r` the number of rescalings a term goes through, at most the number of tiles its group spans, `z` is within `(n − 1 + c·r)·u·z` of the exact sum, where `c` is the rounding of the platform's `exp` in units of `u` (a few, for a correctly rounded or nearly correctly rounded `exp`). `a` is within `(n − 1 + c·r)·u·Σ_j e^(s_j − m)·|y_j|`. All weights are positive, so `z` has no cancellation, and its bound is relative. Spike S27 measured the fused kernel's error at 1.3–5.1e-15 of the largest output, against DataFusion's 0.6–8.7e-14, with scores spread up to 40× wider than its base case. The bound, not that measurement, is the test.
+- *Special values.* The accumulator must reproduce SQL's results:
+  - a NaN score makes its row's maximum or weights NaN, and so the row's outputs;
+  - a `+∞` score gives `exp(∞ − ∞)`, which is NaN;
+  - a row whose scores are all `−∞` gives `exp(−∞ − (−∞))`, NaN. In the accumulator it gives `0 / 0`, also NaN;
+  - a NULL score is skipped, as SQL's `MAX` and `SUM` skip it, and a row whose scores are all NULL is NULL.
+
+  S27 checked the non-NULL cases against DataFusion.
+
 **In target profiles,** each host records which deterministic mechanisms it offers and which precision levels it supports.
 
 **On GPU hosts,** the relational form still gets its plan-shape benefits. Fast deterministic float sums on GPU need host support for an order-independent accumulator, which einfold will propose to the `gpudb`, Sirius, and GQE maintainers.
@@ -543,6 +555,30 @@ Two design rules come from it:
 - **Common subexpressions.** Put every node of every contraction tree in a canonical form, hash it, and compute identical nodes once (Deeds et al., §5.4). In egglog this comes for free: the e-graph stores each distinct subexpression once, so einsums placed in the same e-graph, including all the steps of a program, share them automatically.
 - **Realization.** Reference executor: an `EinFoldExec` with several outputs. Relational form: the shared operand is emitted once as a CTE that both einsums reference. Whether the host then scans it once is recorded in the target profile.
 
+### 9.6 Fuse fold pipelines
+
+**Matches.** A fold `C` (the consumer) whose operands include the result of another fold `P` (the producer), joined on some of `P`'s group keys, when the following holds. Write `G_P` and `G_C` for the two folds' group keys, and `Z_C` for the dimensions `C` sums away. The condition is `G_P ⊆ G_C ∪ Z_C`: every producer group is a consumer group paired with values of summed dimensions. `C`'s row value may apply any expression to `P`'s result. The producer's own summed dimensions `Z_P` (attention's features `e`) stay inside each producer tile.
+
+**Produces.** One pipeline node, with `P` and `C` and the expression between them. Run by the fused pipeline algorithm (section 10.2) in `EinFoldExec`. A producer may also emit the node directly, as for M1's fold.
+
+**Normalized sums.** A consumer of the form `Σ_j w_j·y_j / Σ_j w_j`, with `w_j = exp(s_j − M)` and `M` the maximum of `s` over the same group, becomes an algebraic fold over the scaled accumulator (section 8.6, item 7). The two forms are equal because `e^(−M)` cancels between numerator and denominator. Recognized spellings:
+
+- `exp(s − MAX(s) OVER (PARTITION BY g))`, then `SUM(w·y) / SUM(w)` over the same `g` (demo 1's spelling);
+- `MAX(s) … GROUP BY g` joined back to the scores on `g` (ddx's spelling);
+- the normalizer divided inside the sum, `SUM(w / z · y)`, which equals `SUM(w·y) / z` up to rounding, because `z` is constant within the group;
+- a constant scale applied to the scores, such as `/ 8.0`, folded into `s`.
+
+`M` must range over exactly the terms the sums range over: the same group, the same mask, the same existence. Otherwise the maximum doesn't cancel, and detection declines.
+
+**Correctness.**
+- *Existence.* An output group exists exactly when some unmasked, existing producer group joins a row of the consumer's other operands. The pipeline tracks `reached` per output group, as section 8.3 does, so groups reached only by NULL weights exist and are NULL. A masked pair is skipped, never given weight 0.
+- *Values.* Each producer result is complete (summed over all of `Z_P`) before it is mapped, so the consumer folds the same values the host would. Only the consumer's order of additions and the shift change, which section 8.6 bounds.
+- *NULLs.* A NULL score gives a NULL weight. `SUM` skips it, and `MAX` ignores it, in both the host and the accumulator.
+
+**Generality.** The rules mention no attention-specific operator. Each is tested on another query too: a Gaussian-kernel weighted average `SUM(exp(−dist²/h²)·y) / SUM(exp(−dist²/h²))` over a join of target and source points (the Nadaraya–Watson estimator), and a log-sum-exp loss.
+
+**Prior work.** Loop fusion with `compute_at` in Halide (Ragan-Kelley et al., 2013). The online softmax (Milakov and Gimelshein, 2018), and its reading as a deferred normalization (Rabe and Staats, 2021). Automatic rediscovery of FlashAttention from tensor programs: Mirage (Wu et al., 2025), Blockbuster (Dekel, 2025), and EqiForge (Zhan et al., 2026), which does it by equality saturation.
+
 ## 10. Physical realization, in detail
 
 Each node of the contraction tree becomes either a relational join-aggregate (section 10.1) or an EinFold operator (section 10.2), chosen per subplan by the target profile (section 7.4).
@@ -645,6 +681,24 @@ The **build** step loads `B` into a hash table. The **probe** step streams `A` a
 
   Thresholds can change while running (section 10.4).
 
+#### Fused pipeline algorithm
+
+For a pipeline (section 9.6) with producer `s = Σ_{Z_P} A·B` and consumer `x = Σ_{Z_C} f(s)·C`, attention being `s = QKᵀ/8`, `f = exp`, `C = V`:
+
+```
+for each tile I of the consumer's groups (one thread per tile, fixed order):
+    state[I] := accumulator identity; reached[I] := false
+    for each tile J of Z_C, in position order:
+        class := classify(I, J, masks)          -- empty, full or partial
+        if class = empty: continue
+        S := A[I, Z_P] · B[Z_P, J]               -- GEMM; one tile of the producer, complete over Z_P
+        for each allowed pair (i, j) in (I, J):  -- partial tiles: masked pairs are skipped, not zeroed
+            fold f(S[i, j]) · C[j, :] into state[i] with the accumulator; reached[i] := true
+    emit finish(state[i]) for each reached i
+```
+
+`classify` evaluates each mask predicate on the tiles' position bounds: for `i >= j`, a tile pair is empty when `max(I) < min(J)`, and full when `min(I) >= max(J)`. Positions stand for coordinates only under an Exact monotonic coordinate map (section 9.1). Tile sizes come from the shape (64 × 64 in S27), so bits don't depend on threads (section 8.6). Memory is one tile of `S` and one row block of state per thread.
+
 #### Correctness
 
 - *NULLs and group existence:* section 8.3.
@@ -741,6 +795,7 @@ Status as of design v15: 22 of 25 spikes done, and three blocked on access. The 
 | **S23** Float guards for eager aggregation. Done: [`s23-float-guards`](spikes/s23-float-guards/README.md) | When does eager aggregation change a float result beyond rounding, and what does a guard cost? | It turns 0 into NaN, NaN into 0 and finite into inf on both hosts, as the hosts' own partitioning does. Finite inputs with bounded absolute partial sums keep both plans finite and within the bound; checking costs 6% of a contraction (sections 8.6 and 10.1). |
 | **S24** Deterministic dense kernels. Done: [`s24-deterministic-kernels`](spikes/s24-deterministic-kernels/README.md) | What do bit-for-bit repeatable dense kernels cost? | Fixed, shape-chosen blocks and position order make them repeatable at no cost. A one-pass reproducible accumulator, which needs no maximum in advance, costs 2–25× (section 8.6). |
 | **S25** ddx emits the fold. Done: [`s25-ddx-emits-fold`](spikes/s25-ddx-emits-fold/README.md) | If ddx emitted its gradient contractions as a fold node, what would it take and give? | About 300 lines for node, operator and planner; matches ddx on 300 random cases; `matmul`'s gradient steps 33–57× faster; covers 86% of `matmul`'s step time, 4% of attention's (sections 7.3 and 16). |
+| **S27** Fused attention. Done: [`s27-fused-attention`](spikes/s27-fused-attention/README.md) | How do the hosts run demo 1's attention in SQL, and what does a fused, tiled online-softmax kernel give on the same rows? | The hosts hold all `N²` scores: DataFusion fails at 8,192 tokens and DuckDB at 16,384. The fused kernel is 280–390× faster than DuckDB and 500–2,000× faster than DataFusion, more accurate than DataFusion, and deterministic. A partly masked tile must skip masked pairs, not zero them (sections 8.3, 8.6, 9.6 and 10.2). |
 
 ### 13.3 Optimizer engine
 
@@ -803,13 +858,17 @@ Papers:
 - Blacher, M., Staudt, C., Klaus, J., Wenig, M., Merk, N., Breuer, A., Engel, M., Laue, S., Giesen, J. (2024). Einsum Benchmark: Enabling the Development of Next-Generation Tensor Execution Engines. *NeurIPS 2024, Datasets and Benchmarks Track.* https://proceedings.neurips.cc/paper_files/paper/2024/file/b1bbfdb9197bfc819a52c34dce493f85-Paper-Datasets_and_Benchmarks_Track.pdf
 - Chaudhuri, S., Shim, K. (1994). Including Group-By in Query Optimization. *VLDB 1994*, 354–366.
 - Chen, J., Huang, Y., Wang, M., Salihoglu, S., Salem, K. (2023). Accurate Summary-based Cardinality Estimation Through the Lens of Cardinality Estimation Graphs. *SIGMOD Record* 52(1), 94–102. https://doi.org/10.1145/3604437.3604458
-- Deeds, K., Ahrens, W., Balazinska, M., Suciu, D. (2025). Galley: Modern Query Optimization for Sparse Tensor Programs. *Proc. ACM Manag. Data* 3(3), Article 164. https://doi.org/10.1145/3725301 (arXiv:2408.14706)
 - Dao, T., Fu, D. Y., Ermon, S., Rudra, A., Ré, C. (2022). FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. *NeurIPS 2022.* https://arxiv.org/abs/2205.14135
+- Deeds, K., Ahrens, W., Balazinska, M., Suciu, D. (2025). Galley: Modern Query Optimization for Sparse Tensor Programs. *Proc. ACM Manag. Data* 3(3), Article 164. https://doi.org/10.1145/3725301 (arXiv:2408.14706)
+- Dekel, O. (2025). Blockbuster, Part 1: Block-level AI Operator Fusion. https://arxiv.org/abs/2505.07829
 - Gray, J., Kourtis, S. (2021). Hyper-optimized tensor network contraction. *Quantum* 5, 410.
 - Gustavson, F. G. (1978). Two Fast Algorithms for Sparse Matrices: Multiplication and Permuted Transposition. *ACM Trans. Math. Softw.* 4(3), 250–269. https://doi.org/10.1145/355791.355796
+- Milakov, M., Gimelshein, N. (2018). Online normalizer calculation for softmax. https://arxiv.org/abs/1805.02867
 - Moerkotte, G., Neumann, T. (2011). Accelerating Queries with Group-By and Join by Groupjoin. *PVLDB* 4(11), 843–851. https://www.vldb.org/pvldb/vol4/p843-moerkotte.pdf
 - Ngo, H. Q., Porat, E., Ré, C., Rudra, A. (2018). Worst-case Optimal Join Algorithms. *J. ACM* 65(3). (Conference version: PODS 2012.)
 - Pfeifer, R. N. C., Haegeman, J., Verstraete, F. (2014). Faster identification of optimal contraction sequences for tensor networks. *Phys. Rev. E* 90, 033315. https://arxiv.org/abs/1304.6112
+- Rabe, M. N., Staats, C. (2021). Self-attention Does Not Need O(n²) Memory. https://arxiv.org/abs/2112.05682
+- Ragan-Kelley, J., Barnes, C., Adams, A., Paris, S., Durand, F., Amarasinghe, S. (2013). Halide: A Language and Compiler for Optimizing Parallelism, Locality, and Recomputation in Image Processing Pipelines. *PLDI 2013.*
 - Selinger, P. G., Astrahan, M. M., Chamberlin, D. D., Lorie, R. A., Price, T. G. (1979). Access Path Selection in a Relational Database Management System. *SIGMOD 1979*, 23–34.
 - Sellis, T. K. (1988). Multiple-Query Optimization. *ACM Trans. Database Syst.* 13(1), 23–52.
 - Smith, D. G. A., Gray, J. (2018). opt_einsum: A Python package for optimizing contraction order for einsum-like expressions. *Journal of Open Source Software* 3(26), 753.
@@ -817,9 +876,11 @@ Papers:
 - Wang, Y. R., Hutchison, S., Leang, J., Howe, B., Suciu, D. (2020). SPORES: Sum-Product Optimization via Relational Equality Saturation for Large Scale Linear Algebra. *PVLDB* 13(12), 1919–1932. http://www.vldb.org/pvldb/vol13/p1919-wang.pdf
 - Wang, Y. R., Willsey, M., Suciu, D. (2023). Free Join: Unifying Worst-Case Optimal and Traditional Joins. *Proc. ACM Manag. Data* 1(2), Article 150. https://doi.org/10.1145/3589295
 - Willsey, M., Nandi, C., Wang, Y. R., Flatt, O., Tatlock, Z., Panchekha, P. (2021). egg: Fast and Extensible Equality Saturation. *Proc. ACM Program. Lang.* 5(POPL). https://arxiv.org/abs/2004.03082
+- Wu, M., Cheng, X., et al. (2025). Mirage: A Multi-Level Superoptimizer for Tensor Programs. *OSDI 2025.* https://arxiv.org/abs/2405.05751
 - Yan, W. P., Larson, P.-Å. (1995). Eager Aggregation and Lazy Aggregation. *VLDB 1995*, 345–357. https://www.vldb.org/conf/1995/P345.PDF
 - Yang, Y., Zhao, H., Yu, X., Koutris, P. (2024). Predicate Transfer: Efficient Pre-Filtering on Multi-Join Queries. *CIDR 2024.* https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf
 - Yannakakis, M. (1981). Algorithms for Acyclic Database Schemes. *VLDB 1981*, 82–94.
+- Zhan, Q., Hu, X., Xia, X., Li, S. (2026). Unleashing the Power of Equality Saturation for Tensor Program Superoptimization. https://arxiv.org/abs/2609.12330
 - Zhang, Y., Wang, Y. R., Flatt, O., Cao, D., Zucker, P., Rosenthal, E., Tatlock, Z., Willsey, M. (2023). Better Together: Unifying Datalog and Equality Saturation. *Proc. ACM Program. Lang.* 7(PLDI), Article 125. https://doi.org/10.1145/3591239
 
 Software and documentation:

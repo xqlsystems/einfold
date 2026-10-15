@@ -64,6 +64,7 @@ From the maintainer's review of the IR (#6):
   - Integer arithmetic wraps, and float arithmetic gives ±inf or NaN, so both are safe to move.
 - **Exact types stay exact.** `SUM` over integers or `DECIMAL` is exact in SQL. Detection rewrites only float sums, where reordering changes at most the last bits.
 - **A product is NULL exactly when one of its factors is NULL.** NaN and infinity are not NULL. So `COUNT` of a product is a sum of products of 0/1 indicators.
+- **A masked pair is an absent row, not a zero.** A dense kernel that gives masked pairs a weight of 0 turns a NaN in a masked value into NaN outputs that SQL computes from other rows (`0 · NaN` is NaN). Partly masked tiles must skip masked pairs (spike S27). The same holds for missing rows (spike S25).
 
 ## DataFusion 54.1.0 behaviors
 

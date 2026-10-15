@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # einfold: Fast Folds over Joins, for Tensors and the XQL Model
 
-Status: draft v15. Author: Alex Merose. Last updated: 2026-10-08. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
+Status: draft v16. Author: Alex Merose. Last updated: 2026-10-15. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
 
 This doc gives the design and the reasons for it. Its companion, the [supplement](supplement.md), holds the details: algorithms, rule tables, correctness arguments, and the evidence from spikes. The supplement's sections are numbered to match this doc's.
 
@@ -30,10 +30,11 @@ einfold makes tensor computation, and more generally aggregation over joins, fas
 6. **Users declare, einfold proves.** Anything that changes results (filters, masks, approximations) is written in plain SQL. einfold infers only optimizations it can prove exact, such as skipping exact zeros (section 9.2).
 7. **Tiling is part of the algebra.** Following Cubed, a tiled computation is a block-level einsum or a change of tiling, and plans over a memory budget are rejected at planning time (section 9.4).
 8. **Programs, not just queries.** einfold optimizes one plan at a time, or a whole program of plans that read each other's results, such as a training step (section 7.3).
+9. **Fold pipelines.** A fold may consume another fold's results through a nonlinear map, as attention's output consumes its scores through `exp`. einfold fuses such pipelines tile by tile, so the intermediate never exists in full. With masks as absent rows and softmax as an algebraic fold over a scaled accumulator, this is how einfold finds FlashAttention's plan in plain SQL: the research target after M1 (sections 9.6 and 16, [`demos.md`](demos.md) demo 1).
 
 **Origin.** einfold grew out of [ddx](https://github.com/xqlsystems/ddx), an XQL Systems project for automatic differentiation of SQL queries. Given a query that computes a function (for example a small neural network written as joins and aggregates), ddx produces the queries that compute its gradients. Training a model this way is mostly contractions, and their slowness motivated einfold. ddx benefits from einfold but does not depend on it.
 
-**Status.** Twenty-two of twenty-five design spikes are done (section 13). Their outcomes are folded into this doc; their reports are in [`docs/spikes/`](spikes/README.md). einfold has not yet shown a speedup inside a host. The first implementation of M1, a hash-based EinFold, ran at 0.11–0.6× of plain DataFusion on ddx's workloads ([`docs/lessons.md`](lessons.md)). Spike S21 then measured the room there is: hand-written dense, positional kernels beat DataFusion and DuckDB by 4–14× on ddx's matrix products and 13–48× on its attention. v14 ordered the roadmap by value, dense kernels first, and gated every milestone on beating the host on its benchmark (section 16). v15 follows a design review (issue #30) and spikes S22–S25. ddx's gradient steps are not the two-table products S21 timed, and a detector for those would match only 13–32% of their time. But a fold node that ddx emits directly, run by a dense kernel that also writes ddx's "fill" rows, runs `matmul`'s gradient steps 33–57× faster (section 3). So M1 is now an explicit fold that a plan producer emits, and detection moves to M2. The machinery that later milestones need (the egglog optimizer, tiling and GPU hosts) is designed here, but deferred until the earlier milestones have paid off.
+**Status.** Twenty-four of twenty-seven design spikes are done (section 13). Their outcomes are folded into this doc; their reports are in [`docs/spikes/`](spikes/README.md). einfold has not yet shown a speedup inside a host. The first implementation of M1, a hash-based EinFold, ran at 0.11–0.6× of plain DataFusion on ddx's workloads ([`docs/lessons.md`](lessons.md)). Spike S21 then measured the room there is: hand-written dense, positional kernels beat DataFusion and DuckDB by 4–14× on ddx's matrix products and 13–48× on its attention. v14 ordered the roadmap by value, dense kernels first, and gated every milestone on beating the host on its benchmark (section 16). v15 follows a design review (issue #30) and spikes S22–S25. ddx's gradient steps are not the two-table products S21 timed, and a detector for those would match only 13–32% of their time. But a fold node that ddx emits directly, run by a dense kernel that also writes ddx's "fill" rows, runs `matmul`'s gradient steps 33–57× faster (section 3). So M1 is now an explicit fold that a plan producer emits, and detection moves later (M3, as of v16). v16 aims the research after M1 at demo 1, rediscovering FlashAttention from SQL ([`demos.md`](demos.md)). Spike S27 ran the demo's query on the hosts. DataFusion fails at 8,192 tokens and DuckDB at 16,384, both holding all `N²` scores, while a hand-written fused kernel on the same rows is 280–390× faster than the faster host and runs at 65,536 tokens. The machinery that later milestones need (the egglog optimizer, tiling under a memory budget and GPU hosts) is designed here, but deferred until the earlier milestones have paid off.
 
 ## 2. Background
 
@@ -78,6 +79,8 @@ Contracted axes become join keys; output axes become group keys. Blacher et al. 
 3. **An algebraic fold.** `AVG(a.v * b.v)` is `SUM(a.v * b.v) / COUNT(a.v * b.v)`, two semiring folds over one join followed by a final division, so it gets everything level 2 gets.
 
 The levels follow the classes of aggregates in Gray et al.'s data-cube paper ("Data Cube: A Relational Aggregation Operator", 1997), which sorts aggregates by the state a partial result must carry. A *distributive* aggregate (`SUM`, `COUNT`, `MIN`, `MAX`, `BOOL_AND`) folds each value, perhaps lifted first (`COUNT` lifts it to 1), with one operation. An *algebraic* aggregate (`AVG`, and in principle variance, covariance and regression) is a fixed tuple of distributive ones plus a final function. Three classes are not folds einfold handles yet: *holistic* aggregates (`MEDIAN`, `COUNT(DISTINCT)`), whose state grows with the input; *approximate* ones (`approx_distinct`), whose state is a mergeable sketch; and *order-dependent* ones (`STRING_AGG`, `FIRST_VALUE`), which are out of scope.
+
+**Fold pipelines.** Folds often feed folds. In attention, the scores `s(i, j) = Σ_e q(i, e)·k(j, e)` are one fold. The output `x(i, d) = Σ_j e^(s(i,j) − m(i))·v(j, d) / Σ_j e^(s(i,j) − m(i))`, with `m(i)` the row's largest score, is another, and reads the scores through `exp`. The maximum cancels, so the output is an algebraic fold: a weighted average with weights `e^(s)` (Rabe and Staats, 2021). The maximum only keeps `exp` from overflowing, which is the accumulator's job (section 8.6). When every group of the first fold is a group of the second paired with a value of a dimension the second sums away, the two can run as one loop over tiles, and the first fold's results never exist in full (section 9.6). That is FlashAttention's plan.
 
 This doc teaches with einsums, the most familiar case, and says where the general fold differs.
 
@@ -171,7 +174,8 @@ einfold sits where three vocabularies meet: XQL and Xarray, einsum notation, and
 | **Row value**, **factor** | What each joined row contributes. When it is a product, each operand contributes one **factor**: an expression over that operand's columns alone |
 | **Semiring fold** | A fold whose row value is a ⊗-product of factors, and whose aggregate is a ⊕ that ⊗ distributes over. A property derived from the fold, which unlocks the algebraic rewrites |
 | **Einsum** | The sum-product semiring fold: `SUM` of products |
-| **Mask** | An operand that only filters which rows join, contributing no value: its factor is ⊗'s identity (section 9.1) |
+| **Mask** | An operand that only filters which rows join, contributing no value: its factor is ⊗'s identity (section 9.1). A masked pair is an absent row, not a zero (section 8.3) |
+| **Fold pipeline** | Folds where one fold's row value reads another fold's result, as attention's output reads its scores. Fusable when the producer's groups are the consumer's groups paired with values of a dimension the consumer sums away (section 9.6) |
 | **Fact** | Something known about an operand or a dimension, tagged with how it is known (section 8.1) |
 
 **Evaluation and execution:**
@@ -179,7 +183,7 @@ einfold sits where three vocabularies meet: XQL and Xarray, einsum notation, and
 | Term | Meaning |
 |---|---|
 | **Partial aggregate** | A group's state over part of the input, mergeable with other parts: whether any row reached the group, plus the aggregate's own state (section 8.3) |
-| **Accumulator** | How an aggregate state's additions are computed numerically, such as plain `f64` or a binned reproducible sum (section 8.6) |
+| **Accumulator** | How an aggregate state's additions are computed numerically, such as plain `f64`, a reproducible sum, or a scaled exponential accumulator for softmax (section 8.6) |
 | **Contraction**, **contraction tree** | One step of a semiring fold: join two operands, and aggregate away the dimensions nothing else needs. A tree of them evaluates the fold |
 | **EinFold** | einfold's fused join-and-fold operator, for any fold (section 10.2). The capitalized name is the operator; lowercase **einfold** is the package |
 | **Relational form**, **extension form** | einfold's two output forms: standard joins and aggregates, or a `Fold` Substrait relation (section 7.2) |
@@ -342,6 +346,8 @@ A row marks its group as reached before its value is tested for NULL. So a group
 
 Dense kernels need existence too. A dense array stores a missing row, or a NULL factor, as 0. That is right for `SUM`, until a NaN or an infinity meets it: 0·∞ is NaN, but SQL forms no product for a missing row and skips a NULL one. A dense kernel must therefore know which rows exist (an Exact completeness fact, or a check), or fall back to a hash path (spike S25).
 
+**Masks are absent rows.** The same holds for masks. A pair a mask removes is a row that doesn't exist: it contributes nothing to any sum, and a group reached only through masked pairs doesn't exist. A dense kernel that gives masked pairs a weight of 0 is wrong: `0 · NaN` is NaN, so a NaN in a masked value spreads to groups SQL computes from other rows. Spike S27's first fused attention kernel did exactly this. A partly masked tile must skip masked pairs, not zero them.
+
 **Fill.** A fold may carry a third relation, its **fill**, whose rows its output has: each fill row gets its group's result, 0 where no row reached the group, and NULL where the fill row's own value is NULL. In SQL this is the fold left-joined from the fill table, which is how ddx gives every input row a gradient. A dense kernel writes every position anyway, so it computes the fill for free, where the left join costs a hash join over the output (S22).
 
 ### 8.4 Order is a layout
@@ -365,8 +371,9 @@ Floating-point addition is not associative, so a parallel sum can differ in its 
 3. **Exactness invariant.** Exact values stay exact: `COUNT`, `MIN`, `MAX`, integers and `DECIMAL`, and any value a comparison, filter, join key, ordering or `LIMIT` depends on. Rewrites that could overflow an exact type apply only when facts prove they cannot.
 4. **Determinism is a setting on hosts,** off by default, like every engine's. When requested, einfold uses only the deterministic mechanisms the host's profile lists, such as a single partition or `DECIMAL`, or leaves the subplan unchanged and says why.
 5. **Determinism is the default where einfold executes:** in `EinFoldExec` and in the `Fold` relation's spec. On CPU it comes free from **fixed blocks chosen from the shape alone**: work is split into blocks of output rows, or of the contracted dimension when the output is small, independent of the thread count, and partial results are added in block order. Rows are visited in position order, not arrival order, which hosts don't fix (S3). Spike S24 found this gives one bit pattern across thread counts and arrival orders at the speed of the non-deterministic kernels (one build on one machine; GEMM libraries choose kernels by CPU features). Where the order can't be fixed, as with GPU atomics, a **reproducible accumulator** gives the same bits in any order: ReproBLAS's one-pass indexed type, which needs no maximum in advance. It costs 3–4.4× a plain sum (S8) and 2–25× the best deterministic kernel inside a contraction (S24), so it is used only there, or when precision `highest` is requested. It was also more accurate than the plain sum. Repeatability is not accuracy: a fixed order repeats the same rounding every time.
-6. **Precision is its own setting,** with levels `fast`, `default` and `highest`, after JAX's.
-7. **Warn where small differences become big ones,** when a float sum feeds a filter, ordering, tie or join.
+6. **Sums of exponentials use a scaled accumulator.** A softmax-weighted sum adds terms `e^(s)`, which overflow for `s` above about 709. SQL avoids that by subtracting the row's maximum first. einfold's equivalent is an accumulator, not a rewrite. It holds a sum of exponentials as a pair `(m, Σ e^(s − m)·y)`, and when a larger `s` arrives, it raises `m` and multiplies the sum by `e^(m_old − m_new)`. Merging two pairs is associative and commutative, so partial results combine as for any fold. Every exponent is at most 0, so nothing overflows, which the float guard of item 2 would otherwise have to prove. Each rescaling adds one rounding of `exp` to the terms already summed, so a result is equivalent when it is within the summation bound of item 2, widened by one `exp` rounding per rescaling. The number of rescalings is at most the number of tiles a group's terms span. On special values the accumulator must give what SQL gives: a NaN or `+∞` score makes its row NaN, and a row whose scores are all `−∞` is NaN. S27 checked these against DataFusion. This accumulator is the online softmax (Milakov and Gimelshein, 2018).
+7. **Precision is its own setting,** with levels `fast`, `default` and `highest`, after JAX's.
+8. **Warn where small differences become big ones,** when a float sum feeds a filter, ordering, tie or join.
 
 The supplement (section 8.6) gives the full policy and the measurements.
 
@@ -376,7 +383,7 @@ The logical optimizer rewrites folds without choosing how each node runs. Detect
 
 ```mermaid
 flowchart LR
-  a["Detect and normalize<br/>(9.1)"] --> b["Prune<br/>(9.2)"] --> c["Plan contraction tree<br/>(9.3)"] --> d["Choose tiling<br/>(9.4)"] --> e["Share across folds<br/>(9.5)"]
+  a["Detect and normalize<br/>(9.1)"] --> b["Prune<br/>(9.2)"] --> c["Plan contraction tree<br/>(9.3)"] --> d["Choose tiling<br/>(9.4)"] --> e["Share across folds<br/>(9.5)"] --> f["Fuse pipelines<br/>(9.6)"]
 ```
 
 ### 9.1 Detect and normalize
@@ -430,13 +437,38 @@ In a query, a tiling becomes a partition key; when it matches the Zarr chunks, p
 
 Folds that read the same operand can share one scan of it. In program mode, that includes steps of a ddx program, such as the two gradient contractions of a layer, which both read the output gradient. Identical subexpressions are computed once, which the e-graph provides for free.
 
+### 9.6 Fuse fold pipelines
+
+A **fold pipeline** is a fold whose row value reads another fold's result, through any expression. In attention, the output fold reads the scores fold through `exp`. Hosts run each fold to completion, so the first fold's results exist in full: for attention, `N²` scores. einfold fuses the pair when the **producer's groups are the consumer's groups paired with values of dimensions the consumer sums away**. For attention, the scores' groups `(i, j)` are the output's groups `i` paired with the summed dimension `j`. Then:
+
+- the consumer's groups are partitioned into tiles, and for each tile, the dimensions it sums away are streamed tile by tile;
+- each producer tile is computed completely, summing all of the producer's own dimensions (attention's features `e`), then mapped, then folded into the consumer's state, and dropped.
+
+So memory holds one producer tile per thread, and nothing materializes in full. This is loop fusion, in the sense of Halide's `compute_at`, applied to folds over joins.
+
+**What makes it correct.**
+- *Existence.* A producer group that doesn't exist contributes no row to the consumer. Masked pairs are absent rows, not zeros (section 8.3).
+- *Values.* The consumer folds exactly the values the host would have: each producer result is complete before it is mapped. Only the order of the consumer's additions changes, which section 8.6 bounds.
+- *Normalization.* When the consumer is a normalized sum, it is computed as an algebraic fold, not as three folds. A normalized sum is `exp(s − max)` divided by its sum over the same group, spelled either with a window, `MAX(s) OVER (PARTITION BY i)`, or with `GROUP BY i` and a join back, as ddx writes it. Division inside the sum, `SUM(w / z · y)`, is the same thing, since `z` is constant within the group. The algebraic fold is `Σ e^(s)·y / Σ e^(s)`, both sums in the scaled exponential accumulator of section 8.6. Only the shift changes, from the row's final maximum to a running one, and the bound accounts for it.
+
+**What makes it general.** No rule mentions attention. The fusion rule needs only the group condition above. The normalization rule needs only the pattern `exp(s − max)` over a sum. Masks come from any predicate on dimensions (section 9.1). Each rule must also fire on a query that isn't attention, such as a Gaussian-kernel weighted average `SUM(exp(−dist²/h²)·y) / SUM(exp(−dist²/h²))` over a join of target and source points (the Nadaraya–Watson estimator, used in regridding). This is what "without being told about FlashAttention" means.
+
+**Where it runs.** Only in the extension form: `EinFoldExec` runs a pipeline node (section 10.2). In the relational form, the consumer can be split into per-tile partial states, combined with the accumulator's merge, but a host's hash aggregation still keeps every producer group until the producer finishes, so the memory criterion fails.
+
+**Precedents.** Three systems rediscover FlashAttention from tensor programs:
+- Mirage (Wu et al., 2025) searches kernel, block and thread levels at once;
+- Blockbuster (Dekel, 2025) fuses by modeling data movement between memory tiers;
+- EqiForge (Zhan et al., 2026) uses equality saturation, with a rule for fusing a reduction into a later one that depends on it.
+
+The last is a precedent for egglog here, if hand-written rules prove too narrow. einfold's setting differs from all three: SQL semantics, masks as absent rows, and a plan for someone else's engine.
+
 ## 10. Physical realization
 
 Each node of the contraction tree becomes either a relational join-aggregate or an EinFold operator, chosen per subplan by the target profile.
 
 ### 10.1 The relational form: eager aggregation
 
-For a semiring fold, aggregate away a dimension as soon as no later step needs it. Over a whole contraction tree, each node becomes one CTE that joins its two inputs and groups by its kept dimensions. This is exact under SQL semantics, NULLs included, because ⊗ distributes over ⊕: for einsums, multiplication over addition (supplement section 10.1). Over floats it is exact only up to rounding, and only without overflow: it applies to float sums under the guard of section 8.6 (spike S23). It helps whenever a node aggregates a dimension away, as in chains of three or more operands, multi-way gradient contractions, and marginals. It does nothing for a plain matrix product, which needs EinFold. An algebraic fold is rewritten through its parts: `AVG(a·b)` becomes a `SUM` and a `COUNT` over the same tree (Yan and Larson's "eager count"), divided at the end. Folds that are neither keep their joins below a single aggregate.
+For a semiring fold, aggregate away a dimension as soon as no later step needs it. Over a whole contraction tree, each node becomes one CTE that joins its two inputs and groups by its kept dimensions. This is exact under SQL semantics, NULLs included, because ⊗ distributes over ⊕: for einsums, multiplication over addition (supplement section 10.1). Over floats it is exact only up to rounding, and only without overflow: it applies to float sums under the guard of section 8.6 (spike S23). It helps whenever a node aggregates a dimension away, as in chains of three or more operands, multi-way gradient contractions, and marginals. It does nothing for a plain matrix product, which needs EinFold. An algebraic fold is rewritten through its parts: `AVG(a·b)` becomes a `SUM` and a `COUNT` over the same tree (Yan and Larson's "eager count"), divided at the end. Folds that are neither keep their joins below a single aggregate. Fold pipelines need the extension form: in the relational form, the producer's results exist in full (section 9.6).
 
 ### 10.2 The extension form: EinFold
 
@@ -445,12 +477,19 @@ EinFold fuses the aggregate into the join, so join rows never exist: each joined
 - **Dense, positional algorithms.** When the dimensions are dense ranges, coordinates are positions, and an output group is an array index: no hashing at all. Dictionary encoding gives positions for other keys. Two kernels cover the einsum: a GEMM over both operands made dense, and a positional *fold* that makes only one operand and the output dense, and streams the other operand's rows, adding each row's value times a row of the dense operand into an output row. Other semirings need their own dense kernels (a "tropical GEMM" for min-plus), which hosts may lack. These come first (section 16).
 - **Hash algorithm.** Its core is Gustavson's 1978 sparse matrix multiply, generalized to folds. One input is built into a table keyed by the shared dimensions, and the other is streamed against it. Each output row's state lives in Gustavson's arrays: the partial aggregates, the columns touched, and a "multiple switch" that never needs clearing between rows. When the streamed input arrives grouped by the output's leading dimensions, only one output row's state is live at a time.
 - **Block-sparse algorithm.** When support is known by tile, as with missing chunks or masks, EinFold runs Gustavson's algorithm over tiles, calling dense kernels per tile and masked kernels for partly masked tiles. This is how FlashAttention tiles causal attention.
+- **Fused pipeline algorithm.** For a fold pipeline (section 9.6), loop over tiles of the consumer's groups, and within each, over tiles of the dimensions it sums away, in position order. For each pair of tiles:
+  - classify it against the masks as empty, full or partial, from the predicate and the tiles' position bounds, which needs a monotonic coordinate map (section 9.1);
+  - skip it if empty;
+  - otherwise compute the producer's tile with a GEMM, map it, and fold it into the consumer's state in the accumulator, skipping masked pairs in a partial tile.
+
+  Tile sizes are chosen from the shape alone, and each consumer tile is owned by one thread, so the bits don't depend on the thread count (section 8.6). Memory is a few tiles per thread.
 
 Two spikes measured them on CPU:
 
 - **Against the hosts (S21).** On ddx's matrix products and attention, the positional kernels beat the faster of DataFusion and DuckDB by 4–14× and 13–48×, from Arrow rows to Arrow rows. Writing the output rows bounds the win as outputs grow. M1's first EinFold, a hash algorithm with generic per-value state, ran at 0.11–0.6× of DataFusion on the same shapes.
 - **Inside ddx's programs (S25).** As a DataFusion operator computing a fold and its fill, the dense path ran `matmul`'s two gradient steps in 28 ms where ddx's SQL took 1,235 ms.
 - **Deterministically (S24).** With fixed, shape-chosen blocks and position order, both kernels give the same bits for any thread count and arrival order, at no cost.
+- **Fused attention (S27).** On demo 1's causal attention, from rows to rows, a fused kernel with 64 × 64 tiles and an online softmax was 280–390× faster than DuckDB and 500–2,000× faster than DataFusion, and skipped half the key tiles. It was more accurate than DataFusion (errors of 1–5e-15 of the largest output, against 0.6–9e-14), with identical bits across thread counts. Both hosts ran out of memory by 16,384 tokens; the kernel ran 65,536 in 5 s, holding one tile of scores per thread.
 - **Against each other (S11).** Dense GEMM beats Gustavson's algorithm above about 20% density. S11's further result, that Gustavson's algorithm beats a hash join with hash aggregation by 2.5–17×, compared it with the spike's own single-threaded loop, not with a SQL engine, and does not transfer to hosts.
 
 ### 10.3 Output order
@@ -476,6 +515,7 @@ Worst-case optimal joins, for cyclic sparse einsums such as triangle counting, a
 - **Zeros and masks.** Check inferred zero elimination against the unrewritten plan on inputs that break each of its three conditions (NaN or infinite factors, groups reached only by zeros), and check masks against the SQL predicate they replace.
 - **Gradients.** With einfold enabled, ddx's gradients still match those computed by JAX's `jax.grad` (ddx's `tests/test_v2_jax.py`), and match ddx's own SQL gradients on random tables with NULLs, NaNs, infinities, missing rows and duplicate keys in constant data, as in spikes S22 and S25.
 - **Speed.** Every milestone is gated on beating the host on its benchmark (section 16). ddx's `matmul` and `attn` (attention) benchmark families (`crates/ddx-datafusion/tests/ad_perf.rs`), forward and backward, with einfold on and off, timed end to end (`ad::run`), not only the contractions. Measure the symbolic–numeric split separately: the first training step against later steps.
+- **Pipelines.** Fused pipelines match the unfused SQL within section 8.6's bound for the scaled accumulator, on ill-conditioned scores. They give exactly SQL's result on NaN and infinities in every input, and on rows that masks empty or leave with scores all `−∞`. Every fusion and normalization rule is also tested on a query that isn't attention (section 9.6).
 - **Bits versus math.** Rewrites change summation order, so plain float results may differ. Equivalence tests compare against the bound in section 8.6, on inputs that stress it: ill-conditioned sums, signed zeros, NaNs and infinities, not only values whose sums are exact in any order. Determinism tests compare the same plan across runs bit for bit. ddx currently tolerates last-bit differences. ddx's tests that use einfold's reference executor, which is deterministic by default (section 8.6), should also check that repeated runs give identical bits.
 
 ## 12. Integration
@@ -495,7 +535,7 @@ What stays in ddx, such as caching each training step's physical plan, is listed
 
 ## 13. Spikes
 
-A spike is a short, time-boxed experiment that answers one design question. Twenty-two of twenty-five are done, and three are blocked on access:
+A spike is a short, time-boxed experiment that answers one design question. Twenty-four of twenty-seven are done, and three are blocked on access:
 
 - S6 (GQE) needs access to NVIDIA's GPU Query Engine.
 - S9 (Zax-SQL) needs an Earthmover account.
@@ -505,11 +545,12 @@ The spike index, [`docs/spikes/README.md`](spikes/README.md), lists each spike w
 
 ## 14. Open questions
 
-- **Further semirings and aggregates.** RFC 0001 made the fold central, and folds are described by their operations and the laws relating them, so any (⊕, ⊗) pair where ⊗ distributes over ⊕ is a semiring. M1 supports `SUM` of products, and M3 adds `COUNT`, `AVG`, `MIN` and `MAX`; conditional laws (`MAX` of products needs non-negative factors) wait for facts that prove them. Open: the log-sum-exp semiring behind softmax, and dense kernels for semirings other than sum-product. Order-sensitive aggregates such as `STRING_AGG` are out of scope for now.
+- **Further semirings and aggregates.** RFC 0001 made the fold central, and folds are described by their operations and the laws relating them, so any (⊕, ⊗) pair where ⊗ distributes over ⊕ is a semiring. M1 supports `SUM` of products, and M4 adds `COUNT`, `AVG`, `MIN` and `MAX`; conditional laws (`MAX` of products needs non-negative factors) wait for facts that prove them. Softmax needs no new semiring: it is an algebraic fold over a scaled accumulator (sections 8.6 and 9.6). Open: dense kernels for semirings other than sum-product. Order-sensitive aggregates such as `STRING_AGG` are out of scope for now.
 - **Scaling the planner inside extraction.** Spike S17 settled how extraction and planning couple: egglog's cost model runs the contraction planner on each region's operands, so extraction sees planned costs (section 7.6). What remains is speed for large regions. egglog calls the cost function again whenever a child's cost improves, so it needs a cache of planned costs per operand multiset, and an incremental planner beyond a few hundred operands.
 - **The tile-size proposer.** Extraction can only choose sizes the proposer offers (spike S20). Which sizes to propose for general folds, beyond storage sizes, their least common multiples and halvings, is open.
 - **Upstream reports.** Bugs found by the spikes, not yet filed: DataFusion's `Unparser` drops predicates of a decorrelated subquery (TPC-H Q22) and refers to tables outside unaliased subqueries (S7); zarr-datafusion pairs a lower-dimensional data variable with its dimension wrongly (S1), and its pushed-down aggregates accumulate integers in `f64` (S12). Each needs the maintainers, and the author's go-ahead.
-- **Gaps found by the demos** ([`demos.md`](demos.md)): the online softmax's state (maximum, normalizer, weighted sum) is a fold that EinFold can compute under RFC 0001, but no algebraic rewrite yet covers it; fusion across folds with a nonlinear step between them; detecting window functions such as `MAX(s) OVER (PARTITION BY i)`; and semi-join reduction through plans many layers deep.
+- **Gaps found by the demos** ([`demos.md`](demos.md)): demo 1's gaps (fusion across folds, the online softmax and softmax detection) are designed in v16 (sections 8.6 and 9.6). Open: semi-join reduction through plans many layers deep (demo 3), and fusing pipelines of more than two folds, such as a transformer block (demo 2).
+- **The fusion search.** Demo 1 needs one fusion, which a hand-written rule can make. Pipelines of many folds, where fusing one pair rules out fusing another, may need a search. That is the case for egglog (section 7.6), with EqiForge as the precedent (section 9.6).
 - **Explicit API.** Offer an `einsum(...)` table function next to automatic detection? Useful for users and tests.
 - **Extension governance.** Where does the `Fold` relation's spec live, and is it proposed upstream to Substrait?
 - **Benchmarks.** Dataset sizes, hardware, and pass/fail thresholds for section 15.
@@ -519,6 +560,7 @@ The spike index, [`docs/spikes/README.md`](spikes/README.md), lists each spike w
 
 | Workload | Tests | Hosts |
 |---|---|---|
+| Attention in plain SQL ([`demos.md`](demos.md) demo 1), causal, forward | Fold pipelines, masks as absent rows, the scaled accumulator, peak memory independent of `N` | DataFusion (reference executor), against DataFusion and DuckDB |
 | Matrix multiplication and attention (ddx), forward and backward | Contraction planning, EinFold, extension form, shared scans | DataFusion, GQE, DuckDB+gpudb (exact types only, since gpudb never moves float `SUM` to the GPU), DuckDB+Sirius |
 | Geoscience on Zarr (ERA5): EOFs (empirical orthogonal functions, the principal components of a climate field), weighted means, regridding | Variable separation, eager aggregation, tiling, reduction at the source, data larger than memory | xarray-sql, duckdb-zarr, zarr-datafusion |
 | Sparse and graph: sparse matrix multiplication, einsums over sparse dimensions | EinFold's hash and block-sparse algorithms, pruning | DataFusion, GQE |
@@ -535,15 +577,28 @@ Each benchmark runs with einfold off and on, on the same host. That is the measu
 
 The milestones are ordered by the value each delivers, and each is **gated**: it is done when einfold, on, beats the same host with einfold off on the named benchmark. If a milestone can't pass its gate, we learn why before building on it.
 
-1. **M0: Spikes S1–S25.** Done except S6, S9 and S15, which are blocked on access. Outcome: facts travel in a side channel filled by per-reader providers (section 8.1); target profiles record plan protection (section 9.3), unparsing rules (section 7.3) and aggregate pushdown routes (section 10.5); S21 measured the host baseline; S22–S25 found where ddx's time goes, the float guard, the deterministic kernels, and that an explicit fold from ddx pays.
-2. **M1: Explicit folds for ddx, in DataFusion.** A `Fold` logical node for a two-operand `SUM` of products over `DOUBLE` values, with an optional fill relation (section 8.3), which a plan producer emits directly; ddx emits it for its gradient contractions, through its Substrait plans (the first, minimal piece of the extension form, section 7.2). `EinFoldExec` runs it: dense positional kernels (the fold and GEMM) when keys are dense integer ranges and existence is known, and a hash path with SQL's bag semantics otherwise; fixed, shape-chosen blocks, so results are deterministic (section 8.6); the fill written as part of the output. `EinFoldExec` behaves like any DataFusion operator: it reserves memory from the memory pool, uses every core, emits batches of the session's batch size, and reports metrics to `EXPLAIN ANALYZE`. No detection: plans without a `Fold` node are untouched. Verified as in section 11. **Gate:** ddx's `matmul` gradient program, end to end (`ad::run`), at least 4× faster at n = 50,000 than ddx's SQL on the same DataFusion; ddx's gradients unchanged on the random-table property tests; the same bits across thread counts.
-3. **M2: Detection, eager aggregation and contraction order.** Detect folds in DataFusion plans, including the shapes producers write: more than two operands, existence tests such as ddx's NULL guard (S22), and a fill joined back. Then, for three or more operands, aggregate dimensions away early under the float guard (section 8.6) and choose the order of contractions with the greedy planner (section 9.3), first as hand-written rules in the relational form, on DataFusion and DuckDB. egglog (section 7.6) comes in only when the rule set outgrows hand-written code. Plan protection per S10: `MATERIALIZED` CTEs on DuckDB, plain CTEs on DataFusion. Alongside it, run detection over real xarray-sql plans and report how many it matches, to steer M3. **Gate:** faster than each host on ddx's attention gradient (whose largest steps S22 found are a region join and softmax cotangents, not two-table products) and on a chain of three or more products; no plan changes and no slowdown on TPC-H.
-4. **M3: Facts, Zarr and wider detection.** `einfold-zarr` and layout facts, so positions come from storage; existence tracking for incomplete inputs (section 8.3); `float32` and integer variables; several aggregates per query, aggregates without `GROUP BY` (such as global weighted means), and `COUNT`, `AVG`, `MIN` and `MAX`, prioritized by M2's measured hit rate. Variable separation and distributivity (9.1), reduction at the source (10.5), and integration with xarray-sql, zarr-datafusion and duckdb-zarr. **Gate:** ERA5 benchmarks.
-5. **M4: Sparse EinFold.** Gustavson's hash algorithm and the block-sparse algorithm (10.2), support pruning including exact zeros (9.2), masks (9.1), and run-time switching between dense and sparse (10.4). **Gate:** sparse and graph benchmarks (section 15).
-6. **M5: Extension form and program mode.** The `Fold` relation's spec and conformance tests, program mode with program-level caching, shared scans (9.5), and other hosts: DuckDB+gpudb, DuckDB+Sirius and GQE.
-7. **M6: Tiling.** Execution tiling and slicing as e-graph terms with a memory budget (9.4), partly masked tiles (10.2), dynamic-programming and exhaustive contraction planners, retiling cost in contraction planning, and output order (10.3).
-8. **M7: GPU adoption (medium term).** Work with the GQE, Sirius, and/or `gpudb` maintainers to run the extension form on GPU. Sirius is the most natural first partner, because it already runs Substrait plans on GPU and describes itself as composable.
-9. **Later.** Worst-case optimal joins (10.6).
+1. **M0: Spikes S1–S27.** Done except S6, S9 and S15, which are blocked on access. Outcome: facts travel in a side channel filled by per-reader providers (section 8.1); target profiles record plan protection (section 9.3), unparsing rules (section 7.3) and aggregate pushdown routes (section 10.5); S21 measured the host baseline; S22–S25 found where ddx's time goes, the float guard, the deterministic kernels, and that an explicit fold from ddx pays; S27 measured demo 1's room on the hosts.
+2. **M1: Explicit folds for ddx, in DataFusion.** A `Fold` logical node for a two-operand `SUM` of products over `DOUBLE` values, with an optional fill relation (section 8.3), which a plan producer emits directly; ddx emits it for its gradient contractions, through its Substrait plans (the first, minimal piece of the extension form, section 7.2). `EinFoldExec` runs it: dense positional kernels (the fold and GEMM) when keys are dense integer ranges and existence is known, and a hash path with SQL's bag semantics otherwise; fixed, shape-chosen blocks, so results are deterministic (section 8.6); the fill written as part of the output. `EinFoldExec` behaves like any DataFusion operator: it reserves memory from the memory pool, uses every core, emits batches of the session's batch size, and reports metrics to `EXPLAIN ANALYZE`. No detection: plans without a `Fold` node are untouched. Verified as in section 11. **Gate:** ddx's `matmul` gradient program, end to end (`ad::run`), at least 4× faster at n = 50,000 than ddx's SQL on the same DataFusion; ddx's gradients unchanged on the random-table property tests; the same bits across thread counts. M1's `Fold` node, dense deterministic kernels and existence rules are what M2's pipelines are built from.
+3. **M2: Demo 1, FlashAttention from SQL.** Two-fold pipelines (section 9.6) in `EinFoldExec`, built on M1's node and kernels:
+   * the fused pipeline algorithm (section 10.2), with tile sizes chosen from the shape;
+   * masks from predicates on dense dimensions, with tile pairs classified as empty, full or partial, and masked pairs skipped rather than zeroed. This is the first piece of M5's masks;
+   * the scaled exponential accumulator (section 8.6).
+
+   The pipeline node can be emitted by a producer, as in M1, and is also detected in demo 1's SQL, in both its window and `GROUP BY` spellings. This is einfold's first detection, deliberately narrow: the pipeline pattern only. **Gate:** demo 1's success criteria ([`demos.md`](demos.md)):
+   * peak memory beyond inputs and output independent of `N`;
+   * about half the key tiles skipped under the causal mask;
+   * within section 8.6's bound, and exactly SQL's results on special values and masked rows;
+   * the same bits across thread counts;
+   * faster than DataFusion and DuckDB at every `N` where they finish, and running where they exceed their memory budget;
+   * both spellings found;
+   * the same rules fusing a query that isn't attention, a Gaussian-kernel weighted average.
+4. **M3: Detection, eager aggregation, contraction order, and demo 1 backward.** Detect folds in DataFusion plans, including the shapes producers write: more than two operands, existence tests such as ddx's NULL guard (S22), and a fill joined back. Then, for three or more operands, aggregate dimensions away early under the float guard (section 8.6) and choose the order of contractions with the greedy planner (section 9.3), first as hand-written rules in the relational form, on DataFusion and DuckDB. egglog (section 7.6) comes in only when the rule set outgrows hand-written code. Plan protection per S10: `MATERIALIZED` CTEs on DuckDB, plain CTEs on DataFusion. Demo 1's backward pass: the gradient of a pipeline is a pipeline over the same tiles, which recomputes the producer's tiles from a saved row statistic `m + log z`, as FlashAttention's backward pass does. S22 found this is where ddx's attention gradient spends its time: a region join of `N²` rows and the softmax cotangents. Alongside it, run detection over real xarray-sql plans and report how many it matches, to steer M4. **Gate:** faster than each host on ddx's attention gradient (whose largest steps S22 found are a region join and softmax cotangents, not two-table products) and on a chain of three or more products; no plan changes and no slowdown on TPC-H.
+5. **M4: Facts, Zarr and wider detection.** `einfold-zarr` and layout facts, so positions come from storage; existence tracking for incomplete inputs (section 8.3); `float32` and integer variables; several aggregates per query, aggregates without `GROUP BY` (such as global weighted means), and `COUNT`, `AVG`, `MIN` and `MAX`, prioritized by M3's measured hit rate. Variable separation and distributivity (9.1), reduction at the source (10.5), and integration with xarray-sql, zarr-datafusion and duckdb-zarr. **Gate:** ERA5 benchmarks.
+6. **M5: Sparse EinFold.** Gustavson's hash algorithm and the block-sparse algorithm (10.2), support pruning including exact zeros (9.2), masks beyond M2's (9.1), and run-time switching between dense and sparse (10.4). **Gate:** sparse and graph benchmarks (section 15).
+7. **M6: Extension form and program mode.** The `Fold` relation's spec and conformance tests, program mode with program-level caching, shared scans (9.5), and other hosts: DuckDB+gpudb, DuckDB+Sirius and GQE.
+8. **M7: Tiling.** Execution tiling and slicing, including of pipelines, as e-graph terms with a memory budget (9.4), dynamic-programming and exhaustive contraction planners, retiling cost in contraction planning, output order (10.3), and pipelines of more than two folds, such as a transformer block (demo 2).
+9. **M8: GPU adoption (medium term).** Work with the GQE, Sirius, and/or `gpudb` maintainers to run the extension form on GPU. Sirius is the most natural first partner, because it already runs Substrait plans on GPU and describes itself as composable.
+10. **Later.** Worst-case optimal joins (10.6).
 
 ### 16.2 Priority of the further optimizations
 
@@ -564,6 +619,7 @@ Agreed priority, highest first. Each lives in the section that owns it:
 - **einfold doesn't beat the hosts.** Its first implementation was slower than plain DataFusion, and the evidence for its design came from spikes that compared einfold's algorithms with each other rather than with hosts. Mitigation: spike S21's host baseline; the roadmap ordered by value; and a benchmark gate on every milestone, so work stops where it stops paying.
 - **The win is in a shape einfold doesn't see.** S22 found that most of ddx's gradient time is in steps a two-table detector wouldn't match, and that ddx's own SQL could be 3.7× faster without einfold (filed as xqlsystems/ddx#125). Mitigation: M1 takes folds from the producer rather than detecting them, and gates on ddx's end-to-end run, not on isolated contractions.
 - **M1 depends on a change in ddx.** ddx must emit the `Fold` node. Mitigation: the node is small (S25's prototype is about 300 lines with its operator), ddx already knows every field it needs, and ddx keeps its SQL path as the fallback.
+- **The demo pulls work forward.** Demo 1 needs pieces of later milestones: masks, tiling and detection. Mitigation: M2 takes only what the demo needs (masks on dense dimensions, tiles fixed by shape, one detected pattern), and every rule is also tested on a query that isn't attention, so the demo can't be met by a special case.
 - **Wrong rewrites.** Mitigation: conservative detection; the partial-aggregate and fill-value rules (sections 8.1 and 8.3); the tests in section 11.
 - **The extension form is never adopted.** Then einfold's ceiling on GPU hosts is the relational form, which cannot speed up two-operand contractions. Mitigation: keep the relational form valuable on its own; keep the `Fold` relation small and well tested; show results with the reference executor.
 - **Host optimizers undo or choke on einfold's plans.** S10 found that hosts keep the written order but DuckDB can spend minutes planning it. Mitigation: plan protection in the target profile (`MATERIALIZED` CTEs on DuckDB), and never emitting flat folds.
@@ -573,7 +629,7 @@ Agreed priority, highest first. Each lives in the section that owns it:
 - **Readers disagree.** The same store reads differently through each reader (S1). Mitigation: per-reader fact providers, and the shared equivalence suite run through every reader.
 - **Unparser bugs.** DataFusion's `Unparser` can write SQL that silently changes results (S7). Mitigation: unparse only unoptimized plans, and check every unparsed plan.
 - **GPU hosts need recent GPUs.** gpudb and Sirius need compute capability 7.5+ (S5), so einfold's GPU testing needs cloud GPUs. A free Colab T4 sufficed for S5.
-- **gpudb gives einfold's float workloads no GPU speedup today.** On a T4, gpudb ran only an integer reduction on the GPU. It declined every `DOUBLE` sum, many-to-many joins, and subquery operands (S5). Mitigation: M7's work with gpudb's maintainer on the extension form, or on `DOUBLE` sums with S8's binned accumulator; meanwhile, the relational form's value on DuckDB+gpudb is the CPU-side plan shape.
+- **gpudb gives einfold's float workloads no GPU speedup today.** On a T4, gpudb ran only an integer reduction on the GPU. It declined every `DOUBLE` sum, many-to-many joins, and subquery operands (S5). Mitigation: M8's work with gpudb's maintainer on the extension form, or on `DOUBLE` sums with S8's binned accumulator; meanwhile, the relational form's value on DuckDB+gpudb is the CPU-side plan shape.
 - **Float sums on GPU hosts.** Deterministic float sums on GPU need host support. gpudb avoids the question by never rewriting float `SUM`, which also keeps float einsums off its GPU path. Mitigation: determinism is a setting, not a default, on hosts (section 8.6); S8's binned sum is a concrete proposal for hosts, cheap even with GPU atomics.
 
 ## 18. References

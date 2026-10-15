@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "s27-fused-attention"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike S27: demo 1's attention in SQL on the hosts, against a fused, tiled online-softmax kernel"
+
+# A standalone crate, not a member of einfold's workspace.
+[workspace]
+
+[dependencies]
+datafusion = "=54.1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+matrixmultiply = "0.3"
+
+[profile.release]
+debug = false

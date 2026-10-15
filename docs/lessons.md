@@ -13,6 +13,7 @@ What M1's first implementation round taught us that [`design.md`](design.md) and
 - **Measure against the host before building.** Spike S11's "2.5–17× faster than a hash join and aggregate" compared Gustavson's algorithm with the spike's own single-threaded loop, not with a SQL engine. M1's kernel, measured against plain DataFusion on ddx's matrix products and attention (ddx is an XQL Systems project for differentiating SQL queries), ran at **0.11–0.6×**: slower everywhere except tiny attention. The first experiment should have been the host's own time on the target workload, next to a hand-written dense loop doing the same arithmetic.
 - **Order milestones by value.** M1 built the sparse hash path, whose only advantage is a constant factor over a parallel, vectorized engine. The asymptotic wins (aggregating early and choosing join order, for three or more operands) and the dense path (ddx and ERA5 are dense) came later. Dense, positional kernels and eager aggregation likely deserve to come first.
 - **Gate each milestone on a benchmark** against the host, not only on an equivalence suite.
+- **Profile the customer end to end, step by step.** S21 timed ddx's contractions as plain two-table queries, and they took 80 ms of a 1.4 s gradient. ddx's real steps rebuilt the forward join for a redundant NULL test and left-joined back to fill groups (spike S22). A per-step profile with each step's plan shape would have shown that before the roadmap was set on two-table kernels.
 - **Check that detection fires on real plans.** M1's detection accepts only `Float64` `SUM`, `COUNT` and `AVG`, one aggregate, with `GROUP BY`, over two operands. Zarr variables are often `float32` or packed integers, and weighted means are often global `SUM(w*x) / SUM(w)`. All of these decline. Measure the hit rate on plans from xarray-sql (which exposes xarray datasets as SQL tables) before widening anything.
 
 ## Performance
@@ -21,7 +22,7 @@ From the adversarial review of the kernel (#14) and operator (#16):
 
 - **Keep generic code out of hot loops.** The kernel cloned a key per joined pair, and updated state through the generic `PartialAggregate`, which dispatches on the operation and the value types for every value. It cost about 70 ns per joined pair, against DataFusion's 25. Describe aggregates generically in the IR, and use the generic state as the *oracle* that specialized loops for each aggregate and type are tested against.
 - **Use positions, not hashes, for small extents.** Dictionary-encode each dimension to dense positions once; the group is then `i · n_j + j`, and the state is a flat array. Fall back to hashing only when the output's extents are too large.
-- **Behave like a DataFusion operator:** reserve memory from the `MemoryPool`, run CPU-bound work off the async runtime, use every core, emit batches of `batch_size`, and report metrics for `EXPLAIN ANALYZE`. For repeatable bits in parallel, partition the output keys: each group's additions keep a fixed order.
+- **Behave like a DataFusion operator:** reserve memory from the `MemoryPool`, run CPU-bound work off the async runtime, use every core, emit batches of `batch_size`, and report metrics for `EXPLAIN ANALYZE`. For repeatable bits in parallel, split work into fixed blocks chosen from the shape, never from the thread count, add partial results in block order, and visit rows in position order rather than arrival order. Partitioning the output keys alone serializes long sums, and "input order" isn't fixed by hosts (spike S24).
 
 ## The algebra and the IR
 
@@ -95,7 +96,7 @@ From the maintainer's review of the IR (#6):
 
 ## Open questions
 
-- **Default determinism.** The design makes repeatable bits the default where einfold executes, using a binned sum that costs 3–4.4× a plain one (spike S8). The adversarial review argues for defaulting to fast, with determinism as a switch, as hosts have it. Repeatability is also not accuracy: see the ill-conditioned sum above.
+- **Default determinism** (resolved by spike S24). The design makes repeatable bits the default where einfold executes. The adversarial review argued for defaulting to fast, with determinism as a switch, because the binned sum costs 3–4.4× a plain one (spike S8). On CPU it doesn't have to be used: fixed, shape-chosen blocks and position order give repeatable bits at the speed of the non-deterministic kernels. The reproducible accumulator stays for GPU atomics and `highest` precision. Repeatability is still not accuracy: see the ill-conditioned sum above.
 - **Scope.** The design specifies an e-graph optimizer, a Substrait extension relation, layout algebra for tiling and GPU hosts, while the one working host, DataFusion, has yet to see a speedup. Consider deferring all of it until einfold beats DataFusion on ddx's matrix products and attention.
 - **Style.** The maintainer asked why the state code doesn't read like conventional functional code: folds and maps over immutable values, rather than in-place updates. Decide which style the codebase uses, and say why.
 

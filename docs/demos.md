@@ -60,7 +60,12 @@ JOIN norm n ON w.i = n.i
 GROUP BY w.i, v.d, n.z;
 ```
 
-ddx (an XQL Systems project for differentiating SQL queries) spells the maximum differently: `MAX(s) … GROUP BY i`, joined back to the scores. It may also divide inside the sum, `SUM(w / z * v.x)`. Both spellings mean the same thing, and einfold must recognize both.
+ddx (an XQL Systems project for differentiating SQL queries) spells the maximum differently: `MAX(s) … GROUP BY i`, joined back to the scores. It may also divide inside the sum, `SUM(w / z * v.x)`. Its attention test program goes further, as one chain of CTEs:
+- it projects `q`, `k` and `v` from one input `x`;
+- it normalizes before the product with `V`: `a = ex / z` in one CTE, then `SUM(a.val * v.val)` in the next;
+- it ends in a squared-error loss over the output.
+
+All these spellings mean the same thing, and einfold must recognize all of them. ddx's program is the realistic input: the softmax region reads the scores twice (for the maximum and the exponent) and the exponentials twice (for the normalizer and the division).
 
 ### What the query computes
 
@@ -129,8 +134,9 @@ Spike S27 ([`spikes/s27-fused-attention`](spikes/s27-fused-attention/README.md))
   - Results repeat bit for bit across thread counts.
 - **Fast.** Faster than DataFusion and DuckDB running the naive plan, at every `N` where they finish. It also runs at `N` where they exceed their memory budget.
 - **Found, not told.**
-  - einfold finds the plan from the SQL above, in both spellings, with no attention-specific rule.
+  - einfold finds the plan from the SQL above, in all its spellings, including ddx's attention program with its projections and loss, with no attention-specific rule.
   - The same rules fuse a query that isn't attention: a Gaussian-kernel weighted average, `SUM(exp(−dist²/h²)·y) / SUM(exp(−dist²/h²))` over a join of target and source points. That is the Nadaraya–Watson estimator, used in regridding.
+- **Chosen, not just found.** In ddx's program, the projections `q` and `k` also meet the condition for fusing into the scores. Fusing them would recompute them once per tile, though, and they are only `N × d`, so the plan should materialize them and fuse only where it avoids an `N²` intermediate (design §9.6).
 - **Where.** Measured on einfold's DataFusion reference executor. The relational form can't meet the memory criterion: a host's hash aggregation keeps every `(i, j)` score group until the scores are complete.
 
 FlashAttention's speed on GPUs also comes from managing on-chip memory, and that is the host's job. einfold produces the plan's *structure*. Running it at GPU-kernel speed requires a host that implements the `Fold` relation, such as Sirius or NVIDIA's GPU Query Engine.
@@ -245,7 +251,7 @@ Zarr facts and readers, projection and filter pushdown into chunk reads, semi-jo
 Design gaps found, in order of how many demos need them:
 
 1. **Fusion across folds** with a nonlinear step in between. Designed in v16 as fold pipelines (design §9.6), for M2. FlashAttention and NanoGPT.
-2. **Softmax.** Designed in v16: an algebraic fold with weights `e^(s)`, summed in a scaled exponential accumulator (design §8.6). Recognized in both its window and its `GROUP BY` spellings (design §9.6). No log-sum-exp semiring is needed. FlashAttention, and NanoGPT through its attention and loss.
+2. **Softmax.** Designed in v16: an algebraic fold with weights `e^(s)`, summed in a scaled exponential accumulator (design §8.6). Recognized in its window and `GROUP BY` spellings, and in ddx's attention program (design §9.6). No log-sum-exp semiring is needed. FlashAttention, and NanoGPT through its attention and loss.
 3. **Masks as absent rows in dense kernels,** found by spike S27: a masked pair must be skipped, not zeroed. FlashAttention and NanoGPT.
 4. **Semi-join reduction through deep plans,** and receptive fields as bounds on support. GraphCast.
 5. **Versioned optimizer state,** for XQL and ddx rather than einfold. NanoGPT.

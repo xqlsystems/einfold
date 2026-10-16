@@ -566,6 +566,7 @@ Two design rules come from it:
 - `exp(s − MAX(s) OVER (PARTITION BY g))`, then `SUM(w·y) / SUM(w)` over the same `g` (demo 1's spelling);
 - `MAX(s) … GROUP BY g` joined back to the scores on `g` (ddx's spelling);
 - the normalizer divided inside the sum, `SUM(w / z · y)`, which equals `SUM(w·y) / z` up to rounding, because `z` is constant within the group;
+- the normalizer applied in its own step before the sum, `a = w / z` and then `SUM(a · y)`, as ddx's attention program writes it. After detection inlines the projection (section 9.1, step 1), this is the previous spelling;
 - a constant scale applied to the scores, such as `/ 8.0`, folded into `s`.
 
 `M` must range over exactly the terms the sums range over: the same group, the same mask, the same existence. Otherwise the maximum doesn't cancel, and detection declines.
@@ -575,9 +576,11 @@ Two design rules come from it:
 - *Values.* Each producer result is complete (summed over all of `Z_P`) before it is mapped, so the consumer folds the same values the host would. Only the consumer's order of additions and the shift change, which section 8.6 bounds.
 - *NULLs.* A NULL score gives a NULL weight. `SUM` skips it, and `MAX` ignores it, in both the host and the accumulator.
 
+**Profitability.** Fuse producer `P` into consumer `C` when `|P| ≫ |inputs of P|`: when materializing `P` would cost more than recomputing it per consumer tile. Otherwise materialize `P` and fuse only the rest. The recomputation factor is the number of consumer tiles that read each producer tile: 1 when the producer's groups are the consumer's groups paired with summed values, as for attention's scores, and the number of query tiles for a projection like `k`. Estimates come from extents and facts, as for contraction order (section 9.3).
+
 **Generality.** The rules mention no attention-specific operator. Each is tested on another query too: a Gaussian-kernel weighted average `SUM(exp(−dist²/h²)·y) / SUM(exp(−dist²/h²))` over a join of target and source points (the Nadaraya–Watson estimator), and a log-sum-exp loss.
 
-**Prior work.** Loop fusion with `compute_at` in Halide (Ragan-Kelley et al., 2013). The online softmax (Milakov and Gimelshein, 2018), and its reading as a deferred normalization (Rabe and Staats, 2021). Automatic rediscovery of FlashAttention from tensor programs: Mirage (Wu et al., 2025), Blockbuster (Dekel, 2025), and EqiForge (Zhan et al., 2026), which does it by equality saturation.
+**Prior work.** Loop fusion with `compute_at` in Halide (Ragan-Kelley et al., 2013). The online softmax (Milakov and Gimelshein, 2018), and its reading as a deferred normalization (Rabe and Staats, 2021). Automatic rediscovery of FlashAttention from tensor programs: Mirage (Wu et al., 2025), Blockbuster (Dekel, 2025), and EqiForge (Zhan et al., 2026), which does it by equality saturation. Tiles as relation rows, with a dense tile as each row's value: tensor relational algebra (Yuan et al., 2021), the same idea as section 8.2's tiles. Output dimensions as "parallel" iterators and summed ones as "reduction" iterators, which decide what may be split freely and what leaves partial results: MLIR's Linalg dialect, the same distinction as a fold's group keys and summed dimensions. Distributing attention by merging these states across devices: Ring Attention (Liu, Zaharia and Abbeel, 2023).
 
 ## 10. Physical realization, in detail
 
@@ -812,6 +815,7 @@ Status as of design v15: 22 of 25 spikes done, and three blocked on access. The 
 - Fent and Neumann, *A practical approach to groupjoin and nested aggregates* (VLDB 2021): groupjoins beyond key/foreign-key joins.
 - Eich, Fender and Moerkotte (2018): generating plans that contain group-by, join, and groupjoin.
 - Systems that run tensor or ML computations inside databases: tensor relational algebra (TRA), LMFAO (in-database learning over joins), and SystemDS (Apache's declarative ML system).
+- "Every Kernel Is a Join: Automatic Multi-GPU Parallelism for AI Computations in Einsummable" (2026, https://arxiv.org/abs/2609.03905), from TRA's authors: distributing einsum programs by treating kernels as joins.
 - Sparse tensor compilers (TACO).
 - Tensat (Yang et al., MLSys 2021): equality saturation for tensor computation graphs.
 - Why datafusion-tokomak, an egg-based optimizer for DataFusion, went inactive.
@@ -863,6 +867,7 @@ Papers:
 - Dekel, O. (2025). Blockbuster, Part 1: Block-level AI Operator Fusion. https://arxiv.org/abs/2505.07829
 - Gray, J., Kourtis, S. (2021). Hyper-optimized tensor network contraction. *Quantum* 5, 410.
 - Gustavson, F. G. (1978). Two Fast Algorithms for Sparse Matrices: Multiplication and Permuted Transposition. *ACM Trans. Math. Softw.* 4(3), 250–269. https://doi.org/10.1145/355791.355796
+- Liu, H., Zaharia, M., Abbeel, P. (2023). Ring Attention with Blockwise Transformers for Near-Infinite Context. https://arxiv.org/abs/2310.01889
 - Milakov, M., Gimelshein, N. (2018). Online normalizer calculation for softmax. https://arxiv.org/abs/1805.02867
 - Moerkotte, G., Neumann, T. (2011). Accelerating Queries with Group-By and Join by Groupjoin. *PVLDB* 4(11), 843–851. https://www.vldb.org/pvldb/vol4/p843-moerkotte.pdf
 - Ngo, H. Q., Porat, E., Ré, C., Rudra, A. (2018). Worst-case Optimal Join Algorithms. *J. ACM* 65(3). (Conference version: PODS 2012.)
@@ -880,6 +885,7 @@ Papers:
 - Yan, W. P., Larson, P.-Å. (1995). Eager Aggregation and Lazy Aggregation. *VLDB 1995*, 345–357. https://www.vldb.org/conf/1995/P345.PDF
 - Yang, Y., Zhao, H., Yu, X., Koutris, P. (2024). Predicate Transfer: Efficient Pre-Filtering on Multi-Join Queries. *CIDR 2024.* https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf
 - Yannakakis, M. (1981). Algorithms for Acyclic Database Schemes. *VLDB 1981*, 82–94.
+- Yuan, B., Jankov, D., Zou, J., Tang, Y., Bourgeois, D., Jermaine, C. (2021). Tensor Relational Algebra for Distributed Machine Learning System Design. *PVLDB* 14(8). http://vldb.org/pvldb/vol14/p1338-yuan.pdf
 - Zhan, Q., Hu, X., Xia, X., Li, S. (2026). Unleashing the Power of Equality Saturation for Tensor Program Superoptimization. https://arxiv.org/abs/2609.12330
 - Zhang, Y., Wang, Y. R., Flatt, O., Cao, D., Zucker, P., Rosenthal, E., Tatlock, Z., Willsey, M. (2023). Better Together: Unifying Datalog and Equality Saturation. *Proc. ACM Program. Lang.* 7(PLDI), Article 125. https://doi.org/10.1145/3591239
 
@@ -896,6 +902,7 @@ Software and documentation:
 - JAX default matmul precision: https://docs.jax.dev/en/latest/_autosummary/jax.default_matmul_precision.html and JAX issue #10413
 - Apache Arrow columnar format, dictionary-encoded layout: https://arrow.apache.org/docs/format/Columnar.html#dictionary-encoded-layout
 - DataFusion table statistics (`Statistics`, `ColumnStatistics`, `Precision`): https://docs.rs/datafusion/latest/datafusion/common/struct.Statistics.html
+- MLIR Linalg dialect: https://mlir.llvm.org/docs/Dialects/Linalg/
 - CuTe layout algebra (NVIDIA CUTLASS): https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/cute/02_layout_algebra.md
 - CuTe layouts as tensor indexes: https://github.com/NVlabs/CuTe/issues/4
 - rechunker algorithm: https://rechunker.readthedocs.io/en/latest/algorithm.html and https://github.com/pangeo-data/rechunker/blob/master/rechunker/algorithm.py

@@ -1,0 +1,516 @@
+// SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Property: a [`FoldNode`] computes what the SQL query it stands for
+//! computes, on DataFusion, for random folds over random tables.
+//!
+//! Each case draws a fold of two operands over one to four dimensions (keys
+//! `BIGINT`, `VARCHAR` or `DOUBLE`, compared with `=` or `IS NOT DISTINCT
+//! FROM`), random outputs, and sometimes a fill. Tables have NULL keys,
+//! duplicate key tuples, missing rows, and factors that are NULL, NaN, ±inf,
+//! `-0.0`, or ill-conditioned (±1e16 beside small values), split across
+//! partitions and batches at random. The invariants:
+//!
+//! 1. **Same rows.** The same key tuples, as a multiset, with keys compared by
+//!    their bits (`-0.0` is not `0.0`).
+//! 2. **Same values, within float summation's bound.** NULL where SQL gives
+//!    NULL; NaN where SQL gives NaN; the same infinity; and otherwise within
+//!    `2·(n − 1)·u·Σ|terms|` of SQL's value, where `n` is the group's number
+//!    of products and `u = 2⁻⁵³`. Any order of the additions is within half
+//!    that of the exact sum, and so is the host's.
+//! 3. **Deterministic.** The same rows, split into other partitions and
+//!    batches in another order, give the same rows, bit for bit.
+//!
+//! Reproduce a failure with `EINFOLD_SEED=<seed printed>`; search longer with
+//! `EINFOLD_CASES=<n>` (and a starting `EINFOLD_SEED`).
+
+use std::fmt::Write as _;
+use std::sync::Arc;
+
+use datafusion::arrow::array::{
+    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, UInt64Array,
+};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::common::ScalarValue;
+use datafusion::datasource::MemTable;
+use datafusion::execution::SessionStateBuilder;
+use datafusion::prelude::SessionContext;
+use einfold_datafusion::{EinFoldQueryPlanner, FoldNode};
+use einfold_ir::{Dimension, Fill, Fold, KeyEquality, Operand};
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+    fn chance(&mut self, p: f64) -> bool {
+        ((self.next() >> 11) as f64) / ((1u64 << 53) as f64) < p
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum KeyType {
+    Int,
+    Text,
+    Float,
+}
+
+impl KeyType {
+    fn data_type(self) -> DataType {
+        match self {
+            KeyType::Int => DataType::Int64,
+            KeyType::Text => DataType::Utf8,
+            KeyType::Float => DataType::Float64,
+        }
+    }
+    /// A literal that stands for NULL in the oracle's NULL-safe keys.
+    fn sentinel(self) -> &'static str {
+        match self {
+            KeyType::Int => "CAST(0 AS BIGINT)",
+            KeyType::Text => "''",
+            KeyType::Float => "CAST(0.0 AS DOUBLE)",
+        }
+    }
+    /// Key `i` of this type; floats include `-0.0` beside `0.0`, and NaN.
+    fn key(self, i: usize) -> ScalarValue {
+        match self {
+            KeyType::Int => ScalarValue::Int64(Some(i as i64 - 1)),
+            KeyType::Text => ScalarValue::Utf8(Some(format!("k{i}"))),
+            KeyType::Float => ScalarValue::Float64(Some([0.0, -0.0, f64::NAN, 2.5, -1.0][i % 5])),
+        }
+    }
+}
+
+/// A random factor: NULL, special values, ill-conditioned or ordinary.
+fn factor(rng: &mut Rng) -> Option<f64> {
+    let r = rng.below(100);
+    match r {
+        0..=9 => None,
+        10..=12 => Some(f64::NAN),
+        13..=14 => Some(f64::INFINITY),
+        15 => Some(f64::NEG_INFINITY),
+        16..=18 => Some(-0.0),
+        19..=25 => Some(if rng.chance(0.5) { 1e16 } else { -1e16 }),
+        _ => {
+            let mantissa = (rng.next() >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+            Some(mantissa * 10f64.powi(rng.below(7) as i32 - 3))
+        }
+    }
+}
+
+/// A table's rows, column by column.
+struct Table {
+    schema: Arc<Schema>,
+    columns: Vec<ArrayRef>,
+}
+
+impl Table {
+    fn rows(&self) -> usize {
+        self.columns.first().map_or(0, |c| c.len())
+    }
+
+    /// The rows in a random order, split into random partitions and batches.
+    fn partitions(&self, rng: &mut Rng) -> Vec<Vec<RecordBatch>> {
+        let n = self.rows();
+        let mut order: Vec<u64> = (0..n as u64).collect();
+        for i in (1..n).rev() {
+            order.swap(i, rng.below(i + 1));
+        }
+        let shuffled: Vec<ArrayRef> = self
+            .columns
+            .iter()
+            .map(|c| {
+                datafusion::arrow::compute::take(c, &UInt64Array::from(order.clone()), None)
+                    .unwrap()
+            })
+            .collect();
+        let batch = RecordBatch::try_new(Arc::clone(&self.schema), shuffled).unwrap();
+        let parts = 1 + rng.below(3);
+        let mut out = vec![Vec::new(); parts];
+        let mut start = 0;
+        while start < n {
+            let len = (1 + rng.below(5)).min(n - start);
+            out[rng.below(parts)].push(batch.slice(start, len));
+            start += len;
+        }
+        out
+    }
+}
+
+/// A table with `keys` (one column per dimension, of its type, named
+/// `names[i]`) and a `DOUBLE` column `v`, over every key tuple of `extents`
+/// with some missing, some duplicated and some NULL.
+fn table(rng: &mut Rng, names: &[String], types: &[KeyType], extents: &[usize]) -> Table {
+    let mut fields: Vec<Field> = names
+        .iter()
+        .zip(types)
+        .map(|(n, t)| Field::new(n, t.data_type(), true))
+        .collect();
+    fields.push(Field::new("v", DataType::Float64, true));
+    let mut keys: Vec<Vec<ScalarValue>> = vec![Vec::new(); names.len()];
+    let mut values = Vec::new();
+    let total: usize = extents.iter().product();
+    for mut t in 0..total {
+        if !rng.chance(0.75) {
+            continue;
+        }
+        let copies = if rng.chance(0.15) { 2 } else { 1 };
+        let tuple: Vec<ScalarValue> = extents
+            .iter()
+            .zip(types)
+            .map(|(&e, ty)| {
+                let i = t % e;
+                t /= e;
+                if rng.chance(0.08) {
+                    ScalarValue::try_from(ty.data_type()).unwrap()
+                } else {
+                    ty.key(i)
+                }
+            })
+            .collect();
+        for _ in 0..copies {
+            for (k, v) in keys.iter_mut().zip(&tuple) {
+                k.push(v.clone());
+            }
+            values.push(factor(rng));
+        }
+    }
+    let mut columns: Vec<ArrayRef> = keys
+        .into_iter()
+        .zip(types)
+        .map(|(k, t)| {
+            if k.is_empty() {
+                datafusion::arrow::array::new_empty_array(&t.data_type())
+            } else {
+                ScalarValue::iter_to_array(k).unwrap()
+            }
+        })
+        .collect();
+    columns.push(Arc::new(Float64Array::from(values)));
+    Table {
+        schema: Arc::new(Schema::new(fields)),
+        columns,
+    }
+}
+
+/// One random case: a fold, its tables, and the SQL it stands for.
+struct Case {
+    fold: Fold,
+    a: Table,
+    b: Table,
+    fill: Option<Table>,
+    sql: String,
+}
+
+fn case(rng: &mut Rng) -> Case {
+    let n = 1 + rng.below(4);
+    let types: Vec<KeyType> = (0..n)
+        .map(|_| [KeyType::Int, KeyType::Int, KeyType::Text, KeyType::Float][rng.below(4)])
+        .collect();
+    let extents: Vec<usize> = (0..n).map(|_| 1 + rng.below(4)).collect();
+    let dims: Vec<Dimension> = (0..n)
+        .map(|d| Dimension {
+            name: format!("d{d}"),
+            equality: if rng.chance(0.5) {
+                KeyEquality::Equal
+            } else {
+                KeyEquality::NotDistinct
+            },
+        })
+        .collect();
+    // Each dimension in a, in b, or in both; never in neither.
+    let mut held = vec![[false; 2]; n];
+    for h in held.iter_mut() {
+        match rng.below(3) {
+            0 => h[0] = true,
+            1 => h[1] = true,
+            _ => *h = [true, true],
+        }
+    }
+    let mut outputs: Vec<usize> = (0..n).filter(|_| rng.chance(0.5)).collect();
+    for i in (1..outputs.len()).rev() {
+        outputs.swap(i, rng.below(i + 1));
+    }
+    let side = |s: usize, rng: &mut Rng| {
+        let mine: Vec<usize> = (0..n).filter(|&d| held[d][s]).collect();
+        let names: Vec<String> = mine.iter().map(|d| format!("k{d}")).collect();
+        let ty: Vec<KeyType> = mine.iter().map(|&d| types[d]).collect();
+        let ext: Vec<usize> = mine.iter().map(|&d| extents[d]).collect();
+        let t = table(rng, &names, &ty, &ext);
+        let op = Operand {
+            keys: mine.iter().enumerate().map(|(c, &d)| (d, c)).collect(),
+            value: mine.len(),
+        };
+        (t, op, mine)
+    };
+    let (a, op_a, dims_a) = side(0, rng);
+    let (b, op_b, dims_b) = side(1, rng);
+    let with_fill = rng.chance(0.5);
+    let fill = with_fill.then(|| {
+        let names: Vec<String> = outputs.iter().map(|d| format!("k{d}")).collect();
+        let ty: Vec<KeyType> = outputs.iter().map(|&d| types[d]).collect();
+        let ext: Vec<usize> = outputs.iter().map(|&d| extents[d] + 1).collect();
+        table(rng, &names, &ty, &ext)
+    });
+    let fold = Fold::try_new(
+        dims.clone(),
+        vec![op_a, op_b],
+        outputs.clone(),
+        "v",
+        with_fill.then(|| Fill {
+            keys: (0..outputs.len()).collect(),
+            value: outputs.len(),
+        }),
+    )
+    .unwrap();
+
+    // The oracle's SQL. A key compared with IS NOT DISTINCT FROM is compared
+    // as the pair (key IS NULL, COALESCE(key, sentinel)) with `=`, which is
+    // the same relation; DataFusion's hash join has one NULL-equality setting
+    // per join, so mixing both kinds in one join is avoided.
+    let safe = |t: &str, d: usize| {
+        format!(
+            "{t}.k{d} IS NULL AS n{d}, COALESCE({t}.k{d}, {}) AS c{d}",
+            types[d].sentinel()
+        )
+    };
+    let view = |t: &str, mine: &[usize]| {
+        let mut cols = vec![format!("{t}.v")];
+        for &d in mine {
+            cols.push(format!("{t}.k{d}"));
+            cols.push(safe(t, d));
+        }
+        format!("(SELECT {} FROM {t}) {t}", cols.join(", "))
+    };
+    let shared: Vec<usize> = (0..n).filter(|&d| held[d] == [true, true]).collect();
+    let mut on: Vec<String> = Vec::new();
+    for &d in &shared {
+        match dims[d].equality {
+            KeyEquality::Equal => on.push(format!("a.k{d} = b.k{d}")),
+            KeyEquality::NotDistinct => {
+                on.push(format!("a.n{d} = b.n{d} AND a.c{d} = b.c{d}"));
+            }
+        }
+    }
+    let src = |d: usize| if held[d][0] { "a" } else { "b" };
+    let group: Vec<String> = outputs
+        .iter()
+        .map(|&d| format!("{}.k{d}", src(d)))
+        .collect();
+    let mut folded = format!(
+        "SELECT {} SUM(a.v * b.v) AS v, SUM(abs(a.v * b.v)) AS mag, COUNT(*) AS cnt FROM {} JOIN {} ON {}",
+        outputs
+            .iter()
+            .map(|&d| format!("{}.k{d} AS d{d}, {} ", src(d), safe(src(d), d)) + ",")
+            .collect::<String>(),
+        view("a", &dims_a),
+        view("b", &dims_b),
+        if on.is_empty() { "true".into() } else { on.join(" AND ") },
+    );
+    if !group.is_empty() {
+        let _ = write!(folded, " GROUP BY {}", group.join(", "));
+    }
+    // A fold over a join has a row only where something joined, as a grouped
+    // query does; without GROUP BY, SQL would return one row regardless.
+    folded.push_str(" HAVING COUNT(*) > 0");
+    let sql = if with_fill {
+        let fill_view = format!(
+            "(SELECT f.v, {} FROM f) f",
+            outputs
+                .iter()
+                .map(|&d| format!("f.k{d}, {}", safe("f", d)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let fill_on: Vec<String> = outputs
+            .iter()
+            .map(|&d| format!("f.n{d} = s.n{d} AND f.c{d} = s.c{d}"))
+            .collect();
+        format!(
+            "SELECT {} CASE WHEN f.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 ELSE s.v END AS v, \
+             s.mag, s.cnt FROM {fill_view} LEFT JOIN ({folded}) s ON {}",
+            outputs.iter().map(|&d| format!("f.k{d} AS d{d}, ")).collect::<String>(),
+            if fill_on.is_empty() { "true".into() } else { fill_on.join(" AND ") },
+        )
+    } else {
+        format!(
+            "SELECT {} v, mag, cnt FROM ({folded}) s",
+            outputs
+                .iter()
+                .map(|&d| format!("d{d}, "))
+                .collect::<String>()
+        )
+    };
+    Case {
+        fold,
+        a,
+        b,
+        fill,
+        sql,
+    }
+}
+
+fn context() -> SessionContext {
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_query_planner(Arc::new(EinFoldQueryPlanner))
+        .build();
+    SessionContext::new_with_state(state)
+}
+
+fn register(ctx: &SessionContext, name: &str, t: &Table, rng: &mut Rng) {
+    let mem = MemTable::try_new(Arc::clone(&t.schema), t.partitions(rng)).unwrap();
+    ctx.register_table(name, Arc::new(mem)).unwrap();
+}
+
+/// A row: its keys, printed so that `-0.0` and `0.0` differ, and its value.
+type Row = (String, Option<f64>);
+
+fn rows(batches: &[RecordBatch], keys: usize) -> Vec<Row> {
+    let mut out = Vec::new();
+    for b in batches {
+        let v = b
+            .column(keys)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        for r in 0..b.num_rows() {
+            let mut k = String::new();
+            for c in 0..keys {
+                let s = ScalarValue::try_from_array(b.column(c), r).unwrap();
+                let _ = write!(k, "{s:?}|");
+            }
+            out.push((k, v.is_valid(r).then(|| v.value(r))));
+        }
+    }
+    out
+}
+
+/// The oracle's rows, each with its bound on the difference of two sums.
+fn oracle_rows(batches: &[RecordBatch], keys: usize) -> Vec<(Row, f64)> {
+    let mut out = Vec::new();
+    let mut base = rows(batches, keys).into_iter();
+    for b in batches {
+        let mag = b
+            .column(keys + 1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let cnt = b
+            .column(keys + 2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for r in 0..b.num_rows() {
+            let n = if cnt.is_valid(r) { cnt.value(r) } else { 0 } as f64;
+            let m = if mag.is_valid(r) { mag.value(r) } else { 0.0 };
+            out.push((
+                base.next().unwrap(),
+                2.0 * (n - 1.0).max(0.0) * f64::EPSILON / 2.0 * m,
+            ));
+        }
+    }
+    out
+}
+
+fn equivalent(ours: Option<f64>, theirs: Option<f64>, bound: f64) -> bool {
+    match (ours, theirs) {
+        (None, None) => true,
+        (Some(x), Some(y)) if x.is_nan() || y.is_nan() => x.is_nan() && y.is_nan(),
+        (Some(x), Some(y)) if x == y => x.is_sign_negative() == y.is_sign_negative(),
+        (Some(x), Some(y)) => x.is_finite() && y.is_finite() && (x - y).abs() <= bound,
+        _ => false,
+    }
+}
+
+async fn run_fold(case: &Case, rng: &mut Rng) -> Vec<RecordBatch> {
+    let ctx = context();
+    register(&ctx, "a", &case.a, rng);
+    register(&ctx, "b", &case.b, rng);
+    if let Some(f) = &case.fill {
+        register(&ctx, "f", f, rng);
+    }
+    let scan = |name: &'static str| {
+        let ctx = ctx.clone();
+        async move { ctx.table(name).await.unwrap().into_unoptimized_plan() }
+    };
+    let fill = match case.fill {
+        Some(_) => Some(scan("f").await),
+        None => None,
+    };
+    let node = FoldNode::try_new(
+        case.fold.clone(),
+        vec![scan("a").await, scan("b").await],
+        fill,
+    )
+    .unwrap();
+    let df = ctx.execute_logical_plan(node.into_plan()).await.unwrap();
+    df.collect().await.unwrap()
+}
+
+#[tokio::test]
+async fn fold_matches_sql() {
+    let seed: u64 = std::env::var("EINFOLD_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0x5eed_f01d);
+    let cases: u64 = match std::env::var("EINFOLD_CASES") {
+        Ok(n) => n.parse().unwrap(),
+        Err(_) if std::env::var("EINFOLD_SEED").is_ok() => 1,
+        Err(_) => 400,
+    };
+    for i in 0..cases {
+        let seed = seed.wrapping_add(i);
+        let mut rng = Rng(seed | 1);
+        let case = case(&mut rng);
+        let keys = case.fold.outputs().len();
+        let fail = |what: String| panic!("seed {seed}: {what}\nSQL: {}", case.sql);
+
+        let ours = run_fold(&case, &mut rng).await;
+        let again = run_fold(&case, &mut rng).await;
+        let (ours, again) = (rows(&ours, keys), rows(&again, keys));
+        // SQL doesn't order rows, so the outputs are compared as multisets.
+        let bits = |r: &[Row]| -> Vec<(String, Option<u64>)> {
+            let mut b: Vec<_> = r
+                .iter()
+                .map(|(k, v)| (k.clone(), v.map(f64::to_bits)))
+                .collect();
+            b.sort();
+            b
+        };
+        if bits(&ours) != bits(&again) {
+            fail(format!(
+                "two arrival orders gave different outputs:\n{ours:?}\n{again:?}"
+            ));
+        }
+
+        let ctx = context();
+        register(&ctx, "a", &case.a, &mut rng);
+        register(&ctx, "b", &case.b, &mut rng);
+        if let Some(f) = &case.fill {
+            register(&ctx, "f", f, &mut rng);
+        }
+        let theirs = ctx.sql(&case.sql).await.unwrap().collect().await.unwrap();
+        let mut theirs = oracle_rows(&theirs, keys);
+        let mut ours = ours;
+        if ours.len() != theirs.len() {
+            fail(format!("{} rows, SQL has {}", ours.len(), theirs.len()));
+        }
+        // Fill rows with the same keys differ only in whether they are NULL.
+        ours.sort_by_key(|(k, v)| (k.clone(), v.is_some()));
+        theirs.sort_by_key(|((k, v), _)| (k.clone(), v.is_some()));
+        for (o, ((k, v), bound)) in ours.iter().zip(&theirs) {
+            if o.0 != *k || !equivalent(o.1, *v, *bound) {
+                fail(format!("row {o:?}, SQL's ({k}, {v:?}) within {bound:e}"));
+            }
+        }
+    }
+}

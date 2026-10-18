@@ -1346,8 +1346,10 @@ dependencies = [
 name = "einfold-datafusion"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "datafusion",
  "einfold-ir",
+ "futures",
  "tokio",
 ]
 

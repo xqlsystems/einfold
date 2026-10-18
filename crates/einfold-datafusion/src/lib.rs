@@ -15,6 +15,7 @@
 //! [`EinFoldExec`]. This is the only einfold crate that depends on a query
 //! engine.
 
+mod dense;
 mod exec;
 mod hash;
 mod node;

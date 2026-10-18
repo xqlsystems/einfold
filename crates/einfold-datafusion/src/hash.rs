@@ -163,15 +163,16 @@ struct Group {
     valued: bool,
 }
 
-/// The fold of operands `a` and `b`, with `fill` its fill relation when it
-/// has one, as one batch of `schema`.
+/// The fold of operands `a` and `b`, with `fill` the batches of its fill
+/// relation when it has one, as batches of `schema`: one per fill batch, or
+/// one in all without a fill.
 pub(crate) fn fold(
     fold: &Fold,
     a: &RecordBatch,
     b: &RecordBatch,
-    fill: Option<&RecordBatch>,
+    fill: Option<&[RecordBatch]>,
     schema: SchemaRef,
-) -> Result<RecordBatch> {
+) -> Result<Vec<RecordBatch>> {
     let ops = fold.operands();
     let shared: Vec<usize> = (0..fold.dimensions().len())
         .filter(|&d| ops[0].column_of(d).is_some() && ops[1].column_of(d).is_some())
@@ -226,9 +227,9 @@ pub(crate) fn fold(
         }
     }
 
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(fold.outputs().len() + 1);
     match (fold.fill(), fill) {
         (None, _) => {
+            let mut columns: Vec<ArrayRef> = Vec::with_capacity(fold.outputs().len() + 1);
             let a_rows = UInt32Array::from_iter_values(groups.iter().map(|g| g.a_row));
             let b_rows = UInt32Array::from_iter_values(groups.iter().map(|g| g.b_row));
             for &d in fold.outputs() {
@@ -242,44 +243,51 @@ pub(crate) fn fold(
             }
             let values: Float64Array = groups.iter().map(|g| g.valued.then_some(g.sum)).collect();
             columns.push(Arc::new(values));
+            Ok(vec![RecordBatch::try_new(schema, columns)?])
         }
-        (Some(spec), Some(fill)) => {
-            // Each fill row's group, found by its keys split as the groups'
-            // are: the outputs taken from a, then those taken from b.
-            let key_col = |d: usize| {
-                let i = fold.outputs().iter().position(|&o| o == d).unwrap();
-                Arc::clone(fill.column(spec.keys[i]))
-            };
-            // The fill's rows keep their own keys, as a left join from the
-            // fill does, but find their group as the join would.
-            let keys = |outputs: &[usize]| {
-                Keys::new(&host_keys(
-                    &outputs.iter().map(|&d| key_col(d)).collect::<Vec<_>>(),
-                ))
-            };
-            let (fa, fb) = (keys(&a_outputs)?, keys(&b_outputs)?);
-            // A fill row whose value is NULL gets NULL. NULL here is logical,
-            // so a column of type Null counts.
-            let fill_nulls = fill.column(spec.value).logical_nulls();
-            let values: Float64Array = (0..fill.num_rows())
-                .map(|r| {
-                    if fill_nulls.as_ref().is_some_and(|n| n.is_null(r)) {
-                        return None;
-                    }
-                    let group = a_ids.0.get(fa.get(r)).zip(b_ids.0.get(fb.get(r)));
-                    let g = group.and_then(|(&x, &y)| index.get(&(x, y)));
-                    Some(match g.map(|&g| &groups[g]) {
-                        Some(g) if g.valued => g.sum,
-                        _ => 0.0,
+        // One output batch per fill batch: each fill row's group, found by
+        // its keys split as the groups' are, the outputs taken from a, then
+        // those taken from b.
+        (Some(spec), Some(fill)) => fill
+            .iter()
+            .map(|fill| {
+                let key_col = |d: usize| {
+                    let i = fold.outputs().iter().position(|&o| o == d).unwrap();
+                    Arc::clone(fill.column(spec.keys[i]))
+                };
+                // The fill's rows keep their own keys, as a left join from
+                // the fill does, but find their group as the join would.
+                let keys = |outputs: &[usize]| {
+                    Keys::new(&host_keys(
+                        &outputs.iter().map(|&d| key_col(d)).collect::<Vec<_>>(),
+                    ))
+                };
+                let (fa, fb) = (keys(&a_outputs)?, keys(&b_outputs)?);
+                // A fill row whose value is NULL gets NULL. NULL here is
+                // logical, so a column of type Null counts.
+                let fill_nulls = fill.column(spec.value).logical_nulls();
+                let values: Float64Array = (0..fill.num_rows())
+                    .map(|r| {
+                        if fill_nulls.as_ref().is_some_and(|n| n.is_null(r)) {
+                            return None;
+                        }
+                        let group = a_ids.0.get(fa.get(r)).zip(b_ids.0.get(fb.get(r)));
+                        let g = group.and_then(|(&x, &y)| index.get(&(x, y)));
+                        Some(match g.map(|&g| &groups[g]) {
+                            Some(g) if g.valued => g.sum,
+                            _ => 0.0,
+                        })
                     })
-                })
-                .collect();
-            for &col in &spec.keys {
-                columns.push(Arc::clone(fill.column(col)));
-            }
-            columns.push(Arc::new(values));
-        }
-        (Some(_), None) => return internal_err!("a fold with a fill was given no fill relation"),
+                    .collect();
+                let mut columns: Vec<ArrayRef> = spec
+                    .keys
+                    .iter()
+                    .map(|&c| Arc::clone(fill.column(c)))
+                    .collect();
+                columns.push(Arc::new(values));
+                Ok(RecordBatch::try_new(Arc::clone(&schema), columns)?)
+            })
+            .collect(),
+        (Some(_), None) => internal_err!("a fold with a fill was given no fill relation"),
     }
-    Ok(RecordBatch::try_new(schema, columns)?)
 }

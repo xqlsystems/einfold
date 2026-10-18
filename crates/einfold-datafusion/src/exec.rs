@@ -21,6 +21,7 @@ use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     collect_partitioned, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
@@ -39,11 +40,18 @@ use crate::node::{describe, FoldNode};
 /// Its children are the fold's operands, then its fill, if it has one. It
 /// reads every partition of each, and emits one partition, in batches of the
 /// session's batch size.
+///
+/// It uses the dense algorithm, by positions and on as many threads as the
+/// session's target partitions, when the keys and rows allow it, and the
+/// hash algorithm otherwise. Both give results that don't depend on the
+/// number of threads or on the order rows arrive in. Its metrics count each
+/// (`dense_folds`, `hash_folds`).
 #[derive(Debug)]
 pub struct EinFoldExec {
     fold: Fold,
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl EinFoldExec {
@@ -60,6 +68,7 @@ impl EinFoldExec {
             fold,
             inputs,
             properties: Arc::new(properties),
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -75,13 +84,11 @@ impl DisplayAs for EinFoldExec {
     }
 }
 
-/// Every partition of `plan`, in partition order, as one batch. The
+/// Every batch of every partition of `plan`, in partition order. The
 /// partitions are read concurrently, since an operator such as a hash
 /// repartition produces them together and would otherwise buffer all but one.
-async fn collect(plan: Arc<dyn ExecutionPlan>, ctx: Arc<TaskContext>) -> Result<RecordBatch> {
-    let schema = plan.schema();
-    let batches = collect_partitioned(plan, ctx).await?;
-    Ok(concat_batches(&schema, batches.iter().flatten())?)
+async fn collect(plan: Arc<dyn ExecutionPlan>, ctx: Arc<TaskContext>) -> Result<Vec<RecordBatch>> {
+    Ok(collect_partitioned(plan, ctx).await?.concat())
 }
 
 impl ExecutionPlan for EinFoldExec {
@@ -112,6 +119,10 @@ impl ExecutionPlan for EinFoldExec {
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false; self.inputs.len()]
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn with_new_children(
@@ -147,14 +158,38 @@ impl ExecutionPlan for EinFoldExec {
             return internal_err!("EinFoldExec was given {} inputs", inputs.len());
         }
         let batch_size = context.session_config().batch_size().max(1);
+        let threads = context.session_config().target_partitions();
+        let dense_folds = MetricBuilder::new(&self.metrics).global_counter("dense_folds");
+        let hash_folds = MetricBuilder::new(&self.metrics).global_counter("hash_folds");
         let out = Arc::clone(&schema);
         let result = async move {
-            let batches =
+            // The operands are read whole; the fill, whose rows the output
+            // has one for one, is passed on batch by batch.
+            let schemas: Vec<SchemaRef> = inputs.iter().map(|i| i.schema()).collect();
+            let mut batches =
                 try_join_all(inputs.into_iter().map(|i| collect(i, Arc::clone(&context)))).await?;
-            let batch = crate::hash::fold(&fold, &batches[0], &batches[1], batches.get(2), out)?;
-            let slices: Vec<Result<RecordBatch>> = (0..batch.num_rows())
-                .step_by(batch_size)
-                .map(|start| Ok(batch.slice(start, batch_size.min(batch.num_rows() - start))))
+            let fill = (batches.len() == 3).then(|| batches.pop().unwrap());
+            let fill = fill.as_deref();
+            let a = concat_batches(&schemas[0], &batches[0])?;
+            let b = concat_batches(&schemas[1], &batches[1])?;
+            let dense = crate::dense::fold(&fold, &a, &b, fill, Arc::clone(&out), threads)?;
+            let batches = match dense {
+                Some(batches) => {
+                    dense_folds.add(1);
+                    batches
+                }
+                None => {
+                    hash_folds.add(1);
+                    crate::hash::fold(&fold, &a, &b, fill, out)?
+                }
+            };
+            let slices: Vec<Result<RecordBatch>> = batches
+                .iter()
+                .flat_map(|batch| {
+                    (0..batch.num_rows()).step_by(batch_size).map(move |start| {
+                        Ok(batch.slice(start, batch_size.min(batch.num_rows() - start)))
+                    })
+                })
                 .collect();
             Ok::<_, datafusion::error::DataFusionError>(stream::iter(slices))
         };

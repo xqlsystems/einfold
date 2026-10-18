@@ -20,7 +20,15 @@
 //!    of products and `u = 2⁻⁵³`. Any order of the additions is within half
 //!    that of the exact sum, and so is the host's.
 //! 3. **Deterministic.** The same rows, split into other partitions and
-//!    batches in another order, give the same rows, bit for bit.
+//!    batches in another order, and run on another number of threads, give
+//!    the same rows, bit for bit.
+//!
+//! Half the cases are drawn from a *dense family*, shaped so that EinFold's
+//! dense algorithm may apply: non-negative `BIGINT` keys with no NULLs in the
+//! operands, and every dimension either an output of one operand or summed
+//! and held by both. Some of them still fall back to the hash path (duplicate
+//! key tuples, or holes in an operand beside NaN or ±inf), and the test checks
+//! that the dense path ran in a good share of them.
 //!
 //! Reproduce a failure with `EINFOLD_SEED=<seed printed>`; search longer with
 //! `EINFOLD_CASES=<n>` (and a starting `EINFOLD_SEED`).
@@ -36,7 +44,8 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::ScalarValue;
 use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::prelude::SessionContext;
+use datafusion::physical_plan::{collect, ExecutionPlan};
+use datafusion::prelude::{SessionConfig, SessionContext};
 use einfold_datafusion::{EinFoldQueryPlanner, FoldNode};
 use einfold_ir::{Dimension, Fill, Fold, KeyEquality, Operand};
 
@@ -68,6 +77,8 @@ impl Rng {
 #[derive(Clone, Copy, Debug)]
 enum KeyType {
     Int,
+    /// Non-negative integers, usable as positions.
+    Pos,
     Text,
     Float,
     /// Dictionary-encoded text whose NULLs are a NULL dictionary value, not a
@@ -78,7 +89,7 @@ enum KeyType {
 impl KeyType {
     fn data_type(self) -> DataType {
         match self {
-            KeyType::Int => DataType::Int64,
+            KeyType::Int | KeyType::Pos => DataType::Int64,
             KeyType::Text => DataType::Utf8,
             KeyType::Float => DataType::Float64,
             KeyType::Dict => {
@@ -123,7 +134,7 @@ impl KeyType {
     /// A literal that stands for NULL in the oracle's NULL-safe keys.
     fn sentinel(self) -> &'static str {
         match self {
-            KeyType::Int => "CAST(0 AS BIGINT)",
+            KeyType::Int | KeyType::Pos => "CAST(0 AS BIGINT)",
             KeyType::Text | KeyType::Dict => "''",
             KeyType::Float => "CAST(0.0 AS DOUBLE)",
         }
@@ -132,15 +143,20 @@ impl KeyType {
     fn key(self, i: usize) -> ScalarValue {
         match self {
             KeyType::Int => ScalarValue::Int64(Some(i as i64 - 1)),
+            KeyType::Pos => ScalarValue::Int64(Some(i as i64)),
             KeyType::Text | KeyType::Dict => ScalarValue::Utf8(Some(format!("k{i}"))),
             KeyType::Float => ScalarValue::Float64(Some([0.0, -0.0, f64::NAN, 2.5, -1.0][i % 5])),
         }
     }
 }
 
-/// A random factor: NULL, special values, ill-conditioned or ordinary.
-fn factor(rng: &mut Rng) -> Option<f64> {
-    let r = rng.below(100);
+/// A random factor: NULL, special values, ill-conditioned or ordinary; with
+/// `specials` false, never NaN or infinite.
+fn factor(rng: &mut Rng, specials: bool) -> Option<f64> {
+    let r = match rng.below(100) {
+        10..=15 if !specials => 50,
+        r => r,
+    };
     match r {
         0..=9 => None,
         10..=12 => Some(f64::NAN),
@@ -194,10 +210,36 @@ impl Table {
     }
 }
 
+/// How a table's rows are drawn.
+#[derive(Clone, Copy)]
+struct Rows {
+    /// The chance that each key tuple has a row.
+    present: f64,
+    /// Whether key tuples may repeat.
+    duplicates: bool,
+    /// Whether keys may be NULL.
+    null_keys: bool,
+    /// Whether factors may be NaN or infinite.
+    specials: bool,
+}
+
+const MESSY: Rows = Rows {
+    present: 0.75,
+    duplicates: true,
+    null_keys: true,
+    specials: true,
+};
+
 /// A table with `keys` (one column per dimension, of its type, named
-/// `names[i]`) and a `DOUBLE` column `v`, over every key tuple of `extents`
-/// with some missing, some duplicated and some NULL.
-fn table(rng: &mut Rng, names: &[String], types: &[KeyType], extents: &[usize]) -> Table {
+/// `names[i]`) and a `DOUBLE` column `v`, over the key tuples of `extents`,
+/// drawn as `how` says.
+fn table(
+    rng: &mut Rng,
+    names: &[String],
+    types: &[KeyType],
+    extents: &[usize],
+    how: Rows,
+) -> Table {
     let mut fields: Vec<Field> = names
         .iter()
         .zip(types)
@@ -208,17 +250,21 @@ fn table(rng: &mut Rng, names: &[String], types: &[KeyType], extents: &[usize]) 
     let mut values = Vec::new();
     let total: usize = extents.iter().product();
     for mut t in 0..total {
-        if !rng.chance(0.75) {
+        if !rng.chance(how.present) {
             continue;
         }
-        let copies = if rng.chance(0.15) { 2 } else { 1 };
+        let copies = if how.duplicates && rng.chance(0.15) {
+            2
+        } else {
+            1
+        };
         let tuple: Vec<ScalarValue> = extents
             .iter()
             .zip(types)
             .map(|(&e, ty)| {
                 let i = t % e;
                 t /= e;
-                if rng.chance(0.08) {
+                if how.null_keys && rng.chance(0.08) {
                     ScalarValue::try_from(ty.value_type()).unwrap()
                 } else {
                     ty.key(i)
@@ -229,7 +275,7 @@ fn table(rng: &mut Rng, names: &[String], types: &[KeyType], extents: &[usize]) 
             for (k, v) in keys.iter_mut().zip(&tuple) {
                 k.push(v.clone());
             }
-            values.push(factor(rng));
+            values.push(factor(rng, how.specials));
         }
     }
     let mut columns: Vec<ArrayRef> = keys
@@ -253,20 +299,36 @@ struct Case {
     sql: String,
 }
 
-fn case(rng: &mut Rng) -> Case {
-    let n = 1 + rng.below(4);
+/// Shapes `[x, z, y]` large enough to cross the dense algorithm's block
+/// sizes: an output of at least 4,096 cells, split into blocks of rows; and
+/// a small output whose sums run over more than 4,096 positions of `z`, split
+/// into blocks along `z`.
+const LARGE: [[usize; 3]; 2] = [[300, 7, 16], [3, 9000, 5]];
+
+/// A random case; from the dense family when `dense`. With `large`, a dense
+/// case of one dimension per role, `x` in `a`, `z` in both and `y` in `b`,
+/// with those extents.
+fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
+    let dense = dense || large.is_some();
+    let n = if large.is_some() { 3 } else { 1 + rng.below(4) };
     let types: Vec<KeyType> = (0..n)
-        .map(|_| {
-            [
+        .map(|_| match dense {
+            true => KeyType::Pos,
+            false => [
                 KeyType::Int,
                 KeyType::Int,
                 KeyType::Text,
                 KeyType::Float,
                 KeyType::Dict,
-            ][rng.below(5)]
+            ][rng.below(5)],
         })
         .collect();
-    let extents: Vec<usize> = (0..n).map(|_| 1 + rng.below(4)).collect();
+    let extents: Vec<usize> = match large {
+        Some(shape) => shape.to_vec(),
+        None => (0..n)
+            .map(|_| 1 + rng.below(if dense { 6 } else { 4 }))
+            .collect(),
+    };
     let dims: Vec<Dimension> = (0..n)
         .map(|d| Dimension {
             name: format!("d{d}"),
@@ -279,23 +341,41 @@ fn case(rng: &mut Rng) -> Case {
         .collect();
     // Each dimension in a, in b, or in both; never in neither.
     let mut held = vec![[false; 2]; n];
-    for h in held.iter_mut() {
-        match rng.below(3) {
+    for (d, h) in held.iter_mut().enumerate() {
+        // A large case's x is in a, z in both, and y in b.
+        match large.map_or_else(|| rng.below(3), |_| [0, 2, 1][d]) {
             0 => h[0] = true,
             1 => h[1] = true,
             _ => *h = [true, true],
         }
     }
-    let mut outputs: Vec<usize> = (0..n).filter(|_| rng.chance(0.5)).collect();
+    // In the dense family, a dimension in one operand is an output, and one
+    // in both is summed.
+    let mut outputs: Vec<usize> = (0..n)
+        .filter(|&d| match dense {
+            true => held[d] != [true, true],
+            false => rng.chance(0.5),
+        })
+        .collect();
     for i in (1..outputs.len()).rev() {
         outputs.swap(i, rng.below(i + 1));
     }
+    let how = |rng: &mut Rng| match dense {
+        true => Rows {
+            present: if rng.chance(0.5) { 1.0 } else { 0.75 },
+            duplicates: rng.chance(0.2),
+            null_keys: false,
+            specials: rng.chance(0.5),
+        },
+        false => MESSY,
+    };
     let side = |s: usize, rng: &mut Rng| {
         let mine: Vec<usize> = (0..n).filter(|&d| held[d][s]).collect();
         let names: Vec<String> = mine.iter().map(|d| format!("k{d}")).collect();
         let ty: Vec<KeyType> = mine.iter().map(|&d| types[d]).collect();
         let ext: Vec<usize> = mine.iter().map(|&d| extents[d]).collect();
-        let t = table(rng, &names, &ty, &ext);
+        let rows = how(rng);
+        let t = table(rng, &names, &ty, &ext, rows);
         let op = Operand {
             keys: mine.iter().enumerate().map(|(c, &d)| (d, c)).collect(),
             value: mine.len(),
@@ -309,7 +389,7 @@ fn case(rng: &mut Rng) -> Case {
         let names: Vec<String> = outputs.iter().map(|d| format!("k{d}")).collect();
         let ty: Vec<KeyType> = outputs.iter().map(|&d| types[d]).collect();
         let ext: Vec<usize> = outputs.iter().map(|&d| extents[d] + 1).collect();
-        table(rng, &names, &ty, &ext)
+        table(rng, &names, &ty, &ext, MESSY)
     });
     let fold = Fold::try_new(
         dims.clone(),
@@ -409,9 +489,11 @@ fn case(rng: &mut Rng) -> Case {
     }
 }
 
-fn context() -> SessionContext {
+fn context(threads: usize) -> SessionContext {
+    let config = SessionConfig::new().with_target_partitions(threads);
     let state = SessionStateBuilder::new()
         .with_default_features()
+        .with_config(config)
         .with_query_planner(Arc::new(EinFoldQueryPlanner))
         .build();
     SessionContext::new_with_state(state)
@@ -489,8 +571,10 @@ fn equivalent(ours: Option<f64>, theirs: Option<f64>, bound: f64) -> bool {
     }
 }
 
-async fn run_fold(case: &Case, rng: &mut Rng) -> Vec<RecordBatch> {
-    let ctx = context();
+/// The fold's output, on a random number of threads, and whether it took the
+/// dense path.
+async fn run_fold(case: &Case, rng: &mut Rng) -> (Vec<RecordBatch>, bool) {
+    let ctx = context(1 + rng.below(8));
     register(&ctx, "a", &case.a, rng);
     register(&ctx, "b", &case.b, rng);
     if let Some(f) = &case.fill {
@@ -511,7 +595,21 @@ async fn run_fold(case: &Case, rng: &mut Rng) -> Vec<RecordBatch> {
     )
     .unwrap();
     let df = ctx.execute_logical_plan(node.into_plan()).await.unwrap();
-    df.collect().await.unwrap()
+    let plan = df.create_physical_plan().await.unwrap();
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await.unwrap();
+    (batches, dense_folds(&plan) > 0)
+}
+
+/// How many times the plan's `EinFoldExec` took the dense path.
+fn dense_folds(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    let here = match plan.name() {
+        "EinFoldExec" => plan
+            .metrics()
+            .and_then(|m| m.sum_by_name("dense_folds"))
+            .map_or(0, |v| v.as_usize()),
+        _ => 0,
+    };
+    here + plan.children().into_iter().map(dense_folds).sum::<usize>()
 }
 
 #[tokio::test]
@@ -525,15 +623,21 @@ async fn fold_matches_sql() {
         Err(_) if std::env::var("EINFOLD_SEED").is_ok() => 1,
         Err(_) => 400,
     };
+    let (mut dense_family, mut dense_ran) = (0, 0);
     for i in 0..cases {
         let seed = seed.wrapping_add(i);
         let mut rng = Rng::new(seed);
-        let case = case(&mut rng);
+        // The family follows from the seed, so a seed alone reproduces a case.
+        let dense = seed % 2 == 1;
+        let large = (seed % 20 == 1).then(|| LARGE[(seed / 20) as usize % LARGE.len()]);
+        let case = case(&mut rng, dense, large);
         let keys = case.fold.outputs().len();
         let fail = |what: String| panic!("seed {seed}: {what}\nSQL: {}", case.sql);
 
-        let ours = run_fold(&case, &mut rng).await;
-        let again = run_fold(&case, &mut rng).await;
+        let (ours, ran) = run_fold(&case, &mut rng).await;
+        let (again, _) = run_fold(&case, &mut rng).await;
+        dense_family += usize::from(dense);
+        dense_ran += usize::from(ran);
         let (ours, again) = (rows(&ours, keys), rows(&again, keys));
         // SQL doesn't order rows, so the outputs are compared as multisets.
         let bits = |r: &[Row]| -> Vec<(String, Option<u64>)> {
@@ -546,11 +650,11 @@ async fn fold_matches_sql() {
         };
         if bits(&ours) != bits(&again) {
             fail(format!(
-                "two arrival orders gave different outputs:\n{ours:?}\n{again:?}"
+                "two arrival orders and thread counts gave different outputs:\n{ours:?}\n{again:?}"
             ));
         }
 
-        let ctx = context();
+        let ctx = context(4);
         register(&ctx, "a", &case.a, &mut rng);
         register(&ctx, "b", &case.b, &mut rng);
         if let Some(f) = &case.fill {
@@ -570,5 +674,14 @@ async fn fold_matches_sql() {
                 fail(format!("row {o:?}, SQL's ({k}, {v:?}) within {bound:e}"));
             }
         }
+    }
+    eprintln!("dense path: {dense_ran} of {cases} cases; dense family: {dense_family}");
+    // The dense family is drawn so that most of its cases qualify; if few
+    // did, the dense path would go untested.
+    if cases >= 100 {
+        assert!(
+            dense_ran * 3 >= dense_family,
+            "the dense path ran in only {dense_ran} of {dense_family} dense-family cases"
+        );
     }
 }

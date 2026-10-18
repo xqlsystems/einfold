@@ -20,10 +20,12 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
+    collect_partitioned, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
+    PlanProperties,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use einfold_ir::Fold;
+use futures::future::try_join_all;
 use futures::{stream, StreamExt, TryStreamExt};
 
 use crate::node::{describe, FoldNode};
@@ -70,14 +72,13 @@ impl DisplayAs for EinFoldExec {
     }
 }
 
-/// Every partition of `plan`, in partition order, as one batch.
+/// Every partition of `plan`, in partition order, as one batch. The
+/// partitions are read concurrently, since an operator such as a hash
+/// repartition produces them together and would otherwise buffer all but one.
 async fn collect(plan: Arc<dyn ExecutionPlan>, ctx: Arc<TaskContext>) -> Result<RecordBatch> {
-    let mut batches = Vec::new();
-    for p in 0..plan.properties().output_partitioning().partition_count() {
-        let stream = plan.execute(p, Arc::clone(&ctx))?;
-        batches.extend(stream.try_collect::<Vec<_>>().await?);
-    }
-    Ok(concat_batches(&plan.schema(), &batches)?)
+    let schema = plan.schema();
+    let batches = collect_partitioned(plan, ctx).await?;
+    Ok(concat_batches(&schema, batches.iter().flatten())?)
 }
 
 impl ExecutionPlan for EinFoldExec {
@@ -105,6 +106,13 @@ impl ExecutionPlan for EinFoldExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != self.inputs.len() {
+            return internal_err!(
+                "EinFoldExec has {} children, given {}",
+                self.inputs.len(),
+                children.len()
+            );
+        }
         Ok(Arc::new(EinFoldExec::new(
             self.fold.clone(),
             children,
@@ -123,16 +131,17 @@ impl ExecutionPlan for EinFoldExec {
         let fold = self.fold.clone();
         let inputs = self.inputs.clone();
         let schema = self.schema();
-        let batch_size = context.session_config().batch_size();
+        if inputs.len() != 2 + usize::from(fold.fill().is_some()) {
+            return internal_err!("EinFoldExec was given {} inputs", inputs.len());
+        }
+        let batch_size = context.session_config().batch_size().max(1);
         let out = Arc::clone(&schema);
         let result = async move {
-            let mut batches = Vec::with_capacity(inputs.len());
-            for input in inputs {
-                batches.push(collect(input, Arc::clone(&context)).await?);
-            }
+            let batches =
+                try_join_all(inputs.into_iter().map(|i| collect(i, Arc::clone(&context)))).await?;
             let batch = crate::hash::fold(&fold, &batches[0], &batches[1], batches.get(2), out)?;
             let slices: Vec<Result<RecordBatch>> = (0..batch.num_rows())
-                .step_by(batch_size.max(1))
+                .step_by(batch_size)
                 .map(|start| Ok(batch.slice(start, batch_size.min(batch.num_rows() - start))))
                 .collect();
             Ok::<_, datafusion::error::DataFusionError>(stream::iter(slices))

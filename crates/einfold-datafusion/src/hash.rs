@@ -35,16 +35,41 @@ use datafusion::arrow::array::{Array, ArrayRef, Float64Array, RecordBatch, UInt3
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::row::{RowConverter, Rows, SortField};
-use datafusion::common::{internal_err, Result};
+use datafusion::common::{exec_err, internal_err, Result};
 use einfold_ir::{Fold, KeyEquality};
+
+/// Each row's key for some columns, as bytes in Arrow's row format, which
+/// gives equal keys equal bytes: NULL equals NULL, floats compare by their
+/// bits, and a dictionary-encoded value encodes as the value itself. With no
+/// columns, every key is empty.
+struct Keys(Option<Rows>);
+
+impl Keys {
+    fn new(columns: &[ArrayRef]) -> Result<Self> {
+        if columns.is_empty() {
+            return Ok(Keys(None));
+        }
+        let fields = columns
+            .iter()
+            .map(|c| SortField::new(c.data_type().clone()))
+            .collect();
+        Ok(Keys(Some(
+            RowConverter::new(fields)?.convert_columns(columns)?,
+        )))
+    }
+
+    fn get(&self, row: usize) -> &[u8] {
+        self.0.as_ref().map_or(&[], |rows| rows.row(row).data())
+    }
+}
 
 /// One operand's rows, as the hash algorithm reads them.
 struct Side<'a> {
     batch: &'a RecordBatch,
-    /// The operand's columns for the dimensions both operands hold.
-    shared: Vec<ArrayRef>,
-    /// The operand's columns for the outputs taken from it.
-    outputs: Vec<ArrayRef>,
+    /// Each row's key for the dimensions both operands hold.
+    shared: Keys,
+    /// Each row's key for the outputs taken from this operand.
+    outputs: Keys,
     values: &'a Float64Array,
     /// The rows that can join, in the order fixed by their contents.
     order: Vec<u32>,
@@ -58,64 +83,61 @@ impl<'a> Side<'a> {
         shared: &[usize],
         outputs: &[usize],
     ) -> Result<Self> {
+        let Ok(len) = u32::try_from(batch.num_rows()) else {
+            return exec_err!("EinFold's hash path takes at most 2³² - 1 rows per operand");
+        };
         let op = &fold.operands()[operand];
         let col = |d: usize| -> ArrayRef {
             Arc::clone(batch.column(op.column_of(d).expect("dimension held by this operand")))
         };
         let shared_cols: Vec<ArrayRef> = shared.iter().map(|&d| col(d)).collect();
         let output_cols: Vec<ArrayRef> = outputs.iter().map(|&d| col(d)).collect();
-        let Some(values) = batch.column(op.value).as_any().downcast_ref() else {
+        let Some(values) = batch
+            .column(op.value)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+        else {
             return internal_err!("EinFold factors must be Float64");
         };
-        // A NULL key in a dimension compared with `=` joins no row.
-        let joins = |row: usize| {
-            shared.iter().zip(&shared_cols).all(|(&d, c)| {
-                fold.dimensions()[d].equality == KeyEquality::NotDistinct || c.is_valid(row)
-            })
-        };
-        let mut sort_cols = shared_cols.clone();
-        sort_cols.extend(output_cols.iter().cloned());
-        sort_cols.push(Arc::clone(batch.column(op.value)));
-        let rows = convert(&sort_cols)?;
-        let mut order: Vec<u32> = (0..batch.num_rows() as u32)
-            .filter(|&r| joins(r as usize))
+        // A NULL key in a dimension compared with `=` joins no row. NULL here
+        // is logical: a dictionary's NULL value counts, as it does in SQL.
+        let strict: Vec<_> = shared
+            .iter()
+            .zip(&shared_cols)
+            .filter(|(&d, _)| fold.dimensions()[d].equality == KeyEquality::Equal)
+            .filter_map(|(_, c)| c.logical_nulls())
             .collect();
-        order.sort_by(|&x, &y| rows.row(x as usize).cmp(&rows.row(y as usize)));
+        let shared = Keys::new(&shared_cols)?;
+        let outputs = Keys::new(&output_cols)?;
+        // Keys, then factor: NULL first, then by the factor's bits.
+        let value = |r: u32| {
+            values
+                .is_valid(r as usize)
+                .then(|| values.value(r as usize).to_bits())
+        };
+        let mut order: Vec<u32> = (0..len)
+            .filter(|&r| strict.iter().all(|n| n.is_valid(r as usize)))
+            .collect();
+        order.sort_by(|&x, &y| {
+            let key = |r: u32| (shared.get(r as usize), outputs.get(r as usize), value(r));
+            key(x).cmp(&key(y))
+        });
         Ok(Side {
             batch,
-            shared: shared_cols,
-            outputs: output_cols,
+            shared,
+            outputs,
             values,
             order,
         })
     }
 }
 
-/// `columns` in Arrow's row format, which compares rows by their bytes: equal
-/// keys (NULL equal to NULL, floats by their bits) give equal bytes.
-fn convert(columns: &[ArrayRef]) -> Result<Rows> {
-    let fields = columns
-        .iter()
-        .map(|c| SortField::new(c.data_type().clone()))
-        .collect();
-    Ok(RowConverter::new(fields)?.convert_columns(columns)?)
-}
-
-/// Each row's key bytes, or one empty key per row when there are no columns.
-fn keys(columns: &[ArrayRef], len: usize) -> Result<Vec<Box<[u8]>>> {
-    if columns.is_empty() {
-        return Ok(vec![Box::default(); len]);
-    }
-    let rows = convert(columns)?;
-    Ok((0..len).map(|r| rows.row(r).as_ref().into()).collect())
-}
-
 /// Small integer ids for distinct keys, in order of first appearance.
 #[derive(Default)]
-struct Interner(HashMap<Box<[u8]>, u32>);
+struct Interner<'a>(HashMap<&'a [u8], u32>);
 
-impl Interner {
-    fn id(&mut self, key: Box<[u8]>) -> u32 {
+impl<'a> Interner<'a> {
+    fn id(&mut self, key: &'a [u8]) -> u32 {
         let next = self.0.len() as u32;
         *self.0.entry(key).or_insert(next)
     }
@@ -156,26 +178,24 @@ pub(crate) fn fold(
     let b = Side::new(fold, 1, b, &shared, &b_outputs)?;
 
     // Build: b's rows by their shared keys, each list in b's fixed order.
-    let b_keys = keys(&b.shared, b.batch.num_rows())?;
     let mut table: HashMap<&[u8], Vec<u32>> = HashMap::new();
     for &r in &b.order {
-        table.entry(&b_keys[r as usize]).or_default().push(r);
+        table.entry(b.shared.get(r as usize)).or_default().push(r);
     }
 
     // Probe: stream a's rows in its fixed order; a group is the pair of a's
     // and b's output keys, each interned to an id.
-    let a_keys = keys(&a.shared, a.batch.num_rows())?;
-    let a_out = keys(&a.outputs, a.batch.num_rows())?;
-    let b_out = keys(&b.outputs, b.batch.num_rows())?;
     let (mut a_ids, mut b_ids) = (Interner::default(), Interner::default());
-    let b_id: Vec<u32> = b_out.into_iter().map(|k| b_ids.id(k)).collect();
-    let mut index: HashMap<(u32, u32), u32> = HashMap::new();
+    let b_id: Vec<u32> = (0..b.batch.num_rows())
+        .map(|r| b_ids.id(b.outputs.get(r)))
+        .collect();
+    let mut index: HashMap<(u32, u32), usize> = HashMap::new();
     let mut groups: Vec<Group> = Vec::new();
     for &ar in &a.order {
-        let Some(matches) = table.get(&*a_keys[ar as usize]) else {
+        let Some(matches) = table.get(a.shared.get(ar as usize)) else {
             continue;
         };
-        let aid = a_ids.id(a_out[ar as usize].clone());
+        let aid = a_ids.id(a.outputs.get(ar as usize));
         let av = (a.values.is_valid(ar as usize)).then(|| a.values.value(ar as usize));
         for &br in matches {
             let g = *index.entry((aid, b_id[br as usize])).or_insert_with(|| {
@@ -185,10 +205,10 @@ pub(crate) fn fold(
                     sum: 0.0,
                     valued: false,
                 });
-                groups.len() as u32 - 1
+                groups.len() - 1
             });
             if let (Some(av), true) = (av, b.values.is_valid(br as usize)) {
-                let g = &mut groups[g as usize];
+                let g = &mut groups[g];
                 g.sum += av * b.values.value(br as usize);
                 g.valued = true;
             }
@@ -221,24 +241,19 @@ pub(crate) fn fold(
                 let i = fold.outputs().iter().position(|&o| o == d).unwrap();
                 Arc::clone(fill.column(spec.keys[i]))
             };
-            let n = fill.num_rows();
-            let fa = keys(
-                &a_outputs.iter().map(|&d| key_col(d)).collect::<Vec<_>>(),
-                n,
-            )?;
-            let fb = keys(
-                &b_outputs.iter().map(|&d| key_col(d)).collect::<Vec<_>>(),
-                n,
-            )?;
-            let fill_values = fill.column(spec.value);
-            let values: Float64Array = (0..n)
+            let fa = Keys::new(&a_outputs.iter().map(|&d| key_col(d)).collect::<Vec<_>>())?;
+            let fb = Keys::new(&b_outputs.iter().map(|&d| key_col(d)).collect::<Vec<_>>())?;
+            // A fill row whose value is NULL gets NULL. NULL here is logical,
+            // so a column of type Null counts.
+            let fill_nulls = fill.column(spec.value).logical_nulls();
+            let values: Float64Array = (0..fill.num_rows())
                 .map(|r| {
-                    if fill_values.is_null(r) {
+                    if fill_nulls.as_ref().is_some_and(|n| n.is_null(r)) {
                         return None;
                     }
-                    let group = a_ids.0.get(&fa[r]).zip(b_ids.0.get(&fb[r]));
+                    let group = a_ids.0.get(fa.get(r)).zip(b_ids.0.get(fb.get(r)));
                     let g = group.and_then(|(&x, &y)| index.get(&(x, y)));
-                    Some(match g.map(|&g| &groups[g as usize]) {
+                    Some(match g.map(|&g| &groups[g]) {
                         Some(g) if g.valued => g.sum,
                         _ => 0.0,
                     })

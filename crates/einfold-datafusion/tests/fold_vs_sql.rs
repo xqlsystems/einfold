@@ -29,7 +29,8 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, UInt64Array,
+    Array, ArrayRef, AsArray, DictionaryArray, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray, UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::ScalarValue;
@@ -42,6 +43,14 @@ use einfold_ir::{Dimension, Fill, Fold, KeyEquality, Operand};
 struct Rng(u64);
 
 impl Rng {
+    /// A generator for `seed`, scrambled by SplitMix64 so that nearby seeds
+    /// give unrelated streams, and never zero, which xorshift can't leave.
+    fn new(seed: u64) -> Self {
+        let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        Rng((z ^ (z >> 31)).max(1))
+    }
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
@@ -61,6 +70,9 @@ enum KeyType {
     Int,
     Text,
     Float,
+    /// Dictionary-encoded text whose NULLs are a NULL dictionary value, not a
+    /// NULL index: NULL to SQL, though the column's null buffer has none.
+    Dict,
 }
 
 impl KeyType {
@@ -69,13 +81,50 @@ impl KeyType {
             KeyType::Int => DataType::Int64,
             KeyType::Text => DataType::Utf8,
             KeyType::Float => DataType::Float64,
+            KeyType::Dict => {
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+            }
         }
+    }
+    /// The type of the keys `key` returns.
+    fn value_type(self) -> DataType {
+        match self {
+            KeyType::Dict => DataType::Utf8,
+            t => t.data_type(),
+        }
+    }
+    /// `keys` as a column of this type.
+    fn column(self, keys: Vec<ScalarValue>) -> ArrayRef {
+        let values = if keys.is_empty() {
+            datafusion::arrow::array::new_empty_array(&self.value_type())
+        } else {
+            ScalarValue::iter_to_array(keys).unwrap()
+        };
+        let KeyType::Dict = self else {
+            return values;
+        };
+        let mut dict: Vec<Option<&str>> = vec![None];
+        let indices: Int32Array = values
+            .as_string::<i32>()
+            .iter()
+            .map(|v| {
+                let i = dict.iter().position(|d| *d == v).unwrap_or_else(|| {
+                    dict.push(v);
+                    dict.len() - 1
+                });
+                Some(i as i32)
+            })
+            .collect();
+        Arc::new(DictionaryArray::new(
+            indices,
+            Arc::new(StringArray::from(dict)),
+        ))
     }
     /// A literal that stands for NULL in the oracle's NULL-safe keys.
     fn sentinel(self) -> &'static str {
         match self {
             KeyType::Int => "CAST(0 AS BIGINT)",
-            KeyType::Text => "''",
+            KeyType::Text | KeyType::Dict => "''",
             KeyType::Float => "CAST(0.0 AS DOUBLE)",
         }
     }
@@ -83,7 +132,7 @@ impl KeyType {
     fn key(self, i: usize) -> ScalarValue {
         match self {
             KeyType::Int => ScalarValue::Int64(Some(i as i64 - 1)),
-            KeyType::Text => ScalarValue::Utf8(Some(format!("k{i}"))),
+            KeyType::Text | KeyType::Dict => ScalarValue::Utf8(Some(format!("k{i}"))),
             KeyType::Float => ScalarValue::Float64(Some([0.0, -0.0, f64::NAN, 2.5, -1.0][i % 5])),
         }
     }
@@ -170,7 +219,7 @@ fn table(rng: &mut Rng, names: &[String], types: &[KeyType], extents: &[usize]) 
                 let i = t % e;
                 t /= e;
                 if rng.chance(0.08) {
-                    ScalarValue::try_from(ty.data_type()).unwrap()
+                    ScalarValue::try_from(ty.value_type()).unwrap()
                 } else {
                     ty.key(i)
                 }
@@ -186,13 +235,7 @@ fn table(rng: &mut Rng, names: &[String], types: &[KeyType], extents: &[usize]) 
     let mut columns: Vec<ArrayRef> = keys
         .into_iter()
         .zip(types)
-        .map(|(k, t)| {
-            if k.is_empty() {
-                datafusion::arrow::array::new_empty_array(&t.data_type())
-            } else {
-                ScalarValue::iter_to_array(k).unwrap()
-            }
-        })
+        .map(|(k, t)| t.column(k))
         .collect();
     columns.push(Arc::new(Float64Array::from(values)));
     Table {
@@ -213,7 +256,15 @@ struct Case {
 fn case(rng: &mut Rng) -> Case {
     let n = 1 + rng.below(4);
     let types: Vec<KeyType> = (0..n)
-        .map(|_| [KeyType::Int, KeyType::Int, KeyType::Text, KeyType::Float][rng.below(4)])
+        .map(|_| {
+            [
+                KeyType::Int,
+                KeyType::Int,
+                KeyType::Text,
+                KeyType::Float,
+                KeyType::Dict,
+            ][rng.below(5)]
+        })
         .collect();
     let extents: Vec<usize> = (0..n).map(|_| 1 + rng.below(4)).collect();
     let dims: Vec<Dimension> = (0..n)
@@ -371,7 +422,8 @@ fn register(ctx: &SessionContext, name: &str, t: &Table, rng: &mut Rng) {
     ctx.register_table(name, Arc::new(mem)).unwrap();
 }
 
-/// A row: its keys, printed so that `-0.0` and `0.0` differ, and its value.
+/// A row: its keys, printed so that `-0.0` and `0.0` differ and a dictionary
+/// key prints as its value, and its value.
 type Row = (String, Option<f64>);
 
 fn rows(batches: &[RecordBatch], keys: usize) -> Vec<Row> {
@@ -385,7 +437,13 @@ fn rows(batches: &[RecordBatch], keys: usize) -> Vec<Row> {
         for r in 0..b.num_rows() {
             let mut k = String::new();
             for c in 0..keys {
-                let s = ScalarValue::try_from_array(b.column(c), r).unwrap();
+                let col = match b.column(c).data_type() {
+                    DataType::Dictionary(_, v) => {
+                        datafusion::arrow::compute::cast(b.column(c), v).unwrap()
+                    }
+                    _ => Arc::clone(b.column(c)),
+                };
+                let s = ScalarValue::try_from_array(&col, r).unwrap();
                 let _ = write!(k, "{s:?}|");
             }
             out.push((k, v.is_valid(r).then(|| v.value(r))));
@@ -469,7 +527,7 @@ async fn fold_matches_sql() {
     };
     for i in 0..cases {
         let seed = seed.wrapping_add(i);
-        let mut rng = Rng(seed | 1);
+        let mut rng = Rng::new(seed);
         let case = case(&mut rng);
         let keys = case.fold.outputs().len();
         let fail = |what: String| panic!("seed {seed}: {what}\nSQL: {}", case.sql);

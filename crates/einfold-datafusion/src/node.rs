@@ -88,7 +88,16 @@ impl FoldNode {
                 .clone()
                 .expect("every dimension is held by an operand");
             let source = match (fold.fill(), &fill) {
-                (Some(f), Some(plan)) => field(plan, f.keys[i])?,
+                (Some(f), Some(plan)) => {
+                    let source = field(plan, f.keys[i])?;
+                    if source.data_type() != &ty {
+                        return plan_err!(
+                            "the fill's column for dimension {d} is {}, the operands' {ty}",
+                            source.data_type()
+                        );
+                    }
+                    source
+                }
                 _ => {
                     let (op, plan) = fold
                         .operands()
@@ -99,12 +108,6 @@ impl FoldNode {
                     field(plan, op.column_of(d).expect("found above"))?
                 }
             };
-            if source.data_type() != &ty {
-                return plan_err!(
-                    "the fill's column for dimension {d} is {}, the operands' {ty}",
-                    source.data_type()
-                );
-            }
             let name = &fold.dimensions()[d].name;
             fields.push(Field::new(name, ty, source.is_nullable()));
         }
@@ -167,8 +170,13 @@ impl UserDefinedLogicalNodeCore for FoldNode {
         if !exprs.is_empty() {
             return plan_err!("a Fold node has no expressions");
         }
-        let fill = (self.fold.fill().is_some()).then(|| inputs[2].clone());
-        FoldNode::try_new(self.fold.clone(), inputs[..2].to_vec(), fill)
+        let mut operands = inputs;
+        let fill = match (self.fold.fill(), operands.len()) {
+            (None, 2) => None,
+            (Some(_), 3) => operands.pop(),
+            (_, n) => return plan_err!("a Fold node has {} inputs, given {n}", self.inputs.len()),
+        };
+        FoldNode::try_new(self.fold.clone(), operands, fill)
     }
 }
 

@@ -19,8 +19,9 @@
 //! - **NULL keys.** A NULL in a dimension compared with `=` joins nothing; one
 //!   compared with `IS NOT DISTINCT FROM` joins NULL. Grouping keeps NULL as a
 //!   group of its own.
-//! - **Keys compare by their bits,** as DataFusion's do: `-0.0` and `0.0` are
-//!   different keys, and a NaN key matches the same NaN.
+//! - **Keys compare as DataFusion's do:** by their bits, except that `-0.0`
+//!   and `0.0` are one key. So a NaN key matches the same NaN, and a group
+//!   reached by both zeros is one group, emitted as `0.0`.
 //!
 //! **Determinism.** A float sum's bits depend on the order of its additions,
 //! and DataFusion doesn't fix the order in which rows arrive. So each operand
@@ -35,14 +36,21 @@ use datafusion::arrow::array::{Array, ArrayRef, Float64Array, RecordBatch, UInt3
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::row::{RowConverter, Rows, SortField};
+use datafusion::common::utils::normalize_float_zero;
 use datafusion::common::{exec_err, internal_err, Result};
 use einfold_ir::{Fold, KeyEquality};
 
 /// Each row's key for some columns, as bytes in Arrow's row format, which
 /// gives equal keys equal bytes: NULL equals NULL, floats compare by their
 /// bits, and a dictionary-encoded value encodes as the value itself. With no
-/// columns, every key is empty.
+/// columns, every key is empty. Pass columns through [`host_keys`] first.
 struct Keys(Option<Rows>);
+
+/// `columns` with each float's `-0.0` replaced by `0.0`, as DataFusion does
+/// to the keys it joins and groups on.
+fn host_keys(columns: &[ArrayRef]) -> Vec<ArrayRef> {
+    columns.iter().map(normalize_float_zero).collect()
+}
 
 impl Keys {
     fn new(columns: &[ArrayRef]) -> Result<Self> {
@@ -70,6 +78,8 @@ struct Side<'a> {
     shared: Keys,
     /// Each row's key for the outputs taken from this operand.
     outputs: Keys,
+    /// The columns of those outputs, as DataFusion would emit their keys.
+    output_cols: Vec<ArrayRef>,
     values: &'a Float64Array,
     /// The rows that can join, in the order fixed by their contents.
     order: Vec<u32>,
@@ -90,8 +100,8 @@ impl<'a> Side<'a> {
         let col = |d: usize| -> ArrayRef {
             Arc::clone(batch.column(op.column_of(d).expect("dimension held by this operand")))
         };
-        let shared_cols: Vec<ArrayRef> = shared.iter().map(|&d| col(d)).collect();
-        let output_cols: Vec<ArrayRef> = outputs.iter().map(|&d| col(d)).collect();
+        let shared_cols = host_keys(&shared.iter().map(|&d| col(d)).collect::<Vec<_>>());
+        let output_cols = host_keys(&outputs.iter().map(|&d| col(d)).collect::<Vec<_>>());
         let Some(values) = batch
             .column(op.value)
             .as_any()
@@ -126,6 +136,7 @@ impl<'a> Side<'a> {
             batch,
             shared,
             outputs,
+            output_cols,
             values,
             order,
         })
@@ -221,15 +232,13 @@ pub(crate) fn fold(
             let a_rows = UInt32Array::from_iter_values(groups.iter().map(|g| g.a_row));
             let b_rows = UInt32Array::from_iter_values(groups.iter().map(|g| g.b_row));
             for &d in fold.outputs() {
-                let (side, rows) = if from_a(&&d) {
-                    (&a, &a_rows)
+                let (side, rows, outputs) = if from_a(&&d) {
+                    (&a, &a_rows, &a_outputs)
                 } else {
-                    (&b, &b_rows)
+                    (&b, &b_rows, &b_outputs)
                 };
-                let col = side
-                    .batch
-                    .column(ops[usize::from(!from_a(&&d))].column_of(d).unwrap());
-                columns.push(take(col, rows, None)?);
+                let i = outputs.iter().position(|&o| o == d).unwrap();
+                columns.push(take(&side.output_cols[i], rows, None)?);
             }
             let values: Float64Array = groups.iter().map(|g| g.valued.then_some(g.sum)).collect();
             columns.push(Arc::new(values));
@@ -241,8 +250,14 @@ pub(crate) fn fold(
                 let i = fold.outputs().iter().position(|&o| o == d).unwrap();
                 Arc::clone(fill.column(spec.keys[i]))
             };
-            let fa = Keys::new(&a_outputs.iter().map(|&d| key_col(d)).collect::<Vec<_>>())?;
-            let fb = Keys::new(&b_outputs.iter().map(|&d| key_col(d)).collect::<Vec<_>>())?;
+            // The fill's rows keep their own keys, as a left join from the
+            // fill does, but find their group as the join would.
+            let keys = |outputs: &[usize]| {
+                Keys::new(&host_keys(
+                    &outputs.iter().map(|&d| key_col(d)).collect::<Vec<_>>(),
+                ))
+            };
+            let (fa, fb) = (keys(&a_outputs)?, keys(&b_outputs)?);
             // A fill row whose value is NULL gets NULL. NULL here is logical,
             // so a column of type Null counts.
             let fill_nulls = fill.column(spec.value).logical_nulls();

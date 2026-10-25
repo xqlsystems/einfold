@@ -67,14 +67,16 @@ fn worth(cells: usize, rows: usize) -> bool {
 }
 
 /// `column` as non-negative `i64` keys, or `None` if it isn't an integer
-/// column, or holds a NULL or a negative key.
+/// column, or holds a NULL, a negative key, or one too large for `i64` (an
+/// unsigned key of 2⁶³ or more).
 fn keys(column: &ArrayRef) -> Option<Int64Array> {
     if !column.data_type().is_integer() || column.null_count() > 0 {
         return None;
     }
+    // The cast turns a key too large for i64 into NULL, which reads as 0.
     let keys = cast(column, &DataType::Int64).ok()?;
     let keys = keys.as_any().downcast_ref::<Int64Array>()?.clone();
-    keys.values().iter().all(|&k| k >= 0).then_some(keys)
+    (keys.null_count() == 0 && keys.values().iter().all(|&k| k >= 0)).then_some(keys)
 }
 
 /// A row's position over some dimensions, flattened with the first

@@ -24,7 +24,7 @@
 //!    the same rows, bit for bit.
 //!
 //! Half the cases are drawn from a *dense family*, shaped so that EinFold's
-//! dense algorithm may apply: non-negative `BIGINT` keys with no NULLs in the
+//! dense algorithm may apply: non-negative integer keys with no NULLs in the
 //! operands, and every dimension either an output of one operand or summed
 //! and held by both. Some of them still fall back to the hash path (duplicate
 //! key tuples, or holes in an operand beside NaN or ±inf), and the test checks
@@ -79,6 +79,9 @@ enum KeyType {
     Int,
     /// Non-negative integers, usable as positions.
     Pos,
+    /// Unsigned integers, usable as positions except key 0, which is 2⁶³:
+    /// beyond `BIGINT`, so a dense array can't hold it.
+    Wide,
     Text,
     Float,
     /// Dictionary-encoded text whose NULLs are a NULL dictionary value, not a
@@ -90,6 +93,7 @@ impl KeyType {
     fn data_type(self) -> DataType {
         match self {
             KeyType::Int | KeyType::Pos => DataType::Int64,
+            KeyType::Wide => DataType::UInt64,
             KeyType::Text => DataType::Utf8,
             KeyType::Float => DataType::Float64,
             KeyType::Dict => {
@@ -135,6 +139,7 @@ impl KeyType {
     fn sentinel(self) -> &'static str {
         match self {
             KeyType::Int | KeyType::Pos => "CAST(0 AS BIGINT)",
+            KeyType::Wide => "arrow_cast(0, 'UInt64')",
             KeyType::Text | KeyType::Dict => "''",
             KeyType::Float => "CAST(0.0 AS DOUBLE)",
         }
@@ -144,6 +149,7 @@ impl KeyType {
         match self {
             KeyType::Int => ScalarValue::Int64(Some(i as i64 - 1)),
             KeyType::Pos => ScalarValue::Int64(Some(i as i64)),
+            KeyType::Wide => ScalarValue::UInt64(Some(if i == 0 { 1 << 63 } else { i as u64 })),
             KeyType::Text | KeyType::Dict => ScalarValue::Utf8(Some(format!("k{i}"))),
             KeyType::Float => ScalarValue::Float64(Some([0.0, -0.0, f64::NAN, 2.5, -1.0][i % 5])),
         }
@@ -313,6 +319,7 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
     let n = if large.is_some() { 3 } else { 1 + rng.below(4) };
     let types: Vec<KeyType> = (0..n)
         .map(|_| match dense {
+            true if large.is_none() && rng.chance(0.1) => KeyType::Wide,
             true => KeyType::Pos,
             false => [
                 KeyType::Int,

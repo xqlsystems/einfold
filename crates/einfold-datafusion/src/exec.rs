@@ -254,9 +254,9 @@ impl ExecutionPlan for EinFoldExec {
             .map_err(|e| DataFusionError::External(Box::new(e)))??;
             timer.done();
             // The kernel has dropped its inputs: release them, so that the
-            // operators downstream have the memory they would have had
-            // without einfold. The output, which may share the domain's
-            // columns, is counted below.
+            // host's plan, if it runs, and the operators downstream have the
+            // memory they would have had without einfold. The output, which
+            // may share the domain's columns, is counted below.
             reservation.free();
             let batches = match (ran, fallback) {
                 (Some((Algorithm::Dense, batches)), _) => {

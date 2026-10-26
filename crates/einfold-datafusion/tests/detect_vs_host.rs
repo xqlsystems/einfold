@@ -842,3 +842,45 @@ async fn joined_back_fallbacks_hold_only_the_hosts_plan() {
     execs(fallback, &mut inner);
     assert!(inner.is_empty(), "the fallback runs einfold again");
 }
+
+#[test]
+fn host_plan_runs_where_there_is_no_tokio_runtime() {
+    use datafusion::physical_plan::{self, ExecutionPlan};
+    use futures::TryStreamExt;
+    fn find(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+        match plan.name() == "EinFoldExec" {
+            true => Some(Arc::clone(plan)),
+            false => plan.children().into_iter().find_map(find),
+        }
+    }
+    // Text keys, which the dense algorithm declines, so the operator runs the
+    // host's plan, whose operators spawn tasks. A host in another library
+    // polls the operator through DataFusion's FFI, where this library's Tokio
+    // sees no runtime.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut rng = Rng::new(7);
+    let ours = einfold(4, true);
+    table(&mut rng, &[&ours], "l", [4, 3], Keys::Text, false);
+    table(&mut rng, &[&ours], "r", [3, 5], Keys::Text, false);
+    let sql = "SELECT l.a, r.b, SUM(l.v * r.v) AS v FROM l JOIN r ON l.b = r.a GROUP BY l.a, r.b";
+    // A plan's operators run once, so each run plans the query anew.
+    let plan = || {
+        runtime.block_on(async {
+            let df = ours.sql(sql).await.unwrap();
+            let physical = df.create_physical_plan().await.unwrap();
+            find(&physical).expect("einfold finds the fold")
+        })
+    };
+    let (first, exec) = (plan(), plan());
+    let with = runtime
+        .block_on(physical_plan::collect(first, ours.task_ctx()))
+        .unwrap();
+    drop(runtime);
+    let stream = exec.execute(0, ours.task_ctx()).unwrap();
+    let without: Vec<RecordBatch> = futures::executor::block_on(stream.try_collect()).unwrap();
+    assert_eq!(rows(&with), rows(&without));
+    let shown = DisplayableExecutionPlan::with_metrics(exec.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(shown.contains("host_plans=1"), "{shown}");
+}

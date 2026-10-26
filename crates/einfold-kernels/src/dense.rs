@@ -49,7 +49,7 @@ use std::thread;
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef};
-use einfold_ir::{Domain, Fold};
+use einfold_ir::{ColumnIndex, DimensionId, Domain, Fold};
 
 use crate::Result;
 
@@ -147,21 +147,22 @@ pub(crate) fn fold(
     let [op_a, op_b] = fold.operands() else {
         return Ok(None);
     };
-    // The roles: X and Y in output order, Z in dimension order.
+    // The roles: X and Y in output order, Z in dimension order. Here a
+    // dimension is its index, which indexes the extents too.
     let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
     for d in fold.outputs().iter().map(|o| o.dimension) {
         match (op_a.column_of(d), op_b.column_of(d)) {
-            (Some(_), None) => xs.push(d),
-            (None, Some(_)) => ys.push(d),
+            (Some(_), None) => xs.push(d.0),
+            (None, Some(_)) => ys.push(d.0),
             _ => return Ok(None),
         }
     }
-    for d in 0..fold.dimensions().len() {
+    for d in fold.dimension_ids() {
         if fold.is_aggregated(d) {
             if op_a.column_of(d).is_none() || op_b.column_of(d).is_none() {
                 return Ok(None);
             }
-            zs.push(d);
+            zs.push(d.0);
         }
     }
     // Each operand's key columns as non-negative i64, cast once; and each
@@ -170,7 +171,7 @@ pub(crate) fn fold(
     let mut cast_keys = |op: &einfold_ir::Operand, batch: &RecordBatch| {
         op.keys
             .iter()
-            .map(|&(d, c)| {
+            .map(|&(DimensionId(d), ColumnIndex(c))| {
                 let k = keys(batch.column(c))?;
                 let max = k.values().iter().max().map_or(0, |&m| m as usize + 1);
                 extent[d] = extent[d].max(max);
@@ -207,7 +208,7 @@ pub(crate) fn fold(
     );
     let factors = |op: &einfold_ir::Operand, batch: &'_ RecordBatch| {
         op.factor
-            .and_then(|c| batch.column(c).as_any().downcast_ref::<Float64Array>())
+            .and_then(|c| batch.column(c.0).as_any().downcast_ref::<Float64Array>())
             .cloned()
     };
     let (Some(av), Some(bv)) = (factors(op_a, a), factors(op_b, b)) else {
@@ -262,7 +263,12 @@ pub(crate) fn fold(
             // first-slowest, so a key's stride is the product of the extents
             // after it in that order.
             let order: Vec<usize> = xs.iter().chain(&ys).copied().collect();
-            let dims: Vec<usize> = fold.outputs().iter().map(|o| o.dimension).collect();
+            let dims: Vec<usize> = fold.outputs().iter().map(|o| o.dimension.0).collect();
+            let keys: Vec<ColumnIndex> = fold
+                .outputs()
+                .iter()
+                .map(|o| o.domain_key.expect("a fold with a domain").0)
+                .collect();
             let strides: Vec<usize> = dims
                 .iter()
                 .map(|d| {
@@ -281,6 +287,7 @@ pub(crate) fn fold(
             };
             let cells = Cells {
                 dims: &dims,
+                keys: &keys,
                 strides: &strides,
                 extent: &extent,
             };
@@ -301,7 +308,7 @@ pub(crate) fn fold(
                 .flat_map(|x| (0..ny).map(move |y| (x, y)))
                 .collect();
             let mut columns: Vec<ArrayRef> = Vec::with_capacity(fold.outputs().len() + 1);
-            for d in fold.outputs().iter().map(|o| o.dimension) {
+            for d in fold.outputs().iter().map(|o| o.dimension.0) {
                 // The key's place in x's or y's position, first dimension
                 // slowest.
                 let (in_x, role) = match xs.contains(&d) {
@@ -332,6 +339,8 @@ pub(crate) fn fold(
 /// dense output, and every dimension's extent.
 struct Cells<'a> {
     dims: &'a [usize],
+    /// The domain's column for each output.
+    keys: &'a [ColumnIndex],
     strides: &'a [usize],
     extent: &'a [usize],
 }
@@ -349,7 +358,7 @@ fn domain_batch(
 ) -> Result<RecordBatch> {
     const NO_GROUP: usize = usize::MAX;
     let mut cell = vec![0usize; batch.num_rows()];
-    for ((&d, &stride), &(col, _)) in cells.dims.iter().zip(cells.strides).zip(&spec.keys) {
+    for ((&d, &stride), &ColumnIndex(col)) in cells.dims.iter().zip(cells.strides).zip(cells.keys) {
         // Out-of-range unsigned keys become NULL here, so match no group.
         let k = cast(batch.column(col), &DataType::Int64)?;
         let k = k
@@ -384,7 +393,7 @@ fn domain_batch(
     let mut columns: Vec<ArrayRef> = spec
         .carry
         .iter()
-        .map(|&c| Arc::clone(batch.column(c)))
+        .map(|&c| Arc::clone(batch.column(c.0)))
         .collect();
     columns.push(Arc::new(values));
     RecordBatch::try_new(Arc::clone(schema), columns)

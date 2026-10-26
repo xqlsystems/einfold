@@ -6,3 +6,7 @@
 //!
 //! Nothing in this crate depends on a query engine, so every engine
 //! integration can share it.
+
+pub mod fold;
+
+pub use fold::{Aggregate, Dimension, Domain, Fold, InvalidFold, KeyEquality, Operand, Output};

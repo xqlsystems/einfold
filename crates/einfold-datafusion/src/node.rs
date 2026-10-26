@@ -30,6 +30,9 @@ pub struct FoldNode {
     fallback: Option<LogicalPlan>,
     /// Whether [`DetectFolds`](crate::DetectFolds) made this node.
     found: bool,
+    /// Whether the node computes its fold only when no two domain rows reach
+    /// one group, and runs its fallback otherwise.
+    unique_domain: bool,
 }
 
 impl FoldNode {
@@ -71,6 +74,7 @@ impl FoldNode {
             schema,
             fallback: None,
             found: false,
+            unique_domain: false,
         })
     }
 
@@ -82,6 +86,21 @@ impl FoldNode {
         self.fallback = Some(plan);
         self.found = true;
         self
+    }
+
+    /// This node, computing its fold only when no two of its domain's rows
+    /// reach one group, and running its fallback otherwise: for a plan that
+    /// joins a fold back to its domain and groups again by the domain's keys,
+    /// which is the fold from its domain exactly then.
+    pub(crate) fn requiring_unique_domain(mut self) -> Self {
+        self.unique_domain = true;
+        self
+    }
+
+    /// Whether the node computes its fold only when its domain's keys are
+    /// unique, running its fallback otherwise.
+    pub fn unique_domain(&self) -> bool {
+        self.unique_domain
     }
 
     /// This node, marked as made by [`DetectFolds`](crate::DetectFolds)
@@ -122,12 +141,10 @@ impl FoldNode {
 // The schema follows from the fold and the inputs, so ordering ignores it.
 impl PartialOrd for FoldNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        (&self.fold, &self.inputs, &self.fallback, self.found).partial_cmp(&(
-            &other.fold,
-            &other.inputs,
-            &other.fallback,
-            other.found,
-        ))
+        fn key(n: &FoldNode) -> impl PartialOrd + '_ {
+            (&n.fold, &n.inputs, &n.fallback, n.found, n.unique_domain)
+        }
+        key(self).partial_cmp(&key(other))
     }
 }
 
@@ -149,7 +166,7 @@ impl UserDefinedLogicalNodeCore for FoldNode {
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Fold: {}", describe(&self.fold))
+        write!(f, "Fold: {}", describe(&self.fold, self.unique_domain))
     }
 
     fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
@@ -167,6 +184,7 @@ impl UserDefinedLogicalNodeCore for FoldNode {
         Ok(FoldNode {
             fallback: self.fallback.clone(),
             found: self.found,
+            unique_domain: self.unique_domain,
             ..node
         })
     }
@@ -174,9 +192,10 @@ impl UserDefinedLogicalNodeCore for FoldNode {
 
 /// The fold in einsum notation for `EXPLAIN`: each operand's dimensions,
 /// then the outputs, such as `a,b * b,c -> a,c` for a matrix product, with
-/// `+ domain` when there is one. Dimensions are lettered by number, as the
+/// `+ domain` when there is one (`+ unique domain` when the node requires
+/// its keys to be unique). Dimensions are lettered by number, as the
 /// fold names none; past `z`, they are shown as `#26`, `#27`, ….
-pub(crate) fn describe(fold: &Fold) -> String {
+pub(crate) fn describe(fold: &Fold, unique_domain: bool) -> String {
     let name = |DimensionId(d): DimensionId| match u8::try_from(d) {
         Ok(d) if d < 26 => char::from(b'a' + d).to_string(),
         _ => format!("#{d}"),
@@ -197,10 +216,10 @@ pub(crate) fn describe(fold: &Fold) -> String {
         "{} -> {}{}",
         operands.join(" * "),
         outputs.join(","),
-        if fold.domain().is_some() {
-            " + domain"
-        } else {
-            ""
+        match (fold.domain(), unique_domain) {
+            (None, _) => "",
+            (Some(_), false) => " + domain",
+            (Some(_), true) => " + unique domain",
         }
     )
 }

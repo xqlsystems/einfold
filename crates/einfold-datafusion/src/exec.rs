@@ -70,6 +70,8 @@ pub struct EinFoldExec {
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     /// The host's plan for the same rows, run instead of the hash algorithm.
     fallback: Option<Arc<dyn ExecutionPlan>>,
+    /// Whether to run the fallback unless no two domain rows reach one group.
+    unique_domain: bool,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -88,6 +90,7 @@ impl EinFoldExec {
             fold,
             inputs,
             fallback: None,
+            unique_domain: false,
             properties: Arc::new(properties),
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -101,6 +104,14 @@ impl EinFoldExec {
         self
     }
 
+    /// This operator, computing its fold only when no two of its domain's
+    /// rows reach one group, and running its fallback otherwise. It needs a
+    /// fallback (see [`EinFoldExec::with_fallback`]).
+    pub fn requiring_unique_domain(mut self) -> Self {
+        self.unique_domain = true;
+        self
+    }
+
     /// The host's plan this operator runs where the dense algorithm doesn't
     /// apply, if it has one.
     pub fn fallback(&self) -> Option<&Arc<dyn ExecutionPlan>> {
@@ -111,6 +122,7 @@ impl EinFoldExec {
     fn copy(&self, inputs: Vec<Arc<dyn ExecutionPlan>>) -> EinFoldExec {
         let mut exec = EinFoldExec::new(self.fold.clone(), inputs, self.schema());
         exec.fallback = self.fallback.clone();
+        exec.unique_domain = self.unique_domain;
         exec
     }
 
@@ -122,7 +134,11 @@ impl EinFoldExec {
 
 impl DisplayAs for EinFoldExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "EinFoldExec: {}", describe(&self.fold))
+        write!(
+            f,
+            "EinFoldExec: {}",
+            describe(&self.fold, self.unique_domain)
+        )
     }
 }
 
@@ -234,7 +250,11 @@ impl ExecutionPlan for EinFoldExec {
         let options = Options {
             host: HOST,
             threads: context.session_config().target_partitions(),
+            unique_domain: self.unique_domain,
         };
+        if self.unique_domain && self.fallback.is_none() {
+            return internal_err!("EinFoldExec requires a unique domain, but has no fallback");
+        }
         let builder = || MetricBuilder::new(&self.metrics);
         let dense_folds = builder().global_counter("dense_folds");
         let hash_folds = builder().global_counter("hash_folds");
@@ -356,6 +376,9 @@ impl ExtensionPlanner for EinFoldPlanner {
         let mut exec = EinFoldExec::new(node.fold().clone(), physical_inputs.to_vec(), schema);
         if let Some(plan) = node.fallback() {
             exec = exec.with_fallback(planner.create_physical_plan(plan, session).await?);
+        }
+        if node.unique_domain() {
+            exec = exec.requiring_unique_domain();
         }
         Ok(Some(Arc::new(exec)))
     }

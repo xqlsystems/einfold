@@ -16,6 +16,7 @@
 //! engine.
 
 mod exec;
+mod join_back;
 mod node;
 mod rule;
 

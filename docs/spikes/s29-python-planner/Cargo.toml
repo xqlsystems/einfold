@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Spike S29: einfold's query planner in datafusion-python, through its FFI.
+[package]
+name = "einfold-spike-s29"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+name = "einfold_spike"
+crate-type = ["cdylib"]
+
+[dependencies]
+async-trait = "0.1"
+datafusion = "=55.2.0"
+datafusion-ffi = "=55.2.0"
+datafusion-proto = "=55.2.0"
+# einfold at xqlsystems/einfold#57, which runs EinFoldExec where there is no
+# Tokio runtime, as there isn't when a host polls it through the FFI.
+einfold-datafusion = { git = "https://github.com/xqlsystems/einfold", rev = "1dddecadb2c718433cd8329a35b7759e9c2c6181" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+futures = "0.3"
+pyo3 = { version = "0.29", features = ["extension-module", "abi3", "abi3-py310"] }

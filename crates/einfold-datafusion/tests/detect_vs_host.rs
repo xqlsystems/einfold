@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Property: with einfold installed, DataFusion returns exactly what it
-//! returns without, for random queries over random tables; and `EinFoldRule`
+//! returns without, for random queries over random tables; and `DetectFolds`
 //! finds the folds it claims to and leaves the rest alone.
 //!
 //! Each case draws two operand tables `l` and `r`, and a domain table `d`,
@@ -16,18 +16,18 @@
 //! - **folds** (`SUM` of a product over an inner equi-join, grouped by columns
 //!   of either side, with `=` or `IS NOT DISTINCT FROM`, factors that are
 //!   expressions, aliases), which the rule must replace;
-//! - **fills** (ddx's left join from `d` onto a fold, with its `CASE`), which
-//!   the rule must turn into a fold with a domain;
+//! - **folds from a domain** (ddx's left join from `d` onto a fold, with its
+//!   `CASE`), which the rule must turn into a fold with `d` as its domain;
 //! - **look-alikes** it must leave alone: a mask (`AND l.a >= r.b`), no
 //!   `GROUP BY`, `AVG` rather than `SUM`, and a sum that isn't a product;
-//!   and fills' look-alikes, in which it must find the fold but give it no
+//!   and look-alikes of a fold from a domain, in which it must find the fold but give it no
 //!   domain: a projection that reads the fold's keys, and inner and right
 //!   joins.
 //!
 //! Invariants: the same rows, as a multiset, bit for bit (every NaN alike), as
-//! without einfold; the rule fires on every fold and fill, and never on a
+//! without einfold; the rule fires on every fold and fold from a domain, and never on a
 //! look-alike. Half the cases run every fold the rule finds through einfold's
-//! own kernels (`EinFoldRule::without_fallback`), so that the folds the rule
+//! own kernels (`DetectFolds::without_fallback`), so that the folds the rule
 //! describes are checked even where the dense algorithm doesn't apply.
 //!
 //! Reproduce a failure with `EINFOLD_SEED=<seed printed>`; search longer with
@@ -44,7 +44,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use einfold_datafusion::{EinFoldExec, EinFoldQueryPlanner, EinFoldRule, FoldNode};
+use einfold_datafusion::{DetectFolds, EinFoldExec, EinFoldQueryPlanner, FoldNode};
 
 struct Rng(u64);
 
@@ -161,8 +161,8 @@ enum Expect {
     /// A fold, with no domain.
     Fold,
     /// A fold with a domain.
-    Fill,
-    /// A fill's look-alike: the fold is found, but it gets no domain.
+    FromDomain,
+    /// A look-alike of a fold from a domain: the fold is found, but it gets no domain.
     FoldOnly,
     /// No fold at all.
     Decline,
@@ -218,7 +218,7 @@ fn query(rng: &mut Rng) -> (String, Expect) {
     match rng.below(8) {
         0..=2 => (fold(&product, false), Expect::Fold),
         3..=4 if groups.len() == 2 => {
-            // ddx's fill: every row of d gets its group's sum, 0 where none.
+            // A fold from a domain, as ddx writes it: every row of d gets its group's sum, 0 where none.
             // Its look-alikes, which keep the fold but must not become a
             // domain: a projection that reads the fold's keys, or a join
             // that isn't a left join from d.
@@ -231,7 +231,7 @@ fn query(rng: &mut Rng) -> (String, Expect) {
                 _ => ("d.b", "LEFT JOIN"),
             };
             let expect = match (reads, join) {
-                ("d.b", "LEFT JOIN") => Expect::Fill,
+                ("d.b", "LEFT JOIN") => Expect::FromDomain,
                 _ => Expect::FoldOnly,
             };
             (
@@ -270,8 +270,8 @@ fn host(threads: usize) -> SessionContext {
 fn einfold(threads: usize, fallback: bool) -> SessionContext {
     let config = SessionConfig::new().with_target_partitions(threads);
     let rule = match fallback {
-        true => EinFoldRule::default(),
-        false => EinFoldRule::without_fallback(),
+        true => DetectFolds::default(),
+        false => DetectFolds::without_fallback(),
     };
     let state = SessionStateBuilder::new()
         .with_default_features()
@@ -381,7 +381,7 @@ async fn einfold_changes_no_answer() {
         let (found, domains) = exec_folds(&physical);
         let ok = match expect {
             Expect::Fold | Expect::FoldOnly => found == 1 && domains == 0,
-            Expect::Fill => found == 1 && domains == 1,
+            Expect::FromDomain => found == 1 && domains == 1,
             Expect::Decline => found == 0,
         };
         if !ok {

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`EinFoldRule`]: an optimizer rule that finds folds over joins in
+//! [`DetectFolds`]: an optimizer rule that finds folds over joins in
 //! DataFusion's plans and replaces them with [`FoldNode`]s.
 //!
 //! It finds two shapes, and leaves everything else alone:
@@ -19,12 +19,13 @@
 //!    row even when nothing joined, and a fold doesn't.) A condition of the
 //!    join that isn't an equality, such as causal attention's `q.t >= k.t`,
 //!    is a mask, which comes later; such joins are left alone.
-//! 2. **A fill.** A projection over `d LEFT JOIN f ON <d's columns> = <f's
-//!    group keys>`, where `f` is a fold found by shape 1, the join matches
-//!    every one of `f`'s group keys, and the projection reads only `d`'s
-//!    columns and `f`'s sum. The fold gets `d` as its domain. This is how ddx,
-//!    an XQL Systems project for automatic differentiation of SQL queries,
-//!    gives every row of a table its gradient.
+//! 2. **A fold from a domain.** A projection over `d LEFT JOIN f ON <d's
+//!    columns> = <f's group keys>`, where `f` is a fold found by shape 1, the
+//!    join matches every one of `f`'s group keys, and the projection reads
+//!    only `d`'s columns and `f`'s sum. The fold gets `d` as its domain, the
+//!    relation whose rows its output has. This is how ddx, an XQL Systems
+//!    project for automatic differentiation of SQL queries, gives every row
+//!    of a table its gradient; ddx calls these rows its "fill".
 //!
 //! The rule runs after DataFusion's own rules, so filters are already pushed
 //! below the join, and keeps every plan's schema exactly: names, qualifiers,
@@ -60,28 +61,28 @@ const PREFIX: &str = "__einfold_";
 /// then optimized plans contain `Fold` nodes, which a Substrait producer, such
 /// as ddx's, can't encode.
 #[derive(Debug)]
-pub struct EinFoldRule {
+pub struct DetectFolds {
     fallback: bool,
 }
 
-impl Default for EinFoldRule {
+impl Default for DetectFolds {
     fn default() -> Self {
-        EinFoldRule { fallback: true }
+        DetectFolds { fallback: true }
     }
 }
 
-impl EinFoldRule {
+impl DetectFolds {
     /// The rule, but with nodes that run EinFold's hash algorithm where the
     /// dense one doesn't apply, rather than the host's plan. Slower, and for
     /// tests: it makes every fold the rule describes run through einfold.
     pub fn without_fallback() -> Self {
-        EinFoldRule { fallback: false }
+        DetectFolds { fallback: false }
     }
 }
 
-impl OptimizerRule for EinFoldRule {
+impl OptimizerRule for DetectFolds {
     fn name(&self) -> &str {
-        "einfold"
+        "detect_folds"
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {
@@ -95,7 +96,7 @@ impl OptimizerRule for EinFoldRule {
     ) -> Result<Transformed<LogicalPlan>> {
         let found = match &plan {
             LogicalPlan::Aggregate(agg) => fold(agg, self.fallback)?,
-            LogicalPlan::Projection(p) => fill(p, self.fallback)?,
+            LogicalPlan::Projection(p) => from_domain(p, self.fallback)?,
             _ => None,
         };
         Ok(match found {
@@ -225,7 +226,7 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
         }
     }
     let mut outputs = Vec::new();
-    for (i, g) in agg.group_expr.iter().enumerate() {
+    for g in &agg.group_expr {
         let g = resolve(g, &projections)?;
         let (Expr::Column(_), Some(s)) = (&g, side(&g, inputs)) else {
             return Ok(None);
@@ -248,7 +249,6 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
         }
         outputs.push(Output {
             dimension: DimensionId(d),
-            name: format!("{PREFIX}o{i}"),
             domain_key: None,
         });
     }
@@ -277,14 +277,17 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
         outputs,
         RowValue::Product,
         FoldAggregate::sum(),
-        format!("{PREFIX}v"),
         None,
     ) else {
         return Ok(None);
     };
     let plans = operands.into_iter().map(|(_, p)| p).collect();
     let original = LogicalPlan::Aggregate(agg.clone());
-    let Ok(node) = FoldNode::try_new(spec, plans, None) else {
+    let names: Vec<String> = (0..agg.group_expr.len())
+        .map(|i| format!("{PREFIX}o{i}"))
+        .chain([format!("{PREFIX}v")])
+        .collect();
+    let Ok(node) = FoldNode::try_new(spec, plans, None, names.clone()) else {
         return Ok(None);
     };
     let node = match fallback {
@@ -294,10 +297,6 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
     .into_plan();
     // Give the node the aggregate's schema: its names, qualifiers, types
     // and nullability.
-    let names: Vec<String> = (0..agg.group_expr.len())
-        .map(|i| format!("{PREFIX}o{i}"))
-        .chain([format!("{PREFIX}v")])
-        .collect();
     restore(node, &names, &agg.schema)
 }
 
@@ -331,7 +330,7 @@ fn same_schema(a: &DFSchemaRef, b: &DFSchemaRef) -> bool {
         })
 }
 
-// --- shape 2: a fill --------------------------------------------------------------
+// --- shape 2: a fold from a domain --------------------------------------------
 
 /// The fold this rule made under `plan`, through any aliases and projections
 /// that only rename or reorder columns, with, for each column of `plan`, its
@@ -363,7 +362,7 @@ fn found_fold(plan: &LogicalPlan) -> Option<(&FoldNode, Vec<usize>)> {
 
 /// `p` over a left join from a relation onto a fold, with the relation as the
 /// fold's domain, if that is what `p` is.
-fn fill(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
+fn from_domain(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
     let LogicalPlan::Join(join) = p.input.as_ref() else {
         return Ok(None);
     };
@@ -436,7 +435,7 @@ fn fill(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
         .zip(keys)
         .map(|(o, key)| Output {
             domain_key: Some(key),
-            ..o.clone()
+            ..*o
         })
         .collect();
     let Ok(with_domain) = Fold::try_new(
@@ -445,7 +444,6 @@ fn fill(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
         outputs,
         fold.row(),
         fold.aggregate().clone(),
-        fold.value(),
         Some(spec),
     ) else {
         return Ok(None);
@@ -460,10 +458,17 @@ fn fill(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
     kept.push(Expr::Column(value.clone()));
     let original = LogicalPlan::Projection(Projection::try_new(kept, Arc::clone(&p.input))?);
     let inputs = node.inputs_owned();
+    // The domain's columns keep their names, and the value takes one that
+    // can't clash with theirs.
+    let names: Vec<String> = (domain.schema().fields().iter())
+        .map(|f| f.name().clone())
+        .chain([format!("{PREFIX}v")])
+        .collect();
     let Ok(new) = FoldNode::try_new(
         with_domain,
         inputs[..2].to_vec(),
         Some(domain.as_ref().clone()),
+        names.clone(),
     ) else {
         return Ok(None);
     };
@@ -473,12 +478,6 @@ fn fill(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
     }
     .into_plan();
     // Rename the node's columns to the join's, so `p` reads them as before.
-    let names: Vec<String> = new
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
     let Some(renamed) = restore(new, &names, original.schema())? else {
         return Ok(None);
     };

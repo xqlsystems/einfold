@@ -28,7 +28,7 @@ pub struct FoldNode {
     /// The plan this node replaced, if it replaced one: its columns are the
     /// node's, in order, though their names may differ.
     fallback: Option<LogicalPlan>,
-    /// Whether [`EinFoldRule`](crate::EinFoldRule) made this node.
+    /// Whether [`DetectFolds`](crate::DetectFolds) made this node.
     found: bool,
 }
 
@@ -84,14 +84,14 @@ impl FoldNode {
         self
     }
 
-    /// This node, marked as made by [`EinFoldRule`](crate::EinFoldRule)
+    /// This node, marked as made by [`DetectFolds`](crate::DetectFolds)
     /// without a fallback.
     pub(crate) fn marked_found(mut self) -> Self {
         self.found = true;
         self
     }
 
-    /// Whether [`EinFoldRule`](crate::EinFoldRule) made this node.
+    /// Whether [`DetectFolds`](crate::DetectFolds) made this node.
     pub(crate) fn found(&self) -> bool {
         self.found
     }

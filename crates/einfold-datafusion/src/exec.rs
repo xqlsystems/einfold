@@ -37,7 +37,7 @@ use futures::future::try_join_all;
 use futures::{stream, StreamExt, TryStreamExt};
 
 use crate::node::{describe, FoldNode};
-use crate::rule::EinFoldRule;
+use crate::rule::DetectFolds;
 use crate::HOST;
 
 /// Computes a fold over a join (see [`FoldNode`]) without forming the join's
@@ -336,7 +336,7 @@ impl ExtensionPlanner for EinFoldPlanner {
 }
 
 /// DataFusion's default query planner, with [`EinFoldPlanner`] added, and,
-/// if made with [`EinFoldQueryPlanner::detecting`], [`EinFoldRule`] applied to
+/// if made with [`EinFoldQueryPlanner::detecting`], [`DetectFolds`] applied to
 /// each optimized logical plan just before it is planned. Install it with
 /// `SessionStateBuilder::with_query_planner`, or use [`install`](crate::install).
 ///
@@ -348,12 +348,12 @@ impl ExtensionPlanner for EinFoldPlanner {
 /// bindings, can take a query planner.
 #[derive(Debug, Default)]
 pub struct EinFoldQueryPlanner {
-    detect: Option<EinFoldRule>,
+    detect: Option<DetectFolds>,
 }
 
 impl EinFoldQueryPlanner {
     /// The planner, applying `rule` to each plan before planning it.
-    pub fn detecting(rule: EinFoldRule) -> Self {
+    pub fn detecting(rule: DetectFolds) -> Self {
         EinFoldQueryPlanner { detect: Some(rule) }
     }
 }

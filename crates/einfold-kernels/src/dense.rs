@@ -328,19 +328,23 @@ pub(crate) fn fold(
                 strides: &strides,
                 extent: &extent,
             };
-            let mut seen = vec![false; if unique_domain { nx * ny } else { 0 }];
-            let mut batches = Vec::with_capacity(domain.len());
-            for f in domain {
-                let cell = locate(f, &cells)?;
-                if unique_domain
-                    && (cell.iter())
-                        .any(|&c| c != NO_GROUP && std::mem::replace(&mut seen[c], true))
-                {
-                    return Ok(None);
+            // Each batch's cells, then its rows, on the threads in turn: the
+            // batches are independent, and each comes back in its place.
+            let located = par_tasks(domain.len(), threads, |i| locate(&domain[i], &cells))
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            if unique_domain {
+                let mut seen = vec![false; nx * ny];
+                for &c in located.iter().flatten() {
+                    if c != NO_GROUP && std::mem::replace(&mut seen[c], true) {
+                        return Ok(None);
+                    }
                 }
-                batches.push(domain_batch(f, &cell, spec, &value, &schema)?);
             }
-            Ok(Some(batches))
+            let batches = par_tasks(domain.len(), threads, |i| {
+                domain_batch(&domain[i], &located[i], spec, &value, &schema)
+            });
+            Ok(Some(batches.into_iter().collect::<Result<_>>()?))
         }
         (None, None) => {
             // Without a domain, the groups are (x, y) for each x some row of a

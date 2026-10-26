@@ -43,7 +43,8 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use einfold_ir::{
-    Aggregate as FoldAggregate, Dimension, Domain, Fold, KeyEquality, Operand, Output,
+    Aggregate as FoldAggregate, ColumnIndex, Dimension, DimensionId, Domain, Fold, KeyEquality,
+    Operand, Output, RowValue,
 };
 
 use crate::node::FoldNode;
@@ -207,12 +208,12 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
     };
     let mut dimensions = Vec::new();
     let mut columns: [Vec<Expr>; 2] = [Vec::new(), Vec::new()];
-    let mut keys: [Vec<(usize, usize)>; 2] = [Vec::new(), Vec::new()];
+    let mut keys: [Vec<(DimensionId, ColumnIndex)>; 2] = [Vec::new(), Vec::new()];
     let mut hold = |s: usize, d: usize, e: Expr, columns: &mut [Vec<Expr>; 2]| {
         if columns[s].contains(&e) {
             return false;
         }
-        keys[s].push((d, columns[s].len()));
+        keys[s].push((DimensionId(d), ColumnIndex(columns[s].len())));
         columns[s].push(e);
         true
     };
@@ -239,12 +240,16 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
                 dimensions.len() - 1
             }
         };
-        if outputs.iter().any(|o: &Output| o.dimension == d) {
+        if outputs
+            .iter()
+            .any(|o: &Output| o.dimension == DimensionId(d))
+        {
             return Ok(None);
         }
         outputs.push(Output {
-            dimension: d,
+            dimension: DimensionId(d),
             name: format!("{PREFIX}o{i}"),
+            domain_key: None,
         });
     }
     let mut operands = Vec::new();
@@ -261,7 +266,7 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
         operands.push((
             Operand {
                 keys: std::mem::take(&mut keys[s]),
-                factor: Some(columns[s].len()),
+                factor: Some(ColumnIndex(columns[s].len())),
             },
             LogicalPlan::Projection(Projection::try_new(exprs, Arc::clone(input))?),
         ));
@@ -270,7 +275,8 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
         dimensions,
         operands.iter().map(|(o, _)| o.clone()).collect(),
         outputs,
-        FoldAggregate::SumOfProducts,
+        RowValue::Product,
+        FoldAggregate::sum(),
         format!("{PREFIX}v"),
         None,
     ) else {
@@ -384,7 +390,7 @@ fn fill(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
         NullEquality::NullEqualsNull => KeyEquality::NotDistinct,
         NullEquality::NullEqualsNothing => KeyEquality::Equal,
     };
-    let mut keys: Vec<Option<(usize, KeyEquality)>> = vec![None; n];
+    let mut keys: Vec<Option<(ColumnIndex, KeyEquality)>> = vec![None; n];
     for (l, r) in on {
         let (Expr::Column(lc), Expr::Column(rc)) = (l, r) else {
             return Ok(None);
@@ -396,7 +402,7 @@ fn fill(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
             return Ok(None);
         };
         let i = columns[i];
-        if i >= n || keys[i].replace((d, equality)).is_some() {
+        if i >= n || keys[i].replace((ColumnIndex(d), equality)).is_some() {
             return Ok(None);
         }
     }
@@ -420,15 +426,25 @@ fn fill(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
     }
     let width = domain.schema().fields().len();
     let spec = Domain {
-        keys,
-        carry: (0..width).collect(),
+        carry: (0..width).map(ColumnIndex).collect(),
         missing: None,
     };
+    // Each output, now matched with its domain column.
+    let outputs = fold
+        .outputs()
+        .iter()
+        .zip(keys)
+        .map(|(o, key)| Output {
+            domain_key: Some(key),
+            ..o.clone()
+        })
+        .collect();
     let Ok(with_domain) = Fold::try_new(
         fold.dimensions().to_vec(),
         fold.operands().to_vec(),
-        fold.outputs().to_vec(),
-        fold.aggregate(),
+        outputs,
+        fold.row(),
+        fold.aggregate().clone(),
         fold.value(),
         Some(spec),
     ) else {

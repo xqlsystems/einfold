@@ -27,7 +27,7 @@ If you're not sure where to start, look for issues labeled [`good first issue`](
 
 ## Getting set up
 
-1. **Install Rust** with [rustup](https://rustup.rs). einfold needs Rust 1.88 or newer:
+1. **Install Rust** with [rustup](https://rustup.rs). einfold needs Rust 1.94 or newer:
 
    ```sh
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh

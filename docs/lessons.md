@@ -66,9 +66,11 @@ From the maintainer's review of the IR (#6):
 - **A product is NULL exactly when one of its factors is NULL.** NaN and infinity are not NULL. So `COUNT` of a product is a sum of products of 0/1 indicators.
 - **A masked pair is an absent row, not a zero.** A dense kernel that gives masked pairs a weight of 0 turns a NaN in a masked value into NaN outputs that SQL computes from other rows (`0 · NaN` is NaN). Partly masked tiles must skip masked pairs (spike S27). The same holds for missing rows (spike S25).
 
-## DataFusion 54.1.0 behaviors
+## DataFusion behaviors
 
-- **Float keys compare bitwise.** `-0.0` and `0.0` are different keys, and `NaN` equals `NaN`.
+As of DataFusion 55.2.0. `crates/einfold-datafusion/tests/datafusion_behaviors.rs` pins the ones einfold must match, and fails when one changes.
+
+- **Float keys compare bitwise, except that `-0.0` and `0.0` are one key.** In joins, `GROUP BY` and `COUNT(DISTINCT)`, `NaN` equals `NaN`, a NaN with the sign bit set is a different key, and a group of `-0.0` and `0.0` is emitted as `0.0`. DataFusion 54.1.0 kept `-0.0` and `0.0` apart, and einfold's property test caught the change. A dictionary-encoded `DOUBLE` still keeps them apart when grouped.
 - **`MIN` and `MAX` order floats by IEEE 754's total order,** as Arrow does: a NaN with the sign bit clear is above every number, one with it set is below every number, and `-0.0` is below `0.0`.
 - **Integer arithmetic wraps** on overflow.
 - **Partial aggregate states have fixed schemas,** given by each aggregate's `state_fields`. For example, `SUM(double)` is `[sum]`, and `AVG` is `[count, sum]`.

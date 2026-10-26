@@ -56,8 +56,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # "1.88" is the MSRV and must match `rust-version` in Cargo.toml.
-        rust: [stable, beta, "1.88"]
+        # "1.94" is the MSRV and must match `rust-version` in Cargo.toml.
+        rust: [stable, beta, "1.94"]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master

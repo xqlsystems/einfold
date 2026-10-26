@@ -19,6 +19,6 @@ mod tests {
 
     #[test]
     fn pinned_datafusion_version() {
-        assert_eq!(DATAFUSION_VERSION, "54.1.0");
+        assert_eq!(DATAFUSION_VERSION, "55.2.0");
     }
 }

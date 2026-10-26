@@ -53,10 +53,17 @@ use crate::HOST;
 /// runs the kernels on a blocking thread, off the async runtime; and its
 /// metrics, shown by `EXPLAIN ANALYZE`, count which algorithm ran
 /// (`dense_folds`, `hash_folds`), its compute time and its output rows.
+///
+/// Given the plan it replaced (see [`EinFoldExec::with_fallback`]), it runs
+/// that plan where the dense algorithm doesn't apply, and counts it in
+/// `host_plans`, so it is never slower than the host's own plan by more than
+/// reading its inputs once.
 #[derive(Debug)]
 pub struct EinFoldExec {
     fold: Fold,
     inputs: Vec<Arc<dyn ExecutionPlan>>,
+    /// The host's plan for the same rows, run instead of the hash algorithm.
+    fallback: Option<Arc<dyn ExecutionPlan>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -74,9 +81,18 @@ impl EinFoldExec {
         EinFoldExec {
             fold,
             inputs,
+            fallback: None,
             properties: Arc::new(properties),
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// This operator, running `plan` when the dense algorithm doesn't apply,
+    /// instead of the hash algorithm. `plan` must produce the operator's
+    /// columns, in order, under any names.
+    pub fn with_fallback(mut self, plan: Arc<dyn ExecutionPlan>) -> Self {
+        self.fallback = Some(plan);
+        self
     }
 
     /// The fold this operator computes.
@@ -167,11 +183,9 @@ impl ExecutionPlan for EinFoldExec {
                 children.len()
             );
         }
-        Ok(Arc::new(EinFoldExec::new(
-            self.fold.clone(),
-            children,
-            self.schema(),
-        )))
+        let mut exec = EinFoldExec::new(self.fold.clone(), children, self.schema());
+        exec.fallback = self.fallback.clone();
+        Ok(Arc::new(exec))
     }
 
     fn execute(
@@ -196,6 +210,8 @@ impl ExecutionPlan for EinFoldExec {
         let builder = || MetricBuilder::new(&self.metrics);
         let dense_folds = builder().global_counter("dense_folds");
         let hash_folds = builder().global_counter("hash_folds");
+        let host_plans = builder().global_counter("host_plans");
+        let fallback = self.fallback.clone();
         let compute = builder().elapsed_compute(0);
         let output_rows = builder().output_rows(0);
         // Shared with the kernel's task, which holds the inputs it counts: a
@@ -218,11 +234,19 @@ impl ExecutionPlan for EinFoldExec {
             let b = concat(&schemas[1], batches.pop().unwrap(), &reservation)?;
             let a = concat(&schemas[0], batches.pop().unwrap(), &reservation)?;
             let timer = compute.timer();
+            let with_fallback = fallback.is_some();
+            let kernel_out = Arc::clone(&out);
             let held = Arc::clone(&reservation);
-            let (algorithm, batches) = SpawnedTask::spawn_blocking(move || {
-                let folded = einfold_kernels::fold(&fold, &a, &b, domain.as_deref(), out, options);
-                drop(held);
-                folded
+            let ran = SpawnedTask::spawn_blocking(move || {
+                let _held = held;
+                let domain = domain.as_deref();
+                match with_fallback {
+                    true => einfold_kernels::fold_dense(&fold, &a, &b, domain, kernel_out, options)
+                        .map(|r| r.map(|batches| (Algorithm::Dense, batches))),
+                    false => {
+                        einfold_kernels::fold(&fold, &a, &b, domain, kernel_out, options).map(Some)
+                    }
+                }
             })
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))??;
@@ -232,10 +256,27 @@ impl ExecutionPlan for EinFoldExec {
             // without einfold. The output, which may share the domain's
             // columns, is counted below.
             reservation.free();
-            match algorithm {
-                Algorithm::Dense => dense_folds.add(1),
-                Algorithm::Hash => hash_folds.add(1),
-            }
+            let batches = match (ran, fallback) {
+                (Some((Algorithm::Dense, batches)), _) => {
+                    dense_folds.add(1);
+                    batches
+                }
+                (Some((Algorithm::Hash, batches)), _) => {
+                    hash_folds.add(1);
+                    batches
+                }
+                (None, Some(plan)) => {
+                    // The host's plan, its columns under this operator's names.
+                    host_plans.add(1);
+                    collect_partitioned(plan, Arc::clone(&context))
+                        .await?
+                        .concat()
+                        .into_iter()
+                        .map(|b| RecordBatch::try_new(Arc::clone(&out), b.columns().to_vec()))
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                }
+                (None, None) => return internal_err!("EinFoldExec ran no algorithm"),
+            };
             for b in &batches {
                 output_rows.add(b.num_rows());
                 reservation.try_grow(b.get_array_memory_size())?;
@@ -273,22 +314,22 @@ pub struct EinFoldPlanner;
 impl ExtensionPlanner for EinFoldPlanner {
     async fn plan_extension(
         &self,
-        _planner: &dyn PhysicalPlanner,
+        planner: &dyn PhysicalPlanner,
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session: &dyn Session,
+        session: &dyn Session,
         _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let Some(node) = node.as_any().downcast_ref::<FoldNode>() else {
             return Ok(None);
         };
         let schema = Arc::new(node.schema().as_arrow().clone());
-        Ok(Some(Arc::new(EinFoldExec::new(
-            node.fold().clone(),
-            physical_inputs.to_vec(),
-            schema,
-        ))))
+        let mut exec = EinFoldExec::new(node.fold().clone(), physical_inputs.to_vec(), schema);
+        if let Some(plan) = node.fallback() {
+            exec = exec.with_fallback(planner.create_physical_plan(plan, session).await?);
+        }
+        Ok(Some(Arc::new(exec)))
     }
 }
 

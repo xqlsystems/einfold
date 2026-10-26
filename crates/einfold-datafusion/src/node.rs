@@ -25,6 +25,11 @@ pub struct FoldNode {
     fold: Fold,
     inputs: Vec<LogicalPlan>,
     schema: DFSchemaRef,
+    /// The plan this node replaced, if it replaced one: its columns are the
+    /// node's, in order, though their names may differ.
+    fallback: Option<LogicalPlan>,
+    /// Whether [`EinFoldRule`](crate::EinFoldRule) made this node.
+    found: bool,
 }
 
 impl FoldNode {
@@ -64,7 +69,41 @@ impl FoldNode {
             fold,
             inputs,
             schema,
+            fallback: None,
+            found: false,
         })
+    }
+
+    /// This node, keeping `plan` as the plan it replaced. When the dense
+    /// algorithm doesn't apply, [`EinFoldExec`](crate::EinFoldExec) runs
+    /// `plan` instead of the hash algorithm, so the host's own plan is the
+    /// slowest the fold can be.
+    pub fn with_fallback(mut self, plan: LogicalPlan) -> Self {
+        self.fallback = Some(plan);
+        self.found = true;
+        self
+    }
+
+    /// This node, marked as made by [`EinFoldRule`](crate::EinFoldRule)
+    /// without a fallback.
+    pub(crate) fn marked_found(mut self) -> Self {
+        self.found = true;
+        self
+    }
+
+    /// Whether [`EinFoldRule`](crate::EinFoldRule) made this node.
+    pub(crate) fn found(&self) -> bool {
+        self.found
+    }
+
+    /// The plan this node replaced, if any.
+    pub fn fallback(&self) -> Option<&LogicalPlan> {
+        self.fallback.as_ref()
+    }
+
+    /// The node's inputs: its operands, then its domain.
+    pub fn inputs_owned(&self) -> Vec<LogicalPlan> {
+        self.inputs.clone()
     }
 
     /// The fold this node computes.
@@ -83,7 +122,12 @@ impl FoldNode {
 // The schema follows from the fold and the inputs, so ordering ignores it.
 impl PartialOrd for FoldNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        (&self.fold, &self.inputs).partial_cmp(&(&other.fold, &other.inputs))
+        (&self.fold, &self.inputs, &self.fallback, self.found).partial_cmp(&(
+            &other.fold,
+            &other.inputs,
+            &other.fallback,
+            other.found,
+        ))
     }
 }
 
@@ -119,7 +163,12 @@ impl UserDefinedLogicalNodeCore for FoldNode {
             (_, n) => return plan_err!("a Fold node has {} inputs, given {n}", self.inputs.len()),
         };
         let names = self.schema.fields().iter().map(|f| f.name().clone());
-        FoldNode::try_new(self.fold.clone(), operands, domain, names.collect())
+        let node = FoldNode::try_new(self.fold.clone(), operands, domain, names.collect())?;
+        Ok(FoldNode {
+            fallback: self.fallback.clone(),
+            found: self.found,
+            ..node
+        })
     }
 }
 

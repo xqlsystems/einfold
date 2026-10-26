@@ -9,16 +9,31 @@
 //! output's coordinates: a *fold over a join*. SQL engines build the join's
 //! rows before summing them; einfold sums each joined pair as it is found.
 //!
-//! A [`FoldNode`] in a logical plan stands for such a fold, and
-//! [`EinFoldQueryPlanner`] plans it as [`EinFoldExec`], which runs
-//! `einfold_kernels`. This is the only einfold crate that depends on a query
+//! [`EinFoldRule`] finds such folds in DataFusion's optimized plans and
+//! replaces each with a [`FoldNode`]; [`EinFoldQueryPlanner`] plans the node
+//! as [`EinFoldExec`], which runs `einfold_kernels`. [`install`] adds both to
+//! a session. This is the only einfold crate that depends on a query
 //! engine.
 
 mod exec;
 mod node;
+mod rule;
+
+use std::sync::Arc;
+
+use datafusion::execution::SessionStateBuilder;
 
 pub use exec::{EinFoldExec, EinFoldPlanner, EinFoldQueryPlanner};
 pub use node::FoldNode;
+pub use rule::EinFoldRule;
+
+/// `builder` with einfold installed: [`EinFoldRule`] after DataFusion's own
+/// optimizer rules, and [`EinFoldQueryPlanner`] to plan the nodes it makes.
+pub fn install(builder: SessionStateBuilder) -> SessionStateBuilder {
+    builder
+        .with_optimizer_rule(Arc::new(EinFoldRule::default()))
+        .with_query_planner(Arc::new(EinFoldQueryPlanner))
+}
 
 /// The DataFusion version this crate is built against.
 pub const DATAFUSION_VERSION: &str = datafusion::DATAFUSION_VERSION;

@@ -151,18 +151,15 @@ async fn fold_plan(ctx: &SessionContext) -> LogicalPlan {
         vec![
             Output {
                 dimension: DimensionId(0),
-                name: "s".into(),
                 domain_key: Some((ColumnIndex(0), eq)),
             },
             Output {
                 dimension: DimensionId(2),
-                name: "k".into(),
                 domain_key: Some((ColumnIndex(1), eq)),
             },
         ],
         RowValue::Product,
         Aggregate::sum(),
-        "g",
         Some(Domain {
             carry: vec![ColumnIndex(0), ColumnIndex(1), ColumnIndex(2)],
             missing: Some(0.0),
@@ -173,6 +170,7 @@ async fn fold_plan(ctx: &SessionContext) -> LogicalPlan {
         fold,
         vec![scan("c").await, scan("w").await],
         Some(scan("a").await),
+        ["s", "k", "v", "g"].map(String::from).to_vec(),
     )
     .unwrap();
     let value = when(
@@ -242,7 +240,7 @@ async fn reports_which_algorithm_ran() {
         .unwrap()
         .to_string();
     assert!(
-        text.contains("EinFoldExec: s,#1 * k,#1 -> s,k + domain"),
+        text.contains("EinFoldExec: a,b * c,b -> a,c + domain"),
         "{text}"
     );
     assert!(text.contains("dense_folds=1"), "{text}");

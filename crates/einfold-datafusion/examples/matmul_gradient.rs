@@ -74,25 +74,23 @@ fn gradient(
         vec![
             Output {
                 dimension: DimensionId(0),
-                name: cols[0].into(),
                 domain_key: Some((ColumnIndex(0), eq)),
             },
             Output {
                 dimension: DimensionId(2),
-                name: cols[2].into(),
                 domain_key: Some((ColumnIndex(1), eq)),
             },
         ],
         RowValue::Product,
         Aggregate::sum(),
-        "g",
         Some(Domain {
             carry: vec![ColumnIndex(0), ColumnIndex(1), ColumnIndex(2)],
             missing: Some(0.0),
         }),
     )
     .map_err(|e| DataFusionError::Plan(e.to_string()))?;
-    let node = FoldNode::try_new(fold, vec![l, r], Some(domain))?;
+    let names = [cols[0], cols[2], "v", "g"].map(String::from).to_vec();
+    let node = FoldNode::try_new(fold, vec![l, r], Some(domain), names)?;
     let value = when(col("v").is_null(), lit(ScalarValue::Float64(None))).otherwise(col("g"))?;
     LogicalPlanBuilder::from(node.into_plan())
         .project(vec![col(cols[0]), col(cols[2]), value.alias("v")])?

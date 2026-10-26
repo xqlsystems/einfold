@@ -12,6 +12,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::common::{plan_err, DFSchema, DFSchemaRef, Result};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan, UserDefinedLogicalNodeCore};
 use einfold_ir::{DimensionId, Fold};
@@ -28,12 +29,15 @@ pub struct FoldNode {
 
 impl FoldNode {
     /// The node computing `fold` over `operands`, with `domain` as the domain
-    /// relation when `fold` has one. Fails when the inputs don't fit the fold
-    /// (see [`einfold_kernels::schema`]).
+    /// relation when `fold` has one, and `names` naming its columns: a fold's
+    /// columns are positional (see [`einfold_kernels::schema`]), and the plan
+    /// above refers to them by name. Fails when the inputs don't fit the fold,
+    /// or when there isn't one name per column.
     pub fn try_new(
         fold: Fold,
         operands: Vec<LogicalPlan>,
         domain: Option<LogicalPlan>,
+        names: Vec<String>,
     ) -> Result<Self> {
         let arrow = |p: &LogicalPlan| p.schema().as_arrow().clone();
         let operand_schemas: Vec<_> = operands.iter().map(arrow).collect();
@@ -43,7 +47,17 @@ impl FoldNode {
             &operand_schemas.iter().collect::<Vec<_>>(),
             domain_schema.as_ref(),
         )?;
-        let schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
+        if names.len() != schema.fields().len() {
+            return plan_err!(
+                "a fold with {} columns, given {} names",
+                schema.fields().len(),
+                names.len()
+            );
+        }
+        let fields: Vec<Field> = (schema.fields().iter().zip(names))
+            .map(|(f, name)| f.as_ref().clone().with_name(name))
+            .collect();
+        let schema = Arc::new(DFSchema::try_from(Schema::new(fields))?);
         let mut inputs = operands;
         inputs.extend(domain);
         Ok(FoldNode {
@@ -104,17 +118,19 @@ impl UserDefinedLogicalNodeCore for FoldNode {
             (Some(_), 3) => operands.pop(),
             (_, n) => return plan_err!("a Fold node has {} inputs, given {n}", self.inputs.len()),
         };
-        FoldNode::try_new(self.fold.clone(), operands, domain)
+        let names = self.schema.fields().iter().map(|f| f.name().clone());
+        FoldNode::try_new(self.fold.clone(), operands, domain, names.collect())
     }
 }
 
-/// The fold in einsum-like notation for `EXPLAIN`: each operand's
-/// dimensions, then the outputs, such as `n,d * d,h -> n,h`, with `+ domain`
-/// when there is one. A dimension that isn't an output is shown by number.
+/// The fold in einsum notation for `EXPLAIN`: each operand's dimensions,
+/// then the outputs, such as `a,b * b,c -> a,c` for a matrix product, with
+/// `+ domain` when there is one. Dimensions are lettered by number, as the
+/// fold names none; past `z`, they are shown as `#26`, `#27`, ….
 pub(crate) fn describe(fold: &Fold) -> String {
-    let name = |d: DimensionId| match fold.output_of(d) {
-        Some(i) => fold.outputs()[i].name.clone(),
-        None => format!("#{}", d.0),
+    let name = |DimensionId(d): DimensionId| match u8::try_from(d) {
+        Ok(d) if d < 26 => char::from(b'a' + d).to_string(),
+        _ => format!("#{d}"),
     };
     let operands: Vec<String> = fold
         .operands()
@@ -127,7 +143,7 @@ pub(crate) fn describe(fold: &Fold) -> String {
                 .join(",")
         })
         .collect();
-    let outputs: Vec<String> = fold.outputs().iter().map(|o| o.name.clone()).collect();
+    let outputs: Vec<String> = fold.outputs().iter().map(|o| name(o.dimension)).collect();
     format!(
         "{} -> {}{}",
         operands.join(" * "),

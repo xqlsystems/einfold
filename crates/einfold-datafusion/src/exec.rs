@@ -1,0 +1,299 @@
+// SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! [`EinFoldExec`], the physical operator that computes a [`FoldNode`], and
+//! the planners that put it in DataFusion's physical plans.
+
+use std::fmt;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::compute::concat_batches;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::catalog::Session;
+use datafusion::common::runtime::SpawnedTask;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::{internal_err, DataFusionError, Result};
+use datafusion::execution::context::QueryPlanner;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
+use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    collect_partitioned, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
+    PlanProperties,
+};
+use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
+use einfold_ir::Fold;
+use einfold_kernels::{Algorithm, Options};
+use futures::future::try_join_all;
+use futures::{stream, StreamExt, TryStreamExt};
+
+use crate::node::{describe, FoldNode};
+use crate::HOST;
+
+/// Computes a fold over a join (see [`FoldNode`]) without forming the join's
+/// rows: each joined pair updates its output group directly.
+///
+/// Its children are the fold's operands, then its domain if it has one. It
+/// reads every partition of each, and emits one partition, in batches of the
+/// session's batch size. It runs `einfold_kernels`' dense algorithm, on as
+/// many threads as the session's target partitions, when the keys and rows
+/// allow it, and the hash algorithm otherwise. Neither result depends on the
+/// number of threads or on the order rows arrive in.
+///
+/// Like DataFusion's own operators, it reserves the memory its inputs take
+/// from the session's memory pool, and fails if the pool can't give it; it
+/// runs the kernels on a blocking thread, off the async runtime; and its
+/// metrics, shown by `EXPLAIN ANALYZE`, count which algorithm ran
+/// (`dense_folds`, `hash_folds`), its compute time and its output rows.
+#[derive(Debug)]
+pub struct EinFoldExec {
+    fold: Fold,
+    inputs: Vec<Arc<dyn ExecutionPlan>>,
+    properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl EinFoldExec {
+    /// The operator computing `fold` over `inputs` (operands, then domain),
+    /// producing `schema`, which [`FoldNode`] derives.
+    pub fn new(fold: Fold, inputs: Vec<Arc<dyn ExecutionPlan>>, schema: SchemaRef) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        EinFoldExec {
+            fold,
+            inputs,
+            properties: Arc::new(properties),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    /// The fold this operator computes.
+    pub fn fold(&self) -> &Fold {
+        &self.fold
+    }
+}
+
+impl DisplayAs for EinFoldExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "EinFoldExec: {}", describe(&self.fold))
+    }
+}
+
+/// Every batch of every partition of `plan`, in partition order, each counted
+/// against `reservation`. The partitions are read concurrently, since an
+/// operator such as a hash repartition produces them together and would
+/// otherwise buffer all but one.
+async fn collect(
+    plan: Arc<dyn ExecutionPlan>,
+    ctx: Arc<TaskContext>,
+    reservation: &MemoryReservation,
+) -> Result<Vec<RecordBatch>> {
+    let batches = collect_partitioned(plan, ctx).await?.concat();
+    for b in &batches {
+        reservation.try_grow(b.get_array_memory_size())?;
+    }
+    Ok(batches)
+}
+
+/// `batches` as one batch, its memory counted against `reservation`, and the
+/// parts' released.
+fn concat(
+    schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+    reservation: &MemoryReservation,
+) -> Result<RecordBatch> {
+    let parts: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+    let whole = concat_batches(schema, &batches)?;
+    reservation.try_grow(whole.get_array_memory_size())?;
+    drop(batches);
+    reservation.shrink(parts);
+    Ok(whole)
+}
+
+impl ExecutionPlan for EinFoldExec {
+    fn name(&self) -> &'static str {
+        "EinFoldExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        self.inputs.iter().collect()
+    }
+
+    /// None: the fold names its operands' columns by position, and holds no
+    /// physical expressions.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::UnspecifiedDistribution; self.inputs.len()]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false; self.inputs.len()]
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != self.inputs.len() {
+            return internal_err!(
+                "EinFoldExec has {} children, given {}",
+                self.inputs.len(),
+                children.len()
+            );
+        }
+        Ok(Arc::new(EinFoldExec::new(
+            self.fold.clone(),
+            children,
+            self.schema(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if partition != 0 {
+            return internal_err!("EinFoldExec has one partition, asked for {partition}");
+        }
+        let fold = self.fold.clone();
+        let inputs = self.inputs.clone();
+        let schema = self.schema();
+        if inputs.len() != 2 + usize::from(fold.domain().is_some()) {
+            return internal_err!("EinFoldExec was given {} inputs", inputs.len());
+        }
+        let batch_size = context.session_config().batch_size().max(1);
+        let options = Options {
+            host: HOST,
+            threads: context.session_config().target_partitions(),
+        };
+        let builder = || MetricBuilder::new(&self.metrics);
+        let dense_folds = builder().global_counter("dense_folds");
+        let hash_folds = builder().global_counter("hash_folds");
+        let compute = builder().elapsed_compute(0);
+        let output_rows = builder().output_rows(0);
+        let reservation = MemoryConsumer::new("EinFoldExec").register(context.memory_pool());
+        let out = Arc::clone(&schema);
+        let result = async move {
+            // The operands are read whole; the domain, whose rows the output
+            // has one for one, stays in its batches.
+            let schemas: Vec<SchemaRef> = inputs.iter().map(|i| i.schema()).collect();
+            let mut batches = try_join_all(
+                inputs
+                    .into_iter()
+                    .map(|i| collect(i, Arc::clone(&context), &reservation)),
+            )
+            .await?;
+            let domain = (batches.len() == 3).then(|| batches.pop().unwrap());
+            let b = concat(&schemas[1], batches.pop().unwrap(), &reservation)?;
+            let a = concat(&schemas[0], batches.pop().unwrap(), &reservation)?;
+            let timer = compute.timer();
+            let (algorithm, batches) = SpawnedTask::spawn_blocking(move || {
+                einfold_kernels::fold(&fold, &a, &b, domain.as_deref(), out, options)
+            })
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))??;
+            timer.done();
+            match algorithm {
+                Algorithm::Dense => dense_folds.add(1),
+                Algorithm::Hash => hash_folds.add(1),
+            }
+            for b in &batches {
+                output_rows.add(b.num_rows());
+                reservation.try_grow(b.get_array_memory_size())?;
+            }
+            let slices: Vec<Result<RecordBatch>> = batches
+                .iter()
+                .flat_map(|batch| {
+                    (0..batch.num_rows()).step_by(batch_size).map(move |start| {
+                        Ok(batch.slice(start, batch_size.min(batch.num_rows() - start)))
+                    })
+                })
+                .collect();
+            // The reservation lives as long as the output does.
+            Ok::<_, DataFusionError>(stream::iter(slices).map(move |b| {
+                let _ = &reservation;
+                b
+            }))
+        };
+        let stream = stream::once(result).try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream.boxed(),
+        )))
+    }
+}
+
+/// Plans a [`FoldNode`] as an [`EinFoldExec`]. Give it to DataFusion's
+/// physical planner with
+/// [`DefaultPhysicalPlanner::with_extension_planners`], or use
+/// [`EinFoldQueryPlanner`].
+#[derive(Debug, Default)]
+pub struct EinFoldPlanner;
+
+#[async_trait]
+impl ExtensionPlanner for EinFoldPlanner {
+    async fn plan_extension(
+        &self,
+        _planner: &dyn PhysicalPlanner,
+        node: &dyn UserDefinedLogicalNode,
+        _logical_inputs: &[&LogicalPlan],
+        physical_inputs: &[Arc<dyn ExecutionPlan>],
+        _session: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let Some(node) = node.as_any().downcast_ref::<FoldNode>() else {
+            return Ok(None);
+        };
+        let schema = Arc::new(node.schema().as_arrow().clone());
+        Ok(Some(Arc::new(EinFoldExec::new(
+            node.fold().clone(),
+            physical_inputs.to_vec(),
+            schema,
+        ))))
+    }
+}
+
+/// DataFusion's default query planner, with [`EinFoldPlanner`] added. Install
+/// it with `SessionStateBuilder::with_query_planner`.
+#[derive(Debug, Default)]
+pub struct EinFoldQueryPlanner;
+
+#[async_trait]
+impl QueryPlanner for EinFoldQueryPlanner {
+    async fn create_physical_plan(
+        &self,
+        plan: &LogicalPlan,
+        session: &dyn Session,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(EinFoldPlanner)])
+            .create_physical_plan(plan, session)
+            .await
+    }
+}

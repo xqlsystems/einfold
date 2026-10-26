@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use datafusion::common::{plan_err, DFSchema, DFSchemaRef, Result};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan, UserDefinedLogicalNodeCore};
-use einfold_ir::Fold;
+use einfold_ir::{DimensionId, Fold};
 
 /// A fold over a join in a DataFusion logical plan. Its inputs are the fold's
 /// two operands, then its domain if it has one; its schema is
@@ -112,9 +112,9 @@ impl UserDefinedLogicalNodeCore for FoldNode {
 /// dimensions, then the outputs, such as `n,d * d,h -> n,h`, with `+ domain`
 /// when there is one. A dimension that isn't an output is shown by number.
 pub(crate) fn describe(fold: &Fold) -> String {
-    let name = |d: usize| match fold.output_of(d) {
+    let name = |d: DimensionId| match fold.output_of(d) {
         Some(i) => fold.outputs()[i].name.clone(),
-        None => format!("#{d}"),
+        None => format!("#{}", d.0),
     };
     let operands: Vec<String> = fold
         .operands()

@@ -31,7 +31,10 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::{col, lit, when, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use einfold_datafusion::{EinFoldQueryPlanner, FoldNode};
-use einfold_ir::{Aggregate, Dimension, Domain, Fold, KeyEquality, Operand, Output};
+use einfold_ir::{
+    Aggregate, ColumnIndex, Dimension, DimensionId, Domain, Fold, KeyEquality, Operand, Output,
+    RowValue,
+};
 
 const N: i64 = 300;
 const K: i64 = 4;
@@ -131,29 +134,37 @@ async fn fold_plan(ctx: &SessionContext) -> LogicalPlan {
         vec![Dimension { equality: eq }; 3],
         vec![
             Operand {
-                keys: vec![(0, 0), (1, 1)],
-                factor: Some(2),
+                keys: vec![
+                    (DimensionId(0), ColumnIndex(0)),
+                    (DimensionId(1), ColumnIndex(1)),
+                ],
+                factor: Some(ColumnIndex(2)),
             },
             Operand {
-                keys: vec![(2, 0), (1, 1)],
-                factor: Some(2),
+                keys: vec![
+                    (DimensionId(2), ColumnIndex(0)),
+                    (DimensionId(1), ColumnIndex(1)),
+                ],
+                factor: Some(ColumnIndex(2)),
             },
         ],
         vec![
             Output {
-                dimension: 0,
+                dimension: DimensionId(0),
                 name: "s".into(),
+                domain_key: Some((ColumnIndex(0), eq)),
             },
             Output {
-                dimension: 2,
+                dimension: DimensionId(2),
                 name: "k".into(),
+                domain_key: Some((ColumnIndex(1), eq)),
             },
         ],
-        Aggregate::SumOfProducts,
+        RowValue::Product,
+        Aggregate::sum(),
         "g",
         Some(Domain {
-            keys: vec![(0, eq), (1, eq)],
-            carry: vec![0, 1, 2],
+            carry: vec![ColumnIndex(0), ColumnIndex(1), ColumnIndex(2)],
             missing: Some(0.0),
         }),
     )

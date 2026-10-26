@@ -36,7 +36,7 @@ use arrow::array::{Array, ArrayRef, Float64Array, RecordBatch, UInt32Array};
 use arrow::compute::take;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
-use einfold_ir::{Fold, KeyEquality};
+use einfold_ir::{DimensionId, Fold, KeyEquality};
 
 use crate::keys::{host_keys, Keys};
 use crate::{Host, Result};
@@ -59,8 +59,8 @@ impl<'a> Side<'a> {
         fold: &Fold,
         operand: usize,
         batch: &'a RecordBatch,
-        shared: &[usize],
-        outputs: &[usize],
+        shared: &[DimensionId],
+        outputs: &[DimensionId],
         host: Host,
     ) -> Result<Self> {
         let Ok(len) = u32::try_from(batch.num_rows()) else {
@@ -69,21 +69,22 @@ impl<'a> Side<'a> {
             ));
         };
         let op = &fold.operands()[operand];
-        let col = |d: usize| -> ArrayRef {
-            Arc::clone(batch.column(op.column_of(d).expect("dimension held by this operand")))
+        let col = |d: DimensionId| -> ArrayRef {
+            let c = op.column_of(d).expect("dimension held by this operand");
+            Arc::clone(batch.column(c.0))
         };
         let shared_cols = host_keys(&shared.iter().map(|&d| col(d)).collect::<Vec<_>>(), host);
         let output_cols = host_keys(&outputs.iter().map(|&d| col(d)).collect::<Vec<_>>(), host);
         let factors = op
             .factor
-            .and_then(|c| batch.column(c).as_any().downcast_ref::<Float64Array>())
+            .and_then(|c| batch.column(c.0).as_any().downcast_ref::<Float64Array>())
             .ok_or_else(|| ArrowError::InvalidArgumentError("factors must be Float64".into()))?;
         // A NULL key in a dimension compared with `=` joins no row. NULL here
         // is logical: a dictionary's NULL value counts, as it does in SQL.
         let strict: Vec<_> = shared
             .iter()
             .zip(&shared_cols)
-            .filter(|(&d, _)| fold.dimensions()[d].equality == KeyEquality::Equal)
+            .filter(|(&d, _)| fold.dimension(d).equality == KeyEquality::Equal)
             .filter_map(|(_, c)| c.logical_nulls())
             .collect();
         let shared = Keys::new(&shared_cols)?;
@@ -141,14 +142,15 @@ pub(crate) fn fold(
     host: Host,
 ) -> Result<Vec<RecordBatch>> {
     let ops = fold.operands();
-    let shared: Vec<usize> = (0..fold.dimensions().len())
+    let shared: Vec<DimensionId> = fold
+        .dimension_ids()
         .filter(|&d| ops[0].column_of(d).is_some() && ops[1].column_of(d).is_some())
         .collect();
     // Each output is taken from the first operand that holds it: its index
     // in the fold's outputs, split by operand.
     let from_a = |i: &usize| ops[0].column_of(fold.outputs()[*i].dimension).is_some();
     let (a_out, b_out): (Vec<usize>, Vec<usize>) = (0..fold.outputs().len()).partition(from_a);
-    let dims = |outs: &[usize]| -> Vec<usize> {
+    let dims = |outs: &[usize]| -> Vec<DimensionId> {
         outs.iter().map(|&i| fold.outputs()[i].dimension).collect()
     };
     let a = Side::new(fold, 0, a, &shared, &dims(&a_out), host)?;
@@ -221,9 +223,11 @@ pub(crate) fn fold(
     domain
         .iter()
         .map(|batch| {
+            // Each output's domain key: its column, and how it is matched.
+            let key = |i: usize| fold.outputs()[i].domain_key.expect("a fold with a domain");
             let key_cols = |outs: &[usize]| -> Vec<ArrayRef> {
                 outs.iter()
-                    .map(|&i| Arc::clone(batch.column(spec.keys[i].0)))
+                    .map(|&i| Arc::clone(batch.column(key(i).0 .0)))
                     .collect()
             };
             let (da, db) = (
@@ -231,11 +235,10 @@ pub(crate) fn fold(
                 Keys::new(&host_keys(&key_cols(&b_out), host))?,
             );
             // A NULL key compared with `=` matches no group.
-            let strict: Vec<_> = spec
-                .keys
-                .iter()
+            let strict: Vec<_> = (0..fold.outputs().len())
+                .map(key)
                 .filter(|(_, eq)| *eq == KeyEquality::Equal)
-                .filter_map(|(c, _)| batch.column(*c).logical_nulls())
+                .filter_map(|(c, _)| batch.column(c.0).logical_nulls())
                 .collect();
             let values: Float64Array = (0..batch.num_rows())
                 .map(|r| {
@@ -252,7 +255,7 @@ pub(crate) fn fold(
             let mut columns: Vec<ArrayRef> = spec
                 .carry
                 .iter()
-                .map(|&c| Arc::clone(batch.column(c)))
+                .map(|&c| Arc::clone(batch.column(c.0)))
                 .collect();
             columns.push(Arc::new(values));
             RecordBatch::try_new(Arc::clone(&schema), columns)

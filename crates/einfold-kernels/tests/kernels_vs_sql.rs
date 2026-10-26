@@ -44,7 +44,10 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::ScalarValue;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use einfold_ir::{Aggregate, Dimension, Domain, Fold, KeyEquality, Operand, Output};
+use einfold_ir::{
+    Aggregate, ColumnIndex, Dimension, DimensionId, Domain, Fold, KeyEquality, Operand, Output,
+    RowValue,
+};
 use einfold_kernels::{FloatKeys, Host};
 
 struct Rng(u64);
@@ -377,8 +380,12 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
         let rows = how(rng);
         let t = table(rng, &names, &ty, &ext, rows);
         let op = Operand {
-            keys: mine.iter().enumerate().map(|(c, &d)| (d, c)).collect(),
-            factor: Some(mine.len()),
+            keys: mine
+                .iter()
+                .enumerate()
+                .map(|(c, &d)| (DimensionId(d), ColumnIndex(c)))
+                .collect(),
+            factor: Some(ColumnIndex(mine.len())),
         };
         (t, op, mine)
     };
@@ -393,9 +400,13 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
     });
     // The domain carries its key columns, so the result's key columns are
     // where they are without one.
+    // How each output is matched with its domain column, which is column i.
+    let domain_keys: Vec<KeyEquality> = match with_domain {
+        true => (0..outputs.len()).map(|_| equality(rng)).collect(),
+        false => vec![],
+    };
     let domain = with_domain.then(|| Domain {
-        keys: (0..outputs.len()).map(|i| (i, equality(rng))).collect(),
-        carry: (0..outputs.len()).collect(),
+        carry: (0..outputs.len()).map(ColumnIndex).collect(),
         missing: [Some(0.0), None, Some(2.5)][rng.below(3)],
     });
     let fold = Fold::try_new(
@@ -403,12 +414,15 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
         vec![op_a, op_b],
         outputs
             .iter()
-            .map(|&d| Output {
-                dimension: d,
+            .enumerate()
+            .map(|(i, &d)| Output {
+                dimension: DimensionId(d),
                 name: format!("d{d}"),
+                domain_key: domain_keys.get(i).map(|&eq| (ColumnIndex(i), eq)),
             })
             .collect(),
-        Aggregate::SumOfProducts,
+        RowValue::Product,
+        Aggregate::sum(),
         "v",
         domain.clone(),
     )
@@ -475,8 +489,8 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
             );
             let on: Vec<String> = outputs
                 .iter()
-                .zip(&domain.keys)
-                .map(|(&d, (_, eq))| match eq {
+                .zip(&domain_keys)
+                .map(|(&d, eq)| match eq {
                     KeyEquality::Equal => format!("f.k{d} = s.d{d}"),
                     KeyEquality::NotDistinct => format!("f.n{d} = s.n{d} AND f.c{d} = s.c{d}"),
                 })

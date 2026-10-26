@@ -26,7 +26,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use einfold_ir::Fold;
+use einfold_ir::{ColumnIndex, Fold};
 
 mod hash;
 mod keys;
@@ -87,7 +87,10 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
     if fold.domain().is_some() != domain.is_some() {
         return bad("a domain relation must be given exactly when the fold has a domain".into());
     }
-    let field = |schema: &Schema, col: usize| -> Result<Field> {
+    if !fold.is_einsum() {
+        return bad("EinFold computes SUM of products only".into());
+    }
+    let field = |schema: &Schema, ColumnIndex(col): ColumnIndex| -> Result<Field> {
         match schema.fields().get(col) {
             Some(f) => Ok(f.as_ref().clone()),
             None => bad(format!(
@@ -111,12 +114,13 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
         }
         for &(d, col) in &op.keys {
             let f = field(schema, col)?;
-            match &types[d] {
-                None => types[d] = Some(f),
+            match &types[d.0] {
+                None => types[d.0] = Some(f),
                 Some(t) if t.data_type() == f.data_type() => {}
                 Some(t) => {
                     return bad(format!(
-                        "dimension {d}'s columns have types {} and {}",
+                        "dimension {}'s columns have types {} and {}",
+                        d.0,
                         t.data_type(),
                         f.data_type()
                     ))
@@ -127,13 +131,14 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
     let mut fields: Vec<Field> = Vec::new();
     match (fold.domain(), domain) {
         (Some(spec), Some(schema)) => {
-            for (o, &(col, _)) in fold.outputs().iter().zip(&spec.keys) {
+            for o in fold.outputs() {
+                let (col, _) = o.domain_key.expect("checked by Fold::try_new");
                 let key = field(schema, col)?;
-                let want = types[o.dimension].as_ref().expect("held by an operand");
+                let want = types[o.dimension.0].as_ref().expect("held by an operand");
                 if key.data_type() != want.data_type() {
                     return bad(format!(
                         "the domain's column for dimension {} is {}, the operands' {}",
-                        o.dimension,
+                        o.dimension.0,
                         key.data_type(),
                         want.data_type()
                     ));
@@ -145,7 +150,7 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
         }
         _ => {
             for o in fold.outputs() {
-                let f = types[o.dimension].as_ref().expect("held by an operand");
+                let f = types[o.dimension.0].as_ref().expect("held by an operand");
                 fields.push(Field::new(&o.name, f.data_type().clone(), f.is_nullable()));
             }
         }

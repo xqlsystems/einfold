@@ -42,7 +42,7 @@ async fn exec(ctx: &SessionContext, sql: &str) {
 }
 
 /// ddx's `matmul` tables, the gradient program, its time end to end, each
-/// step's time, and its two gradients' values in key order.
+/// check's and step's time, and its two gradients' values in key order.
 async fn measure(
     ctx: SessionContext,
     n: usize,
@@ -57,6 +57,12 @@ async fn measure(
     engine::execute(&ctx, &program).await.unwrap();
     let run = best_ms!(engine::execute(&ctx, &program).await.unwrap());
     let mut steps = Vec::new();
+    // ddx's checks run before the steps: plans that must return no rows,
+    // such as one that each table's keys identify its rows.
+    for (i, check) in program.checks.iter().enumerate() {
+        let ms = best_ms!(engine::returns_rows(&ctx, &check.plan).await.unwrap());
+        steps.push((format!("check {i}"), ms));
+    }
     for step in program.steps() {
         let ms = best_ms!(engine::run_step(&ctx, step).await.unwrap());
         let short = step

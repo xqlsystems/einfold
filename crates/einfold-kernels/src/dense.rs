@@ -69,17 +69,19 @@ fn worth(cells: usize, rows: usize) -> bool {
     cells <= rows.saturating_mul(4).saturating_add(FEW_CELLS) && cells < NONE as usize
 }
 
-/// `column` as non-negative `i64` keys, or `None` if it isn't an integer
-/// column, or holds a NULL, a negative key, or one too large for `i64` (an
-/// unsigned key of 2⁶³ or more).
-fn keys(column: &ArrayRef) -> Option<Int64Array> {
+/// `column` as non-negative `i64` keys, with their extent (the largest key
+/// plus one), or `None` if it isn't an integer column, or holds a NULL, a
+/// negative key, or one too large for `i64` (an unsigned key of 2⁶³ or more).
+fn keys(column: &ArrayRef) -> Option<(Int64Array, usize)> {
     if !column.data_type().is_integer() || column.null_count() > 0 {
         return None;
     }
     // The cast turns a key too large for i64 into NULL, which reads as 0.
     let keys = cast(column, &DataType::Int64).ok()?;
     let keys = keys.as_any().downcast_ref::<Int64Array>()?.clone();
-    (keys.null_count() == 0 && keys.values().iter().all(|&k| k >= 0)).then_some(keys)
+    // One pass for both bounds, which the compiler vectorizes.
+    let (lo, hi) = (keys.values().iter()).fold((0, -1), |(lo, hi), &k| (k.min(lo), k.max(hi)));
+    (keys.null_count() == 0 && lo >= 0).then(|| (keys, (hi + 1) as usize))
 }
 
 /// A row's position over some dimensions, flattened with the first
@@ -175,9 +177,8 @@ pub(crate) fn fold(
         op.keys
             .iter()
             .map(|&(DimensionId(d), ColumnIndex(c))| {
-                let k = keys(batch.column(c))?;
-                let max = k.values().iter().max().map_or(0, |&m| m as usize + 1);
-                extent[d] = extent[d].max(max);
+                let (k, n) = keys(batch.column(c))?;
+                extent[d] = extent[d].max(n);
                 Some((d, k))
             })
             .collect::<Option<Vec<_>>>()
@@ -219,11 +220,25 @@ pub(crate) fn fold(
     };
     let (av, bv) = (&av, &bv);
 
-    // a's rows by position; a repeated position means duplicate tuples.
+    // Whether existence can be ignored: a domain whose default is +0.0.
+    let zero_default = fold
+        .domain()
+        .is_some_and(|d| d.missing.map(f64::to_bits) == Some(0.0f64.to_bits()));
+    // In one pass over a: its rows by position, where a repeated position
+    // means duplicate tuples; which x positions it reaches; and whether each
+    // has a non-NULL factor, `valued[x]`, which existence needs only without
+    // the 0.0 default.
     let mut at = vec![NONE; nx * nz];
+    let mut reached = vec![false; nx];
+    let mut valued = vec![false; if zero_default { 0 } else { nx }];
     for r in 0..a.num_rows() {
-        if std::mem::replace(&mut at[ax.of(r) * nz + az.of(r)], r as u32) != NONE {
+        let x = ax.of(r);
+        if std::mem::replace(&mut at[x * nz + az.of(r)], r as u32) != NONE {
             return Ok(None);
+        }
+        reached[x] = true;
+        if !zero_default {
+            valued[x] |= av.is_valid(r);
         }
     }
     // b as a dense matrix [z][y], with holes (missing or NULL rows) as 0.
@@ -238,10 +253,6 @@ pub(crate) fn fold(
             bm[p] = bv.value(r);
         }
     }
-    // Whether existence can be ignored: a domain whose default is +0.0.
-    let zero_default = fold
-        .domain()
-        .is_some_and(|d| d.missing.map(f64::to_bits) == Some(0.0f64.to_bits()));
     let holes = bv.null_count() > 0 || present.iter().any(|&p| !p);
     if holes {
         let finite = (0..av.len()).all(|r| av.is_null(r) || av.value(r).is_finite());
@@ -250,14 +261,8 @@ pub(crate) fn fold(
         }
     }
     // Otherwise b is complete, so group (x, y) exists when a has a row at x,
-    // and is NULL when all of that row's factors are: whether it has a value
-    // is `valued[x]`, which existence needs only without the 0.0 default.
-    let mut valued = vec![false; if zero_default { 0 } else { nx }];
-    if !zero_default {
-        for r in 0..a.num_rows() {
-            valued[ax.of(r)] |= av.is_valid(r);
-        }
-    }
+    // and is NULL when all of that row's factors are: when `valued[x]` is
+    // false.
 
     let out = accumulate(&at, av, &bm, (nx, nz, ny), threads);
     match (fold.domain(), domain) {
@@ -280,9 +285,17 @@ pub(crate) fn fold(
                 })
                 .collect();
             // A cell's value as the left join gives it: its sum where the
-            // group exists with a value, else the default.
+            // group exists with a value, else the default. Whether it has one
+            // is spread from x to its cells, so that a lookup needs no
+            // division.
+            let cell_valued: Vec<bool> = match zero_default {
+                true => Vec::new(),
+                false => (valued.iter())
+                    .flat_map(|&v| std::iter::repeat_n(v, ny))
+                    .collect(),
+            };
             let value = |c: usize| -> Option<f64> {
-                if zero_default || valued[c / ny] {
+                if zero_default || cell_valued[c] {
                     Some(out[c])
                 } else {
                     spec.missing
@@ -309,15 +322,10 @@ pub(crate) fn fold(
             Ok(Some(batches))
         }
         (None, None) => {
-            // Without a domain, the groups are those some row of a reaches.
-            let mut reached = vec![false; nx];
-            for r in 0..a.num_rows() {
-                reached[ax.of(r)] = true;
-            }
-            let groups: Vec<(usize, usize)> = (0..nx)
-                .filter(|&x| reached[x])
-                .flat_map(|x| (0..ny).map(move |y| (x, y)))
-                .collect();
+            // Without a domain, the groups are (x, y) for each x some row of a
+            // reaches, in position order, and every y.
+            let rows: Vec<usize> = (0..nx).filter(|&x| reached[x]).collect();
+            let n = rows.len() * ny;
             let mut columns: Vec<ArrayRef> = Vec::with_capacity(fold.outputs().len() + 1);
             for d in fold.outputs().iter().map(|o| o.dimension.0) {
                 // The key's place in x's or y's position, first dimension
@@ -328,17 +336,39 @@ pub(crate) fn fold(
                 };
                 let slot = role.iter().position(|&e| e == d).unwrap();
                 let stride: usize = role[slot + 1..].iter().map(|&e| extent[e]).product();
-                let key = Int64Array::from_iter_values(groups.iter().map(|&(x, y)| {
-                    let p = if in_x { x } else { y };
-                    ((p / stride) % extent[d]) as i64
-                }));
+                let key_at = |p: usize| ((p / stride) % extent[d]) as i64;
+                let mut key = Vec::with_capacity(n);
+                if in_x {
+                    for &x in &rows {
+                        key.extend(std::iter::repeat_n(key_at(x), ny));
+                    }
+                } else {
+                    let along: Vec<i64> = (0..ny).map(key_at).collect();
+                    for _ in &rows {
+                        key.extend_from_slice(&along);
+                    }
+                }
+                let key = Int64Array::from(key);
                 let ty = schema.field(columns.len()).data_type();
                 columns.push(cast(&(Arc::new(key) as ArrayRef), ty)?);
             }
-            let result: Float64Array = groups
-                .iter()
-                .map(|&(x, y)| valued[x].then(|| out[x * ny + y]))
-                .collect();
+            let result = if rows.iter().all(|&x| valued[x]) {
+                // No NULLs: the output's rows as they are, copied only when
+                // some x is missing.
+                match rows.len() == nx {
+                    true => Float64Array::from(out),
+                    false => Float64Array::from(
+                        (rows.iter())
+                            .flat_map(|&x| out[x * ny..(x + 1) * ny].iter().copied())
+                            .collect::<Vec<f64>>(),
+                    ),
+                }
+            } else {
+                (rows.iter())
+                    .flat_map(|&x| (0..ny).map(move |y| (x, y)))
+                    .map(|(x, y)| valued[x].then(|| out[x * ny + y]))
+                    .collect()
+            };
             columns.push(Arc::new(result));
             Ok(Some(vec![RecordBatch::try_new(schema, columns)?]))
         }

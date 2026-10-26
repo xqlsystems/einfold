@@ -317,10 +317,11 @@ struct Case {
 }
 
 /// Shapes `[x, z, y]` large enough to cross the dense algorithm's block
-/// sizes: an output of at least 4,096 cells, split into blocks of rows; and
-/// a small output whose sums run over more than 4,096 positions of `z`, split
-/// into blocks along `z`.
-const LARGE: [[usize; 3]; 2] = [[300, 7, 16], [3, 9000, 5]];
+/// sizes: an output of at least 4,096 cells, split into blocks of rows; one
+/// of few rows and more than 2,048 columns, split into blocks of columns;
+/// and a small output whose sums run over more than 4,096 positions of `z`,
+/// split into blocks along `z`.
+const LARGE: [[usize; 3]; 3] = [[300, 7, 16], [3, 4, 5000], [3, 9000, 5]];
 
 /// A random case; from the dense family when `dense`. With `large`, a dense
 /// case of one dimension per role, `x` in `a`, `z` in both and `y` in `b`,

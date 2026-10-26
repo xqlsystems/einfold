@@ -23,6 +23,7 @@
 
 use std::sync::Arc;
 
+use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
@@ -189,33 +190,59 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
     Ok(Arc::new(Schema::new(fields)))
 }
 
+/// The rows of one of a fold's inputs, as batches of one schema, in the
+/// order and batches they arrived in.
+#[derive(Clone, Copy, Debug)]
+pub struct Relation<'a> {
+    /// The batches' schema.
+    pub schema: &'a SchemaRef,
+    /// The rows.
+    pub batches: &'a [RecordBatch],
+}
+
+impl<'a> Relation<'a> {
+    /// `batches`, all of `schema`.
+    pub fn new(schema: &'a SchemaRef, batches: &'a [RecordBatch]) -> Self {
+        Relation { schema, batches }
+    }
+}
+
 /// [`fold`] by the dense algorithm alone, or `None` when its conditions don't
 /// hold, for a caller that would rather run something else than the hash
 /// algorithm.
 pub fn fold_dense(
     fold: &Fold,
-    a: &RecordBatch,
-    b: &RecordBatch,
-    domain: Option<&[RecordBatch]>,
+    a: Relation,
+    b: Relation,
+    domain: Option<Relation>,
     schema: SchemaRef,
     options: Options,
 ) -> Result<Option<Vec<RecordBatch>>> {
     let threads = options.threads.max(1);
-    dense::fold(fold, a, b, domain, schema, threads, options.unique_domain)
+    let domain = domain.map(|d| d.batches);
+    dense::fold(
+        fold,
+        a.batches,
+        b.batches,
+        domain,
+        schema,
+        threads,
+        options.unique_domain,
+    )
 }
 
-/// `fold` over operands `a` and `b`, and the batches of its domain if it has
-/// one, as batches of `schema` (which [`schema`] gives): one batch per domain
-/// batch, or one in all without a domain. Also says which algorithm ran: the
-/// dense one when its conditions hold, and the hash one otherwise.
+/// `fold` over operands `a` and `b`, and its domain if it has one, as
+/// batches of `schema` (which [`schema`] gives): one batch per domain batch,
+/// or one in all without a domain. Also says which algorithm ran: the dense
+/// one when its conditions hold, and the hash one otherwise.
 ///
 /// The result's bits depend only on the inputs' rows, not on how they were
 /// batched or ordered, nor on the number of threads.
 pub fn fold(
     fold: &Fold,
-    a: &RecordBatch,
-    b: &RecordBatch,
-    domain: Option<&[RecordBatch]>,
+    a: Relation,
+    b: Relation,
+    domain: Option<Relation>,
     schema: SchemaRef,
     options: Options,
 ) -> Result<(Algorithm, Vec<RecordBatch>)> {
@@ -223,9 +250,22 @@ pub fn fold(
         return bad("only fold_dense checks that a domain's keys are unique".into());
     }
     let threads = options.threads.max(1);
-    if let Some(batches) = dense::fold(fold, a, b, domain, schema.clone(), threads, false)? {
+    let domain = domain.map(|d| d.batches);
+    let dense = dense::fold(
+        fold,
+        a.batches,
+        b.batches,
+        domain,
+        schema.clone(),
+        threads,
+        false,
+    )?;
+    if let Some(batches) = dense {
         return Ok((Algorithm::Dense, batches));
     }
-    let batches = hash::fold(fold, a, b, domain, schema, options.host)?;
+    // The hash algorithm reads each operand as one batch.
+    let whole = |r: Relation| concat_batches(r.schema, r.batches);
+    let (a, b) = (whole(a)?, whole(b)?);
+    let batches = hash::fold(fold, &a, &b, domain, schema, options.host)?;
     Ok((Algorithm::Hash, batches))
 }

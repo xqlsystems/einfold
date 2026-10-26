@@ -45,7 +45,6 @@ use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, DictionaryArray, Float64Array, Int32Array, Int64Array, RecordBatch,
     StringArray, UInt64Array,
 };
-use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::ScalarValue;
 use datafusion::datasource::MemTable;
@@ -54,7 +53,7 @@ use einfold_ir::{
     Aggregate, ColumnIndex, Dimension, DimensionId, Domain, Fold, KeyEquality, Operand, Output,
     RowValue,
 };
-use einfold_kernels::{Algorithm, FloatKeys, Host, Options};
+use einfold_kernels::{Algorithm, FloatKeys, Host, Options, Relation};
 
 struct Rng(u64);
 
@@ -627,9 +626,12 @@ fn run_fold(case: &Case, rng: &mut Rng) -> (Vec<RecordBatch>, Algorithm) {
     let batches = |t: &Table, rng: &mut Rng| -> Vec<RecordBatch> {
         t.partitions(rng).into_iter().flatten().collect()
     };
-    let whole = |t: &Table, rng: &mut Rng| concat_batches(&t.schema, &batches(t, rng)).unwrap();
-    let (a, b) = (whole(&case.a, rng), whole(&case.b, rng));
+    let (a, b) = (batches(&case.a, rng), batches(&case.b, rng));
     let domain = case.domain.as_ref().map(|t| batches(t, rng));
+
+    let domain = (case.domain.as_ref())
+        .zip(domain.as_deref())
+        .map(|(t, d)| Relation::new(&t.schema, d));
     let schema = einfold_kernels::schema(
         &case.fold,
         &[&case.a.schema, &case.b.schema],
@@ -641,8 +643,15 @@ fn run_fold(case: &Case, rng: &mut Rng) -> (Vec<RecordBatch>, Algorithm) {
         threads: 1 + rng.below(8),
         unique_domain: false,
     };
-    let (algorithm, out) =
-        einfold_kernels::fold(&case.fold, &a, &b, domain.as_deref(), schema, options).unwrap();
+    let (algorithm, out) = einfold_kernels::fold(
+        &case.fold,
+        Relation::new(&case.a.schema, &a),
+        Relation::new(&case.b.schema, &b),
+        domain,
+        schema,
+        options,
+    )
+    .unwrap();
     (out, algorithm)
 }
 
@@ -651,11 +660,14 @@ fn run_fold(case: &Case, rng: &mut Rng) -> (Vec<RecordBatch>, Algorithm) {
 fn check_unique_domain(case: &Case, rng: &mut Rng, fail: impl Fn(String)) -> bool {
     let fold = &case.fold;
     let domain = case.domain.as_ref().expect("a case with a domain");
-    let whole = |t: &Table, rng: &mut Rng| {
-        let batches: Vec<RecordBatch> = t.partitions(rng).into_iter().flatten().collect();
-        concat_batches(&t.schema, &batches).unwrap()
+    let batches = |t: &Table, rng: &mut Rng| -> Vec<RecordBatch> {
+        t.partitions(rng).into_iter().flatten().collect()
     };
-    let (a, b) = (whole(&case.a, rng), whole(&case.b, rng));
+    let (a, b) = (batches(&case.a, rng), batches(&case.b, rng));
+    let (a, b) = (
+        Relation::new(&case.a.schema, &a),
+        Relation::new(&case.b.schema, &b),
+    );
     let d: Vec<RecordBatch> = domain.partitions(rng).into_iter().flatten().collect();
     let operands = [case.a.schema.as_ref(), case.b.schema.as_ref()];
     let mut dense = |fold: &Fold, d: Option<&[RecordBatch]>, unique_domain| {
@@ -665,7 +677,8 @@ fn check_unique_domain(case: &Case, rng: &mut Rng, fail: impl Fn(String)) -> boo
             threads: 1 + rng.below(8),
             unique_domain,
         };
-        einfold_kernels::fold_dense(fold, &a, &b, d, schema.unwrap(), options).unwrap()
+        let d = d.map(|batches| Relation::new(&domain.schema, batches));
+        einfold_kernels::fold_dense(fold, a, b, d, schema.unwrap(), options).unwrap()
     };
     let keys = fold.outputs().len();
     let unchecked = dense(fold, Some(&d), false).expect("the dense path applies");

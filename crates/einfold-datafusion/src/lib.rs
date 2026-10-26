@@ -10,9 +10,9 @@
 //! rows before summing them; einfold sums each joined pair as it is found.
 //!
 //! [`EinFoldRule`] finds such folds in DataFusion's optimized plans and
-//! replaces each with a [`FoldNode`]; [`EinFoldQueryPlanner`] plans the node
-//! as [`EinFoldExec`], which runs `einfold_kernels`. [`install`] adds both to
-//! a session. This is the only einfold crate that depends on a query
+//! replaces each with a [`FoldNode`]; [`EinFoldQueryPlanner`] applies it just
+//! before physical planning, and plans each node as [`EinFoldExec`], which
+//! runs `einfold_kernels`. [`install`] adds it to a session. This is the only einfold crate that depends on a query
 //! engine.
 
 mod exec;
@@ -27,12 +27,12 @@ pub use exec::{EinFoldExec, EinFoldPlanner, EinFoldQueryPlanner};
 pub use node::FoldNode;
 pub use rule::EinFoldRule;
 
-/// `builder` with einfold installed: [`EinFoldRule`] after DataFusion's own
-/// optimizer rules, and [`EinFoldQueryPlanner`] to plan the nodes it makes.
+/// `builder` with einfold installed: an [`EinFoldQueryPlanner`] that applies
+/// [`EinFoldRule`] to each optimized plan, then plans the nodes it makes.
 pub fn install(builder: SessionStateBuilder) -> SessionStateBuilder {
-    builder
-        .with_optimizer_rule(Arc::new(EinFoldRule::default()))
-        .with_query_planner(Arc::new(EinFoldQueryPlanner))
+    builder.with_query_planner(Arc::new(EinFoldQueryPlanner::detecting(
+        EinFoldRule::default(),
+    )))
 }
 
 /// The DataFusion version this crate is built against.

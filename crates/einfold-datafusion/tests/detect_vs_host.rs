@@ -44,7 +44,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use einfold_datafusion::{EinFoldQueryPlanner, EinFoldRule, FoldNode};
+use einfold_datafusion::{EinFoldExec, EinFoldQueryPlanner, EinFoldRule, FoldNode};
 
 struct Rng(u64);
 
@@ -195,11 +195,16 @@ fn query(rng: &mut Rng) -> (String, Expect) {
         _ => vec!["l.b"],
     };
     let groups = if two_keys { vec!["l.b"] } else { groups };
-    let select: Vec<String> = groups
+    // The select list in an order of its own, so that the result's columns
+    // aren't in GROUP BY's order.
+    let mut select: Vec<String> = groups
         .iter()
         .enumerate()
         .map(|(i, g)| format!("{g} AS g{i}"))
         .collect();
+    if rng.chance(0.5) {
+        select.reverse();
+    }
     let group = groups.join(", ");
     let fold = |aggregate: &str, mask: bool| {
         let mask = if mask { " AND l.a >= r.b" } else { "" };
@@ -271,10 +276,26 @@ fn einfold(threads: usize, fallback: bool) -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_default_features()
         .with_config(config)
-        .with_optimizer_rule(Arc::new(rule))
-        .with_query_planner(Arc::new(EinFoldQueryPlanner))
+        .with_query_planner(Arc::new(EinFoldQueryPlanner::detecting(rule)))
         .build();
     SessionContext::new_with_state(state)
+}
+
+/// How many `EinFoldExec`s a physical plan has, and how many of them have a
+/// domain.
+fn exec_folds(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> (usize, usize) {
+    let (mut all, mut domains) = (0, 0);
+    let any: &dyn std::any::Any = plan.as_ref();
+    if let Some(e) = any.downcast_ref::<EinFoldExec>() {
+        all += 1;
+        domains += usize::from(e.fold().domain().is_some());
+    }
+    for child in plan.children() {
+        let (a, d) = exec_folds(child);
+        all += a;
+        domains += d;
+    }
+    (all, domains)
 }
 
 /// How many `Fold` nodes a plan has, and how many of them have a domain.
@@ -348,21 +369,28 @@ async fn einfold_changes_no_answer() {
         let fail = |what: String| panic!("seed {seed}: {what}\nSQL: {sql}");
 
         let df = ours.sql(&sql).await.unwrap();
-        let plan = df.clone().into_optimized_plan().unwrap();
-        let (found, domains) = folds(&plan);
+        // Optimized logical plans stay standard: other code reads them.
+        let logical = df.clone().into_optimized_plan().unwrap();
+        if folds(&logical) != (0, 0) {
+            fail(format!(
+                "a Fold in the optimized plan:\n{}",
+                logical.display_indent()
+            ));
+        }
+        let physical = df.clone().create_physical_plan().await.unwrap();
+        let (found, domains) = exec_folds(&physical);
         let ok = match expect {
             Expect::Fold | Expect::FoldOnly => found == 1 && domains == 0,
             Expect::Fill => found == 1 && domains == 1,
             Expect::Decline => found == 0,
         };
         if !ok {
+            let shown = datafusion::physical_plan::displayable(physical.as_ref()).indent(true);
             fail(format!(
-                "expected {expect:?}, found {found} folds, {domains} with a domain:\n{}",
-                plan.display_indent()
+                "expected {expect:?}, found {found} folds, {domains} with a domain:\n{shown}"
             ));
         }
         fired += usize::from(found > 0);
-        let physical = df.clone().create_physical_plan().await.unwrap();
         let got = datafusion::physical_plan::collect(Arc::clone(&physical), ours.task_ctx())
             .await
             .unwrap();

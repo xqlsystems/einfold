@@ -14,13 +14,14 @@ use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::runtime::SpawnedTask;
-use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{internal_err, DataFusionError, Result};
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
+use datafusion::optimizer::{OptimizerContext, OptimizerRule};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
@@ -36,6 +37,7 @@ use futures::future::try_join_all;
 use futures::{stream, StreamExt, TryStreamExt};
 
 use crate::node::{describe, FoldNode};
+use crate::rule::EinFoldRule;
 use crate::HOST;
 
 /// Computes a fold over a join (see [`FoldNode`]) without forming the join's
@@ -333,10 +335,28 @@ impl ExtensionPlanner for EinFoldPlanner {
     }
 }
 
-/// DataFusion's default query planner, with [`EinFoldPlanner`] added. Install
-/// it with `SessionStateBuilder::with_query_planner`.
+/// DataFusion's default query planner, with [`EinFoldPlanner`] added, and,
+/// if made with [`EinFoldQueryPlanner::detecting`], [`EinFoldRule`] applied to
+/// each optimized logical plan just before it is planned. Install it with
+/// `SessionStateBuilder::with_query_planner`, or use [`install`](crate::install).
+///
+/// Detecting here, rather than among the optimizer's rules, keeps `Fold`
+/// nodes out of optimized logical plans, which other code reads: ddx, for
+/// one, turns them into Substrait to differentiate them, and Substrait can't
+/// encode a `Fold`. Only the plan that runs has them. It is also where a host
+/// that can't add optimizer rules from outside, such as DataFusion's Python
+/// bindings, can take a query planner.
 #[derive(Debug, Default)]
-pub struct EinFoldQueryPlanner;
+pub struct EinFoldQueryPlanner {
+    detect: Option<EinFoldRule>,
+}
+
+impl EinFoldQueryPlanner {
+    /// The planner, applying `rule` to each plan before planning it.
+    pub fn detecting(rule: EinFoldRule) -> Self {
+        EinFoldQueryPlanner { detect: Some(rule) }
+    }
+}
 
 #[async_trait]
 impl QueryPlanner for EinFoldQueryPlanner {
@@ -345,6 +365,18 @@ impl QueryPlanner for EinFoldQueryPlanner {
         plan: &LogicalPlan,
         session: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let detected;
+        let plan = match &self.detect {
+            None => plan,
+            Some(rule) => {
+                let config = OptimizerContext::new();
+                detected = plan
+                    .clone()
+                    .transform_up(|node| rule.rewrite(node, &config))?
+                    .data;
+                &detected
+            }
+        };
         DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(EinFoldPlanner)])
             .create_physical_plan(plan, session)
             .await

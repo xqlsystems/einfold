@@ -53,10 +53,11 @@ use crate::node::FoldNode;
 const PREFIX: &str = "__einfold_";
 
 /// Finds folds over joins in DataFusion's optimized plans (see the module's
-/// documentation). Add it after DataFusion's own rules, as
-/// `SessionStateBuilder::with_optimizer_rule` does, with
-/// [`EinFoldQueryPlanner`](crate::EinFoldQueryPlanner) to plan the nodes, or
-/// use [`install`](crate::install).
+/// documentation). [`EinFoldQueryPlanner::detecting`](crate::EinFoldQueryPlanner::detecting)
+/// applies it to each plan just before planning it, which [`install`](crate::install)
+/// sets up. It can also be added after DataFusion's own optimizer rules, but
+/// then optimized plans contain `Fold` nodes, which a Substrait producer, such
+/// as ddx's, can't encode.
 #[derive(Debug)]
 pub struct EinFoldRule {
     fallback: bool,
@@ -326,20 +327,32 @@ fn same_schema(a: &DFSchemaRef, b: &DFSchemaRef) -> bool {
 
 // --- shape 2: a fill --------------------------------------------------------------
 
-/// The fold this rule made from `plan`, under any aliases: its node, and the
-/// projection that restored the aggregate's schema.
-fn found_fold(mut plan: &LogicalPlan) -> Option<(&FoldNode, &Projection)> {
-    while let LogicalPlan::SubqueryAlias(a) = plan {
-        plan = a.input.as_ref();
+/// The fold this rule made under `plan`, through any aliases and projections
+/// that only rename or reorder columns, with, for each column of `plan`, its
+/// column in the fold's output: an output's index, or the number of outputs
+/// for the sum.
+fn found_fold(plan: &LogicalPlan) -> Option<(&FoldNode, Vec<usize>)> {
+    match plan {
+        LogicalPlan::Extension(e) => {
+            let node = e.node.as_any().downcast_ref::<FoldNode>()?;
+            let usable = node.fold().domain().is_none() && node.found();
+            usable.then(|| (node, (0..=node.fold().outputs().len()).collect()))
+        }
+        LogicalPlan::SubqueryAlias(a) => found_fold(&a.input),
+        LogicalPlan::Projection(p) => {
+            let (node, below) = found_fold(&p.input)?;
+            let columns = p
+                .expr
+                .iter()
+                .map(|e| match e.clone().unalias() {
+                    Expr::Column(c) => p.input.schema().index_of_column(&c).ok().map(|i| below[i]),
+                    _ => None,
+                })
+                .collect::<Option<Vec<usize>>>()?;
+            Some((node, columns))
+        }
+        _ => None,
     }
-    let LogicalPlan::Projection(p) = plan else {
-        return None;
-    };
-    let LogicalPlan::Extension(e) = p.input.as_ref() else {
-        return None;
-    };
-    let node = e.node.as_any().downcast_ref::<FoldNode>()?;
-    (node.fold().domain().is_none() && node.found()).then_some((node, p))
 }
 
 /// `p` over a left join from a relation onto a fold, with the relation as the
@@ -360,7 +373,7 @@ fn fill(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
     if *join_type != JoinType::Left || filter.is_some() {
         return Ok(None);
     }
-    let Some((node, _)) = found_fold(right) else {
+    let Some((node, columns)) = found_fold(right) else {
         return Ok(None);
     };
     let fold = node.fold();
@@ -382,6 +395,7 @@ fn fill(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
         ) else {
             return Ok(None);
         };
+        let i = columns[i];
         if i >= n || keys[i].replace((d, equality)).is_some() {
             return Ok(None);
         }
@@ -391,7 +405,10 @@ fn fill(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
     };
     // The projection may read the domain and the fold's sum, not its keys,
     // which are NULL where the domain matched no group.
-    let (value_q, value_field) = right_schema.qualified_field(n);
+    let Some(v) = columns.iter().position(|&c| c == n) else {
+        return Ok(None);
+    };
+    let (value_q, value_field) = right_schema.qualified_field(v);
     let value = Column::new(value_q.cloned(), value_field.name());
     let reads_keys = p.expr.iter().any(|e| {
         e.column_refs()

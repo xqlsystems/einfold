@@ -24,17 +24,15 @@ use datafusion::prelude::SessionContext;
 use ddx_datafusion::ad::{self, ColumnRef};
 use ddx_datafusion::engine;
 
-/// The fastest of five runs, in milliseconds.
-macro_rules! best_ms {
-    ($body:expr) => {{
-        let mut best = f64::MAX;
-        for _ in 0..5 {
-            let t = Instant::now();
-            $body;
-            best = best.min(t.elapsed().as_secs_f64() * 1e3);
-        }
-        best
-    }};
+/// The fastest of five runs of `run`, in milliseconds.
+async fn best_ms(mut run: impl AsyncFnMut()) -> f64 {
+    let mut best = f64::MAX;
+    for _ in 0..5 {
+        let t = Instant::now();
+        run().await;
+        best = best.min(t.elapsed().as_secs_f64() * 1e3);
+    }
+    best
 }
 
 async fn exec(ctx: &SessionContext, sql: &str) {
@@ -55,16 +53,25 @@ async fn measure(
     let wrt = [ColumnRef::new("w", "val"), ColumnRef::new("a", "val")];
     let program = ad::grad(&ctx, loss, &wrt).await.unwrap();
     engine::execute(&ctx, &program).await.unwrap();
-    let run = best_ms!(engine::execute(&ctx, &program).await.unwrap());
+    let run = best_ms(async || {
+        engine::execute(&ctx, &program).await.unwrap();
+    })
+    .await;
     let mut steps = Vec::new();
     // ddx's checks run before the steps: plans that must return no rows,
     // such as one that each table's keys identify its rows.
     for (i, check) in program.checks.iter().enumerate() {
-        let ms = best_ms!(engine::returns_rows(&ctx, &check.plan).await.unwrap());
+        let ms = best_ms(async || {
+            engine::returns_rows(&ctx, &check.plan).await.unwrap();
+        })
+        .await;
         steps.push((format!("check {i}"), ms));
     }
     for step in program.steps() {
-        let ms = best_ms!(engine::run_step(&ctx, step).await.unwrap());
+        let ms = best_ms(async || {
+            engine::run_step(&ctx, step).await.unwrap();
+        })
+        .await;
         let short = step
             .name
             .splitn(4, '_')

@@ -18,20 +18,22 @@ Run with `cargo run --release [n …]`, with `protoc` on the `PATH` or in `PROTO
 
 | step, n = 50,000 | einfold off, ms | einfold on, ms |
 |---|---:|---:|
-| ddx's checks (each table's keys identify its rows; the cotangent's shape) | 32.0 | 32.2 |
-| `saved_0` (forward z = a·w) | 31.5 | 19.9 |
+| ddx's checks (each table's keys identify its rows; the cotangent's shape) | 32.1 | 32.1 |
+| `saved_0` (forward z = a·w) | 37.7 | 9.3 |
 | `saved_1`, `value`, `cotangent_1` | 2.3 | 2.2 |
-| `cotangent_0` | 17.4 | 17.8 |
-| `grad_0_a` (Ā) | 246.7 | 21.5 |
-| `grad_1_w` (W̄) | 33.9 | 20.2 |
-| **whole program** | **364.6** | **117.2** |
+| `cotangent_0` | 17.0 | 17.4 |
+| `grad_0_a` (Ā) | 245.5 | 13.9 |
+| `grad_1_w` (W̄) | 33.1 | 14.2 |
+| **whole program** | **368.9** | **89.8** |
 
-**3.1–3.2× at n = 50,000 over three runs, and 2.3–2.4× at n = 10,000. The gate, 4×, is not yet passed.** The gradients agree to a relative 1e-12.
+**4.0–4.1× at n = 50,000 over five runs, so M1's gate, 4×, is passed, just.** At n = 10,000 it's 2.5–2.6× (75 ms against 30). The gradients agree to a relative 1e-12.
 
-Each gradient step is ddx's transposed contraction, joined back to the table and grouped again by its keys, then left-joined from the table. einfold finds the whole step, and runs it as the contraction with the table as its domain, checking as it runs that the table's keys are unique. That took Ā from 247 ms to 22.
+einfold finds each gradient step whole: ddx's transposed contraction, joined back to the table, grouped again by the table's keys, and left-joined from it. It runs the step as the contraction with the table as its domain, checking as it runs that the table's keys are unique. That took Ā from 246 ms to 14.
 
 Where the rest is, with einfold on:
 
-- **ddx's checks, 32 ms,** run before the steps. One groups `a`'s 800,000 rows by their keys to check that they identify its rows. It isn't a fold, and einfold leaves it to DataFusion.
-- **`cotangent_0`, 18 ms,** is elementwise (the derivative of `tanh(z)²`), not a fold.
-- **The three folds, 20–22 ms each,** are mostly einfold's own overhead around the arithmetic: reading the operands' keys, placing each row, and writing out the result's 400,000 or 800,000 rows, each in a single-threaded pass. The next pull request takes these on.
+- **ddx's checks, 32 ms,** run before the steps. One groups `a`'s 800,000 rows by their keys to check that they identify its rows. It isn't a fold, and einfold leaves it to DataFusion. It checks the same thing einfold's domain check does, so a host running both does that work twice.
+- **`cotangent_0`, 17 ms,** is elementwise (the derivative of `tanh(z)²`), not a fold.
+- **The three folds, 37 ms between them.** They are mostly linear passes: reading 800,000 rows' keys and factors, and writing 400,000 or 800,000 rows out.
+
+So more than half of what remains is ddx's own work outside the folds. Even if einfold's three folds were free, the program would be about 7× faster, not more.

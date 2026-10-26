@@ -15,8 +15,8 @@
 //! dimensions flattened into one position. Keys are used as positions
 //! directly: key `k` of a dimension is position `k`, and a dimension's extent
 //! is its largest key plus one. `b` is held as a dense matrix, and each row of
-//! `a` adds its factor times a row of `b` into a row of the output. This is the
-//! positional *fold* of the design: only `b` and the output are dense.
+//! `a` adds its factor times a row of `b` into a row of the output, so only `b`
+//! and the output are dense: `a` is read row by row, as SQL would read it.
 //!
 //! **When SQL and dense arrays agree.** A dense array has a value at every
 //! position, where SQL has rows only where they exist:
@@ -62,8 +62,9 @@ const FEW_CELLS: usize = 4096;
 const NONE: u32 = u32::MAX;
 
 /// Whether a dense array of `cells` is worth building for `rows` rows: no
-/// more than four cells per row (S11 found dense beats sparse above about 20%
-/// density), plus some slack for small inputs.
+/// more than four cells per row, plus some slack for small inputs. Measured
+/// on CPU, a dense product beats a hash-based one once about a fifth of its
+/// cells hold rows, and one row in four cells is past that.
 fn worth(cells: usize, rows: usize) -> bool {
     cells <= rows.saturating_mul(4).saturating_add(FEW_CELLS) && cells < NONE as usize
 }

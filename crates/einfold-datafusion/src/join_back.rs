@@ -66,12 +66,13 @@ fn base(plan: &LogicalPlan) -> Option<(&LogicalPlan, Vec<usize>)> {
 
 /// Whether two bases (see [`base`]) are one relation: the same plan, or
 /// scans of one table with the same filters and limit, whichever columns
-/// each reads.
+/// each reads. Within one plan, a table's name names one table, though
+/// each scan of it may hold its own handle to it.
 fn same_relation(a: &LogicalPlan, b: &LogicalPlan) -> bool {
     match (a, b) {
         (LogicalPlan::TableScan(a), LogicalPlan::TableScan(b)) => {
             a.table_name == b.table_name
-                && Arc::ptr_eq(&a.source, &b.source)
+                && a.source.schema() == b.source.schema()
                 && a.filters == b.filters
                 && a.fetch == b.fetch
         }

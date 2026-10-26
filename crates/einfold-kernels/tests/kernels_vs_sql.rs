@@ -417,13 +417,11 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
             .enumerate()
             .map(|(i, &d)| Output {
                 dimension: DimensionId(d),
-                name: format!("d{d}"),
                 domain_key: domain_keys.get(i).map(|&eq| (ColumnIndex(i), eq)),
             })
             .collect(),
         RowValue::Product,
         Aggregate::sum(),
-        "v",
         domain.clone(),
     )
     .unwrap();

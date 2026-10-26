@@ -69,10 +69,14 @@ fn bad<T>(why: String) -> Result<T> {
 /// The schema of `fold`'s result over inputs of these schemas: its two
 /// operands, then its domain if it has one.
 ///
-/// Without a domain, the result has one key column per output, named as the
-/// output says and typed as the dimension's columns are, then the value.
-/// With a domain, it has the domain's carried columns, then the value. The
-/// value is a `Float64`, nullable unless the domain gives NULLs a value.
+/// Without a domain, the result has one key column per output, typed as the
+/// dimension's columns are, then the value. With a domain, it has the
+/// domain's carried columns, then the value. The value is a `Float64`,
+/// nullable unless the domain gives NULLs a value.
+///
+/// A fold names no columns, so these are named by position: `"0"`, `"1"`, ….
+/// The kernels read only the types of the schema they are given, so a caller
+/// may rename its fields freely.
 ///
 /// Fails unless every column the fold names exists, factors are `Float64`,
 /// and every column of one dimension, in the operands and the domain, has one
@@ -145,18 +149,24 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
                 }
             }
             for &col in &spec.carry {
-                fields.push(field(schema, col)?);
+                let f = field(schema, col)?;
+                fields.push(f.with_name(fields.len().to_string()));
             }
         }
         _ => {
             for o in fold.outputs() {
                 let f = types[o.dimension.0].as_ref().expect("held by an operand");
-                fields.push(Field::new(&o.name, f.data_type().clone(), f.is_nullable()));
+                let name = fields.len().to_string();
+                fields.push(Field::new(name, f.data_type().clone(), f.is_nullable()));
             }
         }
     }
     let nullable = fold.domain().is_none_or(|d| d.missing.is_none());
-    fields.push(Field::new(fold.value(), DataType::Float64, nullable));
+    fields.push(Field::new(
+        fields.len().to_string(),
+        DataType::Float64,
+        nullable,
+    ));
     Ok(Arc::new(Schema::new(fields)))
 }
 

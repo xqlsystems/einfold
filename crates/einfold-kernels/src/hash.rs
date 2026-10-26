@@ -227,7 +227,7 @@ pub(crate) fn fold(
             let key = |i: usize| fold.outputs()[i].domain_key.expect("a fold with a domain");
             let key_cols = |outs: &[usize]| -> Vec<ArrayRef> {
                 outs.iter()
-                    .map(|&i| Arc::clone(batch.column(key(i).0 .0)))
+                    .map(|&i| Arc::clone(batch.column(key(i).column.0)))
                     .collect()
             };
             let (da, db) = (
@@ -237,8 +237,8 @@ pub(crate) fn fold(
             // A NULL key compared with `=` matches no group.
             let strict: Vec<_> = (0..fold.outputs().len())
                 .map(key)
-                .filter(|(_, eq)| *eq == KeyEquality::Equal)
-                .filter_map(|(c, _)| batch.column(c.0).logical_nulls())
+                .filter(|k| k.equality == KeyEquality::Equal)
+                .filter_map(|k| batch.column(k.column.0).logical_nulls())
                 .collect();
             let values: Float64Array = (0..batch.num_rows())
                 .map(|r| {

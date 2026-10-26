@@ -50,8 +50,8 @@ use datafusion::common::ScalarValue;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use einfold_ir::{
-    Aggregate, ColumnIndex, Dimension, DimensionId, Domain, Fold, KeyEquality, Operand, Output,
-    RowValue,
+    Aggregate, ColumnIndex, Dimension, DimensionId, Domain, DomainKey, Fold, Key, KeyEquality,
+    Operand, Output, RowValue,
 };
 use einfold_kernels::{Algorithm, FloatKeys, Host, Options, Relation};
 
@@ -393,7 +393,7 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
             keys: mine
                 .iter()
                 .enumerate()
-                .map(|(c, &d)| (DimensionId(d), ColumnIndex(c)))
+                .map(|(c, &d)| Key::new(DimensionId(d), ColumnIndex(c)))
                 .collect(),
             factor: Some(ColumnIndex(mine.len())),
         };
@@ -433,7 +433,9 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
             .enumerate()
             .map(|(i, &d)| Output {
                 dimension: DimensionId(d),
-                domain_key: domain_keys.get(i).map(|&eq| (ColumnIndex(i), eq)),
+                domain_key: domain_keys
+                    .get(i)
+                    .map(|&eq| DomainKey::new(ColumnIndex(i), eq)),
             })
             .collect(),
         RowValue::Product,

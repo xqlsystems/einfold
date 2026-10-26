@@ -10,6 +10,6 @@
 pub mod fold;
 
 pub use fold::{
-    Aggregate, ColumnIndex, Dimension, DimensionId, Domain, Finish, Fold, InvalidFold, KeyEquality,
-    Monoid, Operand, Output, RowValue,
+    Aggregate, ColumnIndex, Dimension, DimensionId, Domain, DomainKey, Finish, Fold, InvalidFold,
+    Key, KeyEquality, Monoid, Operand, Output, RowValue,
 };

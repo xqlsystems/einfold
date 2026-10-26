@@ -74,12 +74,29 @@ pub struct Dimension {
     pub equality: KeyEquality,
 }
 
+/// A column of an operand that holds one of the fold's dimensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Key {
+    /// The dimension held.
+    pub dimension: DimensionId,
+    /// The operand's column that holds it.
+    pub column: ColumnIndex,
+}
+
+impl Key {
+    /// Dimension `dimension`, held in column `column`.
+    #[must_use]
+    pub fn new(dimension: DimensionId, column: ColumnIndex) -> Self {
+        Key { dimension, column }
+    }
+}
+
 /// One input of a fold: which of its columns hold which dimensions, and
 /// which holds the factor it contributes to each joined row's value.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Operand {
     /// Each dimension this operand holds, and its column.
-    pub keys: Vec<(DimensionId, ColumnIndex)>,
+    pub keys: Vec<Key>,
     /// The column holding this operand's factor. `None` makes the operand a
     /// *mask*: its rows decide which rows join, and it contributes no factor,
     /// as if its factor were 1.
@@ -88,8 +105,27 @@ pub struct Operand {
 
 impl Operand {
     /// The column of this operand that holds dimension `dim`, if any.
+    #[must_use]
     pub fn column_of(&self, dim: DimensionId) -> Option<ColumnIndex> {
-        self.keys.iter().find(|(d, _)| *d == dim).map(|(_, c)| *c)
+        let key = self.keys.iter().find(|k| k.dimension == dim);
+        key.map(|k| k.column)
+    }
+}
+
+/// The domain's column an output is matched with, and how.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DomainKey {
+    /// The domain's column.
+    pub column: ColumnIndex,
+    /// How it is compared with the output's key.
+    pub equality: KeyEquality,
+}
+
+impl DomainKey {
+    /// The domain's column `column`, compared with `equality`.
+    #[must_use]
+    pub fn new(column: ColumnIndex, equality: KeyEquality) -> Self {
+        DomainKey { column, equality }
     }
 }
 
@@ -100,7 +136,7 @@ pub struct Output {
     pub dimension: DimensionId,
     /// With a [`Domain`], the domain's column this output is matched with, and
     /// how; `None` without one.
-    pub domain_key: Option<(ColumnIndex, KeyEquality)>,
+    pub domain_key: Option<DomainKey>,
 }
 
 /// What each joined row contributes to its group.
@@ -287,7 +323,11 @@ impl Fold {
         let n = dimensions.len();
         for (i, op) in operands.iter().enumerate() {
             let mut seen = vec![false; n];
-            for &(DimensionId(d), _) in &op.keys {
+            for &Key {
+                dimension: DimensionId(d),
+                ..
+            } in &op.keys
+            {
                 if d >= n {
                     return bad(format!("operand {i} names dimension {d}, of {n}"));
                 }
@@ -418,7 +458,7 @@ mod tests {
         Operand {
             keys: keys
                 .iter()
-                .map(|&(d, c)| (DimensionId(d), ColumnIndex(c)))
+                .map(|&(d, c)| Key::new(DimensionId(d), ColumnIndex(c)))
                 .collect(),
             factor: factor.map(ColumnIndex),
         }
@@ -484,7 +524,7 @@ mod tests {
         // With a domain, every output needs a key; without one, none may.
         assert!(matmul(vec![out(0), out(2)], Some(domain())).is_err());
         let mut keyed = out(0);
-        keyed.domain_key = Some((ColumnIndex(0), KeyEquality::NotDistinct));
+        keyed.domain_key = Some(DomainKey::new(ColumnIndex(0), KeyEquality::NotDistinct));
         assert!(matmul(vec![keyed], None).is_err());
         assert!(matmul(vec![keyed], Some(domain())).is_ok());
         assert!(fold(1, vec![op(&[(0, 0), (0, 1)], Some(2))], vec![], None).is_err());

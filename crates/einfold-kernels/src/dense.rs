@@ -185,7 +185,8 @@ pub(crate) fn fold(
         (batches.iter())
             .map(|batch| {
                 (op.keys.iter())
-                    .map(|&(DimensionId(d), ColumnIndex(c))| {
+                    .map(|key| {
+                        let (DimensionId(d), ColumnIndex(c)) = (key.dimension, key.column);
                         let (k, n) = keys(batch.column(c))?;
                         extent[d] = extent[d].max(n);
                         Some((d, k))
@@ -301,7 +302,7 @@ pub(crate) fn fold(
             let keys: Vec<ColumnIndex> = fold
                 .outputs()
                 .iter()
-                .map(|o| o.domain_key.expect("a fold with a domain").0)
+                .map(|o| o.domain_key.expect("a fold with a domain").column)
                 .collect();
             let strides: Vec<usize> = dims
                 .iter()

@@ -27,7 +27,7 @@ use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use einfold_ir::{ColumnIndex, Fold};
+use einfold_ir::{ColumnIndex, Fold, Key};
 
 mod dense;
 mod hash;
@@ -136,7 +136,11 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
                 factor.data_type()
             ));
         }
-        for &(d, col) in &op.keys {
+        for &Key {
+            dimension: d,
+            column: col,
+        } in &op.keys
+        {
             let f = field(schema, col)?;
             match &types[d.0] {
                 None => types[d.0] = Some(f),
@@ -156,7 +160,7 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
     match (fold.domain(), domain) {
         (Some(spec), Some(schema)) => {
             for o in fold.outputs() {
-                let (col, _) = o.domain_key.expect("checked by Fold::try_new");
+                let col = o.domain_key.expect("checked by Fold::try_new").column;
                 let key = field(schema, col)?;
                 let want = types[o.dimension.0].as_ref().expect("held by an operand");
                 if key.data_type() != want.data_type() {

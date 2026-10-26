@@ -237,7 +237,7 @@ pub(crate) fn describe(fold: &Fold, unique_domain: bool) -> String {
         .map(|op| {
             op.keys
                 .iter()
-                .map(|(d, _)| name(*d))
+                .map(|k| name(k.dimension))
                 .collect::<Vec<_>>()
                 .join(",")
         })

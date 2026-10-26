@@ -61,6 +61,11 @@ pub struct Options {
     pub host: Host,
     /// The most threads to use. The result's bits don't depend on it.
     pub threads: usize,
+    /// Decline unless no two of the domain's rows locate the same group. A
+    /// plan that joins a fold back to its domain and groups again by the
+    /// domain's keys is the fold from its domain exactly when they are
+    /// unique. Only [`fold_dense`] checks it, as it can decline.
+    pub unique_domain: bool,
 }
 
 /// Which algorithm computed a fold.
@@ -195,7 +200,8 @@ pub fn fold_dense(
     schema: SchemaRef,
     options: Options,
 ) -> Result<Option<Vec<RecordBatch>>> {
-    dense::fold(fold, a, b, domain, schema, options.threads.max(1))
+    let threads = options.threads.max(1);
+    dense::fold(fold, a, b, domain, schema, threads, options.unique_domain)
 }
 
 /// `fold` over operands `a` and `b`, and the batches of its domain if it has
@@ -213,8 +219,11 @@ pub fn fold(
     schema: SchemaRef,
     options: Options,
 ) -> Result<(Algorithm, Vec<RecordBatch>)> {
+    if options.unique_domain {
+        return bad("only fold_dense checks that a domain's keys are unique".into());
+    }
     let threads = options.threads.max(1);
-    if let Some(batches) = dense::fold(fold, a, b, domain, schema.clone(), threads)? {
+    if let Some(batches) = dense::fold(fold, a, b, domain, schema.clone(), threads, false)? {
         return Ok((Algorithm::Dense, batches));
     }
     let batches = hash::fold(fold, a, b, domain, schema, options.host)?;

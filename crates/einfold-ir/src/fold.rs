@@ -22,9 +22,15 @@
 //! multiplication `C[n, h] = Σ_d X[n, d]·W[d, h]` is the fold with dimensions
 //! `n`, `d` and `h`, operands `X(n, d)` and `W(d, h)`, and outputs `n` and `h`.
 //!
-//! An **output** is a dimension shown as a column of the result, under a
-//! name of its own. Each dimension is shown at most once; a query that shows
-//! one under several names renames it in a projection above the fold.
+//! An **output** is a dimension shown as a column of the result. Each
+//! dimension is shown at most once; a query that shows one in several columns
+//! copies it in a projection above the fold.
+//!
+//! **A fold names no columns.** Its inputs' columns are given by position
+//! ([`ColumnIndex`]), and so are its result's: the outputs' key columns in
+//! order, then the value. Naming them is the host's business, as it is for a
+//! Substrait relation, so two folds that compute the same thing are equal
+//! whatever the query called their columns.
 //!
 //! **Groups exist only where some row joined,** with or without outputs. So
 //! a fold with no outputs has one row when anything joined and none
@@ -87,12 +93,10 @@ impl Operand {
 }
 
 /// One key column of a fold's result.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Output {
     /// The dimension shown.
     pub dimension: DimensionId,
-    /// The column's name.
-    pub name: String,
     /// With a [`Domain`], the domain's column this output is matched with, and
     /// how; `None` without one.
     pub domain_key: Option<(ColumnIndex, KeyEquality)>,
@@ -169,7 +173,8 @@ impl Aggregate {
 
 /// The relation a fold's output is left-joined from.
 ///
-/// With a domain, the output has one row per domain row, in SQL:
+/// With a domain, the output has one row per domain row, and its columns are
+/// the domain's carried columns, then the value. In SQL:
 ///
 /// ```sql
 /// SELECT <domain's carried columns>,
@@ -241,7 +246,6 @@ pub struct Fold {
     outputs: Vec<Output>,
     row: RowValue,
     aggregate: Aggregate,
-    value: String,
     domain: Option<Domain>,
 }
 
@@ -270,15 +274,12 @@ impl Fold {
     /// - the aggregate's final function names one of its parts;
     /// - with a domain, every output has a domain key, and without one, none
     ///   does.
-    ///
-    /// `value` names the output's value column.
     pub fn try_new(
         dimensions: Vec<Dimension>,
         operands: Vec<Operand>,
         outputs: Vec<Output>,
         row: RowValue,
         aggregate: Aggregate,
-        value: impl Into<String>,
         domain: Option<Domain>,
     ) -> Result<Self, InvalidFold> {
         let bad = |why: String| Err(InvalidFold(why));
@@ -316,8 +317,7 @@ impl Fold {
             }
             if o.domain_key.is_some() != domain.is_some() {
                 return bad(format!(
-                    "output {} has a domain key exactly when the fold has a domain",
-                    o.name
+                    "output of dimension {d} has a domain key exactly when the fold has a domain"
                 ));
             }
         }
@@ -334,7 +334,6 @@ impl Fold {
             outputs,
             row,
             aggregate,
-            value: value.into(),
             domain,
         })
     }
@@ -359,7 +358,7 @@ impl Fold {
         &self.operands
     }
 
-    /// The output's key columns, in order.
+    /// The result's key columns, in order.
     pub fn outputs(&self) -> &[Output] {
         &self.outputs
     }
@@ -372,11 +371,6 @@ impl Fold {
     /// How joined rows combine into each group's value.
     pub fn aggregate(&self) -> &Aggregate {
         &self.aggregate
-    }
-
-    /// The name of the output's value column.
-    pub fn value(&self) -> &str {
-        &self.value
     }
 
     /// The domain, if the output is left-joined from one (see [`Domain`]).
@@ -410,10 +404,9 @@ mod tests {
         equality: KeyEquality::Equal,
     };
 
-    fn out(d: usize, name: &str) -> Output {
+    fn out(d: usize) -> Output {
         Output {
             dimension: DimensionId(d),
-            name: name.into(),
             domain_key: None,
         }
     }
@@ -440,7 +433,6 @@ mod tests {
             outputs,
             RowValue::Product,
             Aggregate::sum(),
-            "v",
             domain,
         )
     }
@@ -456,7 +448,7 @@ mod tests {
 
     #[test]
     fn matrix_product() {
-        let f = matmul(vec![out(0, "n"), out(2, "h")], None).unwrap();
+        let f = matmul(vec![out(0), out(2)], None).unwrap();
         assert!(f.is_einsum());
         assert!(f.is_aggregated(DimensionId(1)));
         assert_eq!(f.output_of(DimensionId(2)), Some(1));
@@ -480,17 +472,17 @@ mod tests {
 
     #[test]
     fn rejects_inconsistent_descriptions() {
-        assert!(matmul(vec![out(0, "a"), out(0, "b")], None).is_err());
-        assert!(matmul(vec![out(3, "x")], None).is_err());
+        assert!(matmul(vec![out(0), out(0)], None).is_err());
+        assert!(matmul(vec![out(3)], None).is_err());
         let domain = || Domain {
             carry: vec![ColumnIndex(0)],
             missing: Some(0.0),
         };
         // With a domain, every output needs a key; without one, none may.
-        assert!(matmul(vec![out(0, "n"), out(2, "h")], Some(domain())).is_err());
-        let mut keyed = out(0, "n");
+        assert!(matmul(vec![out(0), out(2)], Some(domain())).is_err());
+        let mut keyed = out(0);
         keyed.domain_key = Some((ColumnIndex(0), KeyEquality::NotDistinct));
-        assert!(matmul(vec![keyed.clone()], None).is_err());
+        assert!(matmul(vec![keyed], None).is_err());
         assert!(matmul(vec![keyed], Some(domain())).is_ok());
         assert!(fold(1, vec![op(&[(0, 0), (0, 1)], Some(2))], vec![], None).is_err());
         assert!(fold(2, vec![op(&[(0, 0)], Some(1))], vec![], None).is_err());

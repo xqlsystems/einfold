@@ -16,6 +16,7 @@ use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::common::{plan_err, DFSchema, DFSchemaRef, Result};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan, UserDefinedLogicalNodeCore};
 use einfold_ir::{ColumnIndex, DimensionId, Fold};
+use einfold_kernels::DomainRows;
 
 /// A fold over a join in a DataFusion logical plan. Its inputs are the fold's
 /// two operands, then its domain if it has one; its schema is
@@ -32,7 +33,7 @@ pub struct FoldNode {
     found: bool,
     /// Whether the node computes its fold only when no two domain rows reach
     /// one group, and runs its fallback otherwise.
-    unique_domain: bool,
+    domain_rows: DomainRows,
     /// A Boolean column of the domain whose rows get a NULL value where it is
     /// true, whatever their group's.
     null_when: Option<ColumnIndex>,
@@ -77,7 +78,7 @@ impl FoldNode {
             schema,
             fallback: None,
             found: false,
-            unique_domain: false,
+            domain_rows: DomainRows::Any,
             null_when: None,
         })
     }
@@ -97,14 +98,15 @@ impl FoldNode {
     /// joins a fold back to its domain and groups again by the domain's keys,
     /// which is the fold from its domain exactly then.
     pub(crate) fn requiring_unique_domain(mut self) -> Self {
-        self.unique_domain = true;
+        self.domain_rows = DomainRows::UniqueKeys;
         self
     }
 
     /// Whether the node computes its fold only when its domain's keys are
-    /// unique, running its fallback otherwise.
-    pub fn unique_domain(&self) -> bool {
-        self.unique_domain
+    /// unique ([`DomainRows::UniqueKeys`]), running its fallback otherwise.
+    #[must_use]
+    pub fn domain_rows(&self) -> DomainRows {
+        self.domain_rows
     }
 
     /// This node, giving a NULL value to each row of its domain where the
@@ -166,7 +168,7 @@ impl PartialOrd for FoldNode {
                 &n.inputs,
                 &n.fallback,
                 n.found,
-                n.unique_domain,
+                n.domain_rows,
                 n.null_when,
             )
         }
@@ -192,7 +194,7 @@ impl UserDefinedLogicalNodeCore for FoldNode {
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Fold: {}", describe(&self.fold, self.unique_domain))?;
+        write!(f, "Fold: {}", describe(&self.fold, self.domain_rows))?;
         match self.null_when {
             Some(ColumnIndex(c)) => write!(f, ", NULL where domain column {c}"),
             None => Ok(()),
@@ -214,7 +216,7 @@ impl UserDefinedLogicalNodeCore for FoldNode {
         Ok(FoldNode {
             fallback: self.fallback.clone(),
             found: self.found,
-            unique_domain: self.unique_domain,
+            domain_rows: self.domain_rows,
             null_when: self.null_when,
             ..node
         })
@@ -226,7 +228,7 @@ impl UserDefinedLogicalNodeCore for FoldNode {
 /// `+ domain` when there is one (`+ unique domain` when the node requires
 /// its keys to be unique). Dimensions are lettered by number, as the
 /// fold names none; past `z`, they are shown as `#26`, `#27`, ….
-pub(crate) fn describe(fold: &Fold, unique_domain: bool) -> String {
+pub(crate) fn describe(fold: &Fold, domain_rows: DomainRows) -> String {
     let name = |DimensionId(d): DimensionId| match u8::try_from(d) {
         Ok(d) if d < 26 => char::from(b'a' + d).to_string(),
         _ => format!("#{d}"),
@@ -247,10 +249,10 @@ pub(crate) fn describe(fold: &Fold, unique_domain: bool) -> String {
         "{} -> {}{}",
         operands.join(" * "),
         outputs.join(","),
-        match (fold.domain(), unique_domain) {
+        match (fold.domain(), domain_rows) {
             (None, _) => "",
-            (Some(_), false) => " + domain",
-            (Some(_), true) => " + unique domain",
+            (Some(_), DomainRows::Any) => " + domain",
+            (Some(_), DomainRows::UniqueKeys) => " + unique domain",
         }
     )
 }

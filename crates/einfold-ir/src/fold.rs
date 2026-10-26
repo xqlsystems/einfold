@@ -6,8 +6,8 @@
 //! described by its operands, dimensions and aggregate rather than by SQL
 //! text.
 //!
-//! With operands `a` and `b` and the aggregate [`Aggregate::SumOfProducts`],
-//! a fold means, in SQL:
+//! With operands `a` and `b`, the row value [`RowValue::Product`] and the
+//! aggregate [`Aggregate::sum`], a fold means, in SQL:
 //!
 //! ```sql
 //! SELECT <outputs>, SUM(a.<factor> * b.<factor>) AS <value>
@@ -22,15 +22,32 @@
 //! multiplication `C[n, h] = Σ_d X[n, d]·W[d, h]` is the fold with dimensions
 //! `n`, `d` and `h`, operands `X(n, d)` and `W(d, h)`, and outputs `n` and `h`.
 //!
-//! A dimension is not a column name: an **output** names the column a
-//! dimension appears as in the result, since a query may show one dimension
-//! under several names.
+//! An **output** is a dimension shown as a column of the result, under a
+//! name of its own. Each dimension is shown at most once; a query that shows
+//! one under several names renames it in a projection above the fold.
+//!
+//! **Groups exist only where some row joined,** with or without outputs. So
+//! a fold with no outputs has one row when anything joined and none
+//! otherwise, unlike SQL's `SELECT SUM(…)` without `GROUP BY`, which always
+//! returns one row.
 //!
 //! A fold may also have a **domain**: a relation that the output is
 //! left-joined from, so that the output has one row per domain row (see
 //! [`Domain`]).
+//!
+//! Indices into a fold's dimensions and into its inputs' columns have types
+//! of their own, [`DimensionId`] and [`ColumnIndex`], so that one can't be
+//! passed for the other.
 
 use std::fmt;
+
+/// A dimension of a fold: an index into [`Fold::dimensions`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DimensionId(pub usize);
+
+/// A column of one of a fold's inputs, by position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ColumnIndex(pub usize);
 
 /// How a dimension's columns are compared in the join.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -54,18 +71,17 @@ pub struct Dimension {
 /// which holds the factor it contributes to each joined row's value.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Operand {
-    /// `(dimension, column)` pairs: the dimension's index in
-    /// [`Fold::dimensions`], and the column of this operand that holds it.
-    pub keys: Vec<(usize, usize)>,
+    /// Each dimension this operand holds, and its column.
+    pub keys: Vec<(DimensionId, ColumnIndex)>,
     /// The column holding this operand's factor. `None` makes the operand a
     /// *mask*: its rows decide which rows join, and it contributes no factor,
     /// as if its factor were 1.
-    pub factor: Option<usize>,
+    pub factor: Option<ColumnIndex>,
 }
 
 impl Operand {
     /// The column of this operand that holds dimension `dim`, if any.
-    pub fn column_of(&self, dim: usize) -> Option<usize> {
+    pub fn column_of(&self, dim: DimensionId) -> Option<ColumnIndex> {
         self.keys.iter().find(|(d, _)| *d == dim).map(|(_, c)| *c)
     }
 }
@@ -73,23 +89,82 @@ impl Operand {
 /// One key column of a fold's result.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Output {
-    /// The dimension, as an index into [`Fold::dimensions`].
-    pub dimension: usize,
+    /// The dimension shown.
+    pub dimension: DimensionId,
     /// The column's name.
     pub name: String,
+    /// With a [`Domain`], the domain's column this output is matched with, and
+    /// how; `None` without one.
+    pub domain_key: Option<(ColumnIndex, KeyEquality)>,
 }
 
-/// How a fold combines its joined rows into each group's value.
-///
-/// SQL's semantics hold in every case: a group exists when some joined row
-/// reaches it, whatever the row's value, and its value skips NULL, so it is
-/// NULL when every contribution was NULL.
+/// What each joined row contributes to its group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
-pub enum Aggregate {
-    /// `SUM` of the product of the operands' factors: an einsum, the
-    /// sum-product semiring. A product is NULL when any factor is.
-    SumOfProducts,
+pub enum RowValue {
+    /// The product of the operands' factors, NULL when any factor is.
+    Product,
+}
+
+/// A commutative monoid that folds row values into one part of a group's
+/// state: an operation with an identity, associative and commutative, so a
+/// group's partial states merge in any grouping and order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum Monoid {
+    /// SQL `SUM`: `+`, skipping NULL; NULL when every value was NULL.
+    Sum,
+}
+
+/// How a group's value is computed from its parts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum Finish {
+    /// The value is part `i` itself.
+    Part(usize),
+}
+
+/// How joined rows combine into each group's value: one or more monoid
+/// parts, folded in one pass, then a final function of them.
+///
+/// This is the shape of an aggregate in Gray et al.'s classification and in
+/// Haskell's `foldl` library: a *distributive* aggregate such as `SUM` is one
+/// part; an *algebraic* one such as `AVG` is several (`SUM` and `COUNT`) with
+/// a final function (division). The laws a kernel relies on, such as merging
+/// partial states in any order, are each part's monoid laws.
+///
+/// SQL's semantics hold in every case: a group exists when some joined row
+/// reaches it, whatever the row's value.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Aggregate {
+    parts: Vec<Monoid>,
+    finish: Finish,
+}
+
+impl Aggregate {
+    /// SQL `SUM`.
+    pub fn sum() -> Self {
+        Aggregate {
+            parts: vec![Monoid::Sum],
+            finish: Finish::Part(0),
+        }
+    }
+
+    /// The monoids folded in one pass.
+    pub fn parts(&self) -> &[Monoid] {
+        &self.parts
+    }
+
+    /// The final function of the parts.
+    pub fn finish(&self) -> Finish {
+        self.finish
+    }
+
+    /// Whether this is plain `SUM`, which with a [`RowValue::Product`] makes
+    /// the fold an einsum: the sum-product semiring.
+    pub fn is_sum(&self) -> bool {
+        self.parts == [Monoid::Sum] && self.finish == Finish::Part(0)
+    }
 }
 
 /// The relation a fold's output is left-joined from.
@@ -103,20 +178,19 @@ pub enum Aggregate {
 ///   ON domain.<key of output 1> <equality> folded.<output 1> AND …
 /// ```
 ///
-/// where `folded` is the fold without its domain. Every domain row appears
-/// once for each group its keys match, and once with a NULL value when none
-/// match. The `COALESCE` is left out when `missing` is `None`.
+/// where `folded` is the fold without its domain, and each output's
+/// [`Output::domain_key`] names its domain column and equality. Every domain
+/// row appears once for each group its keys match, and once with a NULL
+/// value when none match. The `COALESCE` is left out when `missing` is
+/// `None`.
 ///
 /// ddx, an XQL Systems project for automatic differentiation of SQL queries,
 /// writes each gradient this way: the table being differentiated is the
 /// domain, so each of its rows gets a gradient, and 0 where none reached it.
 #[derive(Clone, Debug)]
 pub struct Domain {
-    /// For each of the fold's outputs, in order, the domain's column it is
-    /// matched with, and how.
-    pub keys: Vec<(usize, KeyEquality)>,
     /// The domain's columns the output carries, in order, before the value.
-    pub carry: Vec<usize>,
+    pub carry: Vec<ColumnIndex>,
     /// The value of a domain row whose group's value is NULL, or that matches
     /// no group: `COALESCE`'s second argument.
     pub missing: Option<f64>,
@@ -125,8 +199,8 @@ pub struct Domain {
 impl Domain {
     /// Everything that identifies the domain, with `missing` as its bits, so
     /// that equality, hashing and ordering are total (a NaN equals itself).
-    fn identity(&self) -> (&[(usize, KeyEquality)], &[usize], Option<u64>) {
-        (&self.keys, &self.carry, self.missing.map(f64::to_bits))
+    fn identity(&self) -> (&[ColumnIndex], Option<u64>) {
+        (&self.carry, self.missing.map(f64::to_bits))
     }
 }
 
@@ -140,7 +214,7 @@ impl Eq for Domain {}
 
 impl std::hash::Hash for Domain {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.identity().hash(state)
+        std::hash::Hash::hash(&self.identity(), state)
     }
 }
 
@@ -165,6 +239,7 @@ pub struct Fold {
     dimensions: Vec<Dimension>,
     operands: Vec<Operand>,
     outputs: Vec<Output>,
+    row: RowValue,
     aggregate: Aggregate,
     value: String,
     domain: Option<Domain>,
@@ -185,20 +260,23 @@ impl std::error::Error for InvalidFold {}
 impl Fold {
     /// A fold, if its description is consistent:
     ///
-    /// - every dimension index is in range;
+    /// - every dimension it names is in range;
     /// - an operand holds each dimension in at most one column (a dimension
     ///   repeated within an operand, a diagonal such as `ii->i`, is not
     ///   supported);
     /// - every dimension is held by some operand;
     /// - no dimension is output twice;
     /// - some operand has a factor;
-    /// - a domain names one key column per output.
+    /// - the aggregate's final function names one of its parts;
+    /// - with a domain, every output has a domain key, and without one, none
+    ///   does.
     ///
     /// `value` names the output's value column.
     pub fn try_new(
         dimensions: Vec<Dimension>,
         operands: Vec<Operand>,
         outputs: Vec<Output>,
+        row: RowValue,
         aggregate: Aggregate,
         value: impl Into<String>,
         domain: Option<Domain>,
@@ -207,7 +285,7 @@ impl Fold {
         let n = dimensions.len();
         for (i, op) in operands.iter().enumerate() {
             let mut seen = vec![false; n];
-            for &(d, _) in &op.keys {
+            for &(DimensionId(d), _) in &op.keys {
                 if d >= n {
                     return bad(format!("operand {i} names dimension {d}, of {n}"));
                 }
@@ -217,7 +295,10 @@ impl Fold {
             }
         }
         for d in 0..n {
-            if !operands.iter().any(|op| op.column_of(d).is_some()) {
+            if !operands
+                .iter()
+                .any(|op| op.column_of(DimensionId(d)).is_some())
+            {
                 return bad(format!("no operand holds dimension {d}"));
             }
         }
@@ -226,26 +307,32 @@ impl Fold {
         }
         let mut seen = vec![false; n];
         for o in &outputs {
-            if o.dimension >= n {
-                return bad(format!("output dimension {}, of {n}", o.dimension));
+            let DimensionId(d) = o.dimension;
+            if d >= n {
+                return bad(format!("output dimension {d}, of {n}"));
             }
-            if std::mem::replace(&mut seen[o.dimension], true) {
-                return bad(format!("dimension {} is output twice", o.dimension));
+            if std::mem::replace(&mut seen[d], true) {
+                return bad(format!("dimension {d} is output twice"));
             }
-        }
-        if let Some(domain) = &domain {
-            if domain.keys.len() != outputs.len() {
+            if o.domain_key.is_some() != domain.is_some() {
                 return bad(format!(
-                    "the domain has {} key columns for {} outputs",
-                    domain.keys.len(),
-                    outputs.len()
+                    "output {} has a domain key exactly when the fold has a domain",
+                    o.name
                 ));
             }
+        }
+        let Finish::Part(p) = aggregate.finish;
+        if p >= aggregate.parts.len() {
+            return bad(format!(
+                "the aggregate finishes with part {p}, of {}",
+                aggregate.parts.len()
+            ));
         }
         Ok(Fold {
             dimensions,
             operands,
             outputs,
+            row,
             aggregate,
             value: value.into(),
             domain,
@@ -255,6 +342,16 @@ impl Fold {
     /// The dimensions.
     pub fn dimensions(&self) -> &[Dimension] {
         &self.dimensions
+    }
+
+    /// Dimension `d`.
+    pub fn dimension(&self, d: DimensionId) -> Dimension {
+        self.dimensions[d.0]
+    }
+
+    /// Every dimension's id, in order.
+    pub fn dimension_ids(&self) -> impl Iterator<Item = DimensionId> {
+        (0..self.dimensions.len()).map(DimensionId)
     }
 
     /// The operands.
@@ -267,9 +364,14 @@ impl Fold {
         &self.outputs
     }
 
+    /// What each joined row contributes.
+    pub fn row(&self) -> RowValue {
+        self.row
+    }
+
     /// How joined rows combine into each group's value.
-    pub fn aggregate(&self) -> Aggregate {
-        self.aggregate
+    pub fn aggregate(&self) -> &Aggregate {
+        &self.aggregate
     }
 
     /// The name of the output's value column.
@@ -284,13 +386,19 @@ impl Fold {
 
     /// The position in [`Fold::outputs`] of dimension `dim`, if it is an
     /// output.
-    pub fn output_of(&self, dim: usize) -> Option<usize> {
+    pub fn output_of(&self, dim: DimensionId) -> Option<usize> {
         self.outputs.iter().position(|o| o.dimension == dim)
     }
 
     /// Whether dimension `dim` is aggregated away: not an output.
-    pub fn is_aggregated(&self, dim: usize) -> bool {
+    pub fn is_aggregated(&self, dim: DimensionId) -> bool {
         self.output_of(dim).is_none()
+    }
+
+    /// Whether this fold is an einsum: a `SUM` of products, the sum-product
+    /// semiring. Derived from the row value and the aggregate, never declared.
+    pub fn is_einsum(&self) -> bool {
+        self.row == RowValue::Product && self.aggregate.is_sum()
     }
 }
 
@@ -302,46 +410,67 @@ mod tests {
         equality: KeyEquality::Equal,
     };
 
-    fn out(dimension: usize, name: &str) -> Output {
+    fn out(d: usize, name: &str) -> Output {
         Output {
-            dimension,
+            dimension: DimensionId(d),
             name: name.into(),
+            domain_key: None,
         }
     }
 
-    fn op(keys: Vec<(usize, usize)>, factor: Option<usize>) -> Operand {
-        Operand { keys, factor }
+    fn op(keys: &[(usize, usize)], factor: Option<usize>) -> Operand {
+        Operand {
+            keys: keys
+                .iter()
+                .map(|&(d, c)| (DimensionId(d), ColumnIndex(c)))
+                .collect(),
+            factor: factor.map(ColumnIndex),
+        }
     }
 
-    /// `n,d * d,h -> outputs`.
-    fn matmul(outputs: Vec<Output>, domain: Option<Domain>) -> Result<Fold, InvalidFold> {
+    fn fold(
+        dims: usize,
+        operands: Vec<Operand>,
+        outputs: Vec<Output>,
+        domain: Option<Domain>,
+    ) -> Result<Fold, InvalidFold> {
         Fold::try_new(
-            vec![EQ; 3],
-            vec![
-                op(vec![(0, 0), (1, 1)], Some(2)),
-                op(vec![(1, 0), (2, 1)], Some(2)),
-            ],
+            vec![EQ; dims],
+            operands,
             outputs,
-            Aggregate::SumOfProducts,
+            RowValue::Product,
+            Aggregate::sum(),
             "v",
             domain,
         )
     }
 
+    /// `n,d * d,h -> outputs`.
+    fn matmul(outputs: Vec<Output>, domain: Option<Domain>) -> Result<Fold, InvalidFold> {
+        let ops = vec![
+            op(&[(0, 0), (1, 1)], Some(2)),
+            op(&[(1, 0), (2, 1)], Some(2)),
+        ];
+        fold(3, ops, outputs, domain)
+    }
+
     #[test]
     fn matrix_product() {
         let f = matmul(vec![out(0, "n"), out(2, "h")], None).unwrap();
-        assert!(f.is_aggregated(1));
-        assert_eq!(f.output_of(2), Some(1));
-        assert_eq!(f.operands()[1].column_of(2), Some(1));
-        assert_eq!(f.operands()[0].column_of(2), None);
+        assert!(f.is_einsum());
+        assert!(f.is_aggregated(DimensionId(1)));
+        assert_eq!(f.output_of(DimensionId(2)), Some(1));
+        assert_eq!(
+            f.operands()[1].column_of(DimensionId(2)),
+            Some(ColumnIndex(1))
+        );
+        assert_eq!(f.operands()[0].column_of(DimensionId(2)), None);
     }
 
     #[test]
     fn domains_compare_missing_by_bits() {
         let d = |missing| Domain {
-            keys: vec![(0, KeyEquality::NotDistinct)],
-            carry: vec![0, 1],
+            carry: vec![ColumnIndex(0), ColumnIndex(1)],
             missing,
         };
         assert_eq!(d(Some(f64::NAN)), d(Some(f64::NAN)));
@@ -353,25 +482,20 @@ mod tests {
     fn rejects_inconsistent_descriptions() {
         assert!(matmul(vec![out(0, "a"), out(0, "b")], None).is_err());
         assert!(matmul(vec![out(3, "x")], None).is_err());
-        let domain = Domain {
-            keys: vec![(0, KeyEquality::NotDistinct)],
-            carry: vec![0],
+        let domain = || Domain {
+            carry: vec![ColumnIndex(0)],
             missing: Some(0.0),
         };
-        assert!(matmul(vec![out(0, "n"), out(2, "h")], Some(domain)).is_err());
-        let fold = |ops: Vec<Operand>, dims: usize| {
-            Fold::try_new(
-                vec![EQ; dims],
-                ops,
-                vec![],
-                Aggregate::SumOfProducts,
-                "v",
-                None,
-            )
-        };
-        assert!(fold(vec![op(vec![(0, 0), (0, 1)], Some(2))], 1).is_err());
-        assert!(fold(vec![op(vec![(0, 0)], Some(1))], 2).is_err());
-        assert!(fold(vec![op(vec![(0, 0)], None)], 1).is_err());
-        assert!(fold(vec![op(vec![(0, 0)], None), op(vec![(0, 0)], Some(1))], 1).is_ok());
+        // With a domain, every output needs a key; without one, none may.
+        assert!(matmul(vec![out(0, "n"), out(2, "h")], Some(domain())).is_err());
+        let mut keyed = out(0, "n");
+        keyed.domain_key = Some((ColumnIndex(0), KeyEquality::NotDistinct));
+        assert!(matmul(vec![keyed.clone()], None).is_err());
+        assert!(matmul(vec![keyed], Some(domain())).is_ok());
+        assert!(fold(1, vec![op(&[(0, 0), (0, 1)], Some(2))], vec![], None).is_err());
+        assert!(fold(2, vec![op(&[(0, 0)], Some(1))], vec![], None).is_err());
+        assert!(fold(1, vec![op(&[(0, 0)], None)], vec![], None).is_err());
+        let mask_and_factor = vec![op(&[(0, 0)], None), op(&[(0, 0)], Some(1))];
+        assert!(fold(1, mask_and_factor, vec![], None).is_ok());
     }
 }

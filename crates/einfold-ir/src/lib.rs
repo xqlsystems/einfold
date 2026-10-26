@@ -9,4 +9,7 @@
 
 pub mod fold;
 
-pub use fold::{Aggregate, Dimension, Domain, Fold, InvalidFold, KeyEquality, Operand, Output};
+pub use fold::{
+    Aggregate, ColumnIndex, Dimension, DimensionId, Domain, Finish, Fold, InvalidFold, KeyEquality,
+    Monoid, Operand, Output, RowValue,
+};

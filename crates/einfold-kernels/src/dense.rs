@@ -246,12 +246,13 @@ pub(crate) fn fold(
         }
     }
     // Otherwise b is complete, so group (x, y) exists when a has a row at x,
-    // and is NULL when all of that row's factors are.
-    let (mut reached, mut valued) = (vec![false; nx], vec![false; nx]);
-    for r in 0..a.num_rows() {
-        let x = ax.of(r);
-        reached[x] = true;
-        valued[x] |= av.is_valid(r);
+    // and is NULL when all of that row's factors are: whether it has a value
+    // is `valued[x]`, which existence needs only without the 0.0 default.
+    let mut valued = vec![false; if zero_default { 0 } else { nx }];
+    if !zero_default {
+        for r in 0..a.num_rows() {
+            valued[ax.of(r)] |= av.is_valid(r);
+        }
     }
 
     let out = accumulate(&at, av, &bm, (nx, nz, ny), threads);
@@ -272,10 +273,10 @@ pub(crate) fn fold(
             // A cell's value as the left join gives it: its sum where the
             // group exists with a value, else the default.
             let value = |c: usize| -> Option<f64> {
-                let x = c / ny;
-                match zero_default || (reached[x] && valued[x]) {
-                    true => Some(out[c]),
-                    false => spec.missing,
+                if zero_default || valued[c / ny] {
+                    Some(out[c])
+                } else {
+                    spec.missing
                 }
             };
             let cells = Cells {
@@ -290,6 +291,11 @@ pub(crate) fn fold(
             Ok(Some(batches))
         }
         (None, None) => {
+            // Without a domain, the groups are those some row of a reaches.
+            let mut reached = vec![false; nx];
+            for r in 0..a.num_rows() {
+                reached[ax.of(r)] = true;
+            }
             let groups: Vec<(usize, usize)> = (0..nx)
                 .filter(|&x| reached[x])
                 .flat_map(|x| (0..ny).map(move |y| (x, y)))
@@ -338,7 +344,7 @@ fn domain_batch(
     batch: &RecordBatch,
     spec: &Domain,
     cells: &Cells,
-    value: &dyn Fn(usize) -> Option<f64>,
+    value: &impl Fn(usize) -> Option<f64>,
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
     const NO_GROUP: usize = usize::MAX;
@@ -359,16 +365,22 @@ fn domain_batch(
             };
         }
     }
-    let values: Float64Array = cell
-        .iter()
-        .map(|&c| {
-            if c == NO_GROUP {
-                spec.missing
-            } else {
-                value(c)
-            }
-        })
-        .collect();
+    let at = |c: usize| {
+        if c == NO_GROUP {
+            spec.missing
+        } else {
+            value(c)
+        }
+    };
+    // With a default, no value is NULL, so the column needs no validity map.
+    let values = match spec.missing {
+        Some(m) => Float64Array::from(
+            cell.iter()
+                .map(|&c| at(c).unwrap_or(m))
+                .collect::<Vec<f64>>(),
+        ),
+        None => cell.iter().map(|&c| at(c)).collect(),
+    };
     let mut columns: Vec<ArrayRef> = spec
         .carry
         .iter()

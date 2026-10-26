@@ -39,10 +39,10 @@ use datafusion::logical_expr::expr::Case;
 use datafusion::logical_expr::{lit, Expr, Join, JoinType, LogicalPlan, Projection};
 use einfold_ir::{ColumnIndex, Domain, DomainKey, Fold, KeyEquality, Output};
 
-use crate::node::FoldNode;
-use crate::rule::{
+use crate::detect_folds::{
     found_fold, host_plan, movable, resolve, restore, same_schema, sum_argument, PREFIX,
 };
+use crate::fold_node::FoldNode;
 
 /// `plan` without the aliases and column-only projections over it, with, for
 /// each of `plan`'s columns, its column in what is left. A table scan's

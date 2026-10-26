@@ -48,8 +48,8 @@ use einfold_ir::{
     KeyEquality, Operand, Output, RowValue,
 };
 
+use crate::fold_node::FoldNode;
 use crate::join_back::joined_back;
-use crate::node::FoldNode;
 
 /// The prefix of the names this rule gives the columns of the nodes it makes,
 /// chosen not to clash with a domain's own columns.

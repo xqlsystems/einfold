@@ -262,3 +262,35 @@ async fn fails_cleanly_when_the_memory_pool_is_too_small() {
         .unwrap_err();
     assert!(err.to_string().contains("Resources exhausted"), "{err}");
 }
+
+#[tokio::test]
+async fn holds_only_its_output_in_the_memory_pool() {
+    use datafusion::physical_plan::ExecutionPlan;
+    use futures::StreamExt;
+    fn find(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+        match plan.name() == "EinFoldExec" {
+            true => Some(Arc::clone(plan)),
+            false => plan.children().into_iter().find_map(find),
+        }
+    }
+    let ctx = context(4, 64, None);
+    tables(&ctx, 2);
+    let plan = fold_plan(&ctx).await;
+    let physical = ctx.state().create_physical_plan(&plan).await.unwrap();
+    let exec = find(&physical).unwrap();
+    let mut stream = exec.execute(0, ctx.task_ctx()).unwrap();
+    // While its output is read, the operator counts that output in the pool,
+    // and not the inputs it has folded.
+    // Arrow counts a sliced batch at its whole buffers' size, as the pool
+    // does, so the output's batches can be summed to compare.
+    let first = stream.next().await.unwrap().unwrap();
+    let reserved = ctx.runtime_env().memory_pool.reserved();
+    let mut output = first.get_array_memory_size();
+    while let Some(batch) = stream.next().await {
+        output += batch.unwrap().get_array_memory_size();
+    }
+    assert!(
+        reserved <= output,
+        "{reserved} bytes reserved for an output of {output}"
+    );
+}

@@ -220,6 +220,11 @@ impl ExecutionPlan for EinFoldExec {
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))??;
             timer.done();
+            // The kernel has dropped its inputs: release them, so that the
+            // operators downstream have the memory they would have had
+            // without einfold. The output, which may share the domain's
+            // columns, is counted below.
+            reservation.free();
             match algorithm {
                 Algorithm::Dense => dense_folds.add(1),
                 Algorithm::Hash => hash_folds.add(1),

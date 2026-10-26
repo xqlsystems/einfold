@@ -33,12 +33,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Float64Array, RecordBatch, UInt32Array};
-use arrow::compute::take;
+use arrow::compute;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use einfold_ir::{DimensionId, Fold, KeyEquality};
 
-use crate::keys::{host_keys, Keys};
+use crate::keys::{self, Keys};
 use crate::{Host, Result};
 
 /// One operand's rows, as the hash algorithm reads them.
@@ -73,8 +73,10 @@ impl<'a> Side<'a> {
             let c = op.column_of(d).expect("dimension held by this operand");
             Arc::clone(batch.column(c.0))
         };
-        let shared_cols = host_keys(&shared.iter().map(|&d| col(d)).collect::<Vec<_>>(), host);
-        let output_cols = host_keys(&outputs.iter().map(|&d| col(d)).collect::<Vec<_>>(), host);
+        let shared_cols =
+            keys::host_keys(&shared.iter().map(|&d| col(d)).collect::<Vec<_>>(), host);
+        let output_cols =
+            keys::host_keys(&outputs.iter().map(|&d| col(d)).collect::<Vec<_>>(), host);
         let factors = op
             .factor
             .and_then(|c| batch.column(c.0).as_any().downcast_ref::<Float64Array>())
@@ -200,10 +202,10 @@ pub(crate) fn fold(
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(fold.outputs().len() + 1);
         for i in 0..fold.outputs().len() {
             let column = match a_out.iter().position(|&o| o == i) {
-                Some(j) => take(&a.output_cols[j], &a_rows, None)?,
+                Some(j) => compute::take(&a.output_cols[j], &a_rows, None)?,
                 None => {
                     let j = b_out.iter().position(|&o| o == i).expect("from a or b");
-                    take(&b.output_cols[j], &b_rows, None)?
+                    compute::take(&b.output_cols[j], &b_rows, None)?
                 }
             };
             columns.push(column);
@@ -231,8 +233,8 @@ pub(crate) fn fold(
                     .collect()
             };
             let (da, db) = (
-                Keys::new(&host_keys(&key_cols(&a_out), host))?,
-                Keys::new(&host_keys(&key_cols(&b_out), host))?,
+                Keys::new(&keys::host_keys(&key_cols(&a_out), host))?,
+                Keys::new(&keys::host_keys(&key_cols(&b_out), host))?,
             );
             // A NULL key compared with `=` matches no group.
             let strict: Vec<_> = (0..fold.outputs().len())

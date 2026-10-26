@@ -33,14 +33,15 @@
 //! [`EinFoldExec`](crate::EinFoldExec) runs when its dense algorithm doesn't
 //! apply, so a detected fold is never slower than the host's own plan.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, DFSchema, DFSchemaRef, NullEquality, Result};
+use datafusion::common::tree_node::Transformed;
+use datafusion::common::{Column, DFSchema, NullEquality, Result};
 use datafusion::functions_aggregate::sum::Sum;
 use datafusion::logical_expr::{
-    Aggregate, BinaryExpr, Expr, ExprSchemable, Join, JoinType, LogicalPlan, Operator, Projection,
+    Aggregate, BinaryExpr, Expr, Join, JoinType, LogicalPlan, Operator, Projection,
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use einfold_ir::{
@@ -49,7 +50,7 @@ use einfold_ir::{
 };
 
 use crate::fold_node::FoldNode;
-use crate::join_back::joined_back;
+use crate::join_back;
 
 /// The prefix of the names this rule gives the columns of the nodes it makes,
 /// chosen not to clash with a domain's own columns.
@@ -61,23 +62,32 @@ pub(crate) const PREFIX: &str = "__einfold_";
 /// sets up. It can also be added after DataFusion's own optimizer rules, but
 /// then optimized plans contain `Fold` nodes, which a Substrait producer, such
 /// as ddx's, can't encode.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct DetectFolds {
-    fallback: bool,
+    fallback: Fallback,
 }
 
-impl Default for DetectFolds {
-    fn default() -> Self {
-        DetectFolds { fallback: true }
-    }
+/// What the nodes [`DetectFolds`] makes run where the dense algorithm
+/// doesn't apply.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Fallback {
+    /// The plan each node replaced, so a detected fold is never slower than
+    /// the host's own plan.
+    #[default]
+    HostPlan,
+    /// EinFold's hash algorithm.
+    Hash,
 }
 
 impl DetectFolds {
     /// The rule, but with nodes that run EinFold's hash algorithm where the
     /// dense one doesn't apply, rather than the host's plan. Slower, and for
     /// tests: it makes every fold the rule describes run through einfold.
+    #[must_use]
     pub fn without_fallback() -> Self {
-        DetectFolds { fallback: false }
+        DetectFolds {
+            fallback: Fallback::Hash,
+        }
     }
 }
 
@@ -100,7 +110,7 @@ impl OptimizerRule for DetectFolds {
             LogicalPlan::Projection(p) => match from_domain(p, self.fallback)? {
                 // A fold joined back to its domain needs the host's plan
                 // for when the domain's keys aren't unique.
-                None if self.fallback => joined_back(p)?,
+                None if self.fallback == Fallback::HostPlan => join_back::joined_back(p)?,
                 found => found,
             },
             _ => None,
@@ -117,6 +127,7 @@ impl OptimizerRule for DetectFolds {
 /// `e` with each column a projection in `projections` (outermost first)
 /// produced replaced by the expression that produced it, aliases removed.
 pub(crate) fn resolve(e: &Expr, projections: &[&Projection]) -> Result<Expr> {
+    use datafusion::common::tree_node::TreeNode;
     let mut e = e.clone().unalias();
     for p in projections {
         e = e
@@ -134,7 +145,7 @@ pub(crate) fn resolve(e: &Expr, projections: &[&Projection]) -> Result<Expr> {
 
 /// Which side of a join every column of `e` reads: `Some(0)` for the left,
 /// `Some(1)` for the right, `None` for both, neither, or a column of neither.
-fn side(e: &Expr, inputs: [&DFSchemaRef; 2]) -> Option<usize> {
+fn side(e: &Expr, inputs: [&DFSchema; 2]) -> Option<usize> {
     let cols = e.column_refs();
     if cols.is_empty() {
         return None;
@@ -158,6 +169,8 @@ pub const MOVABLE_FUNCTIONS: &[&str] = &["abs", "exp", "ln", "tanh", "signum"];
 /// a volatile one, such as `random()`, would also be drawn once per input
 /// row rather than once per joined pair.
 pub(crate) fn movable(e: &Expr, schema: &DFSchema) -> bool {
+    use datafusion::common::tree_node::TreeNode;
+    use datafusion::logical_expr::ExprSchemable;
     let ty = |e: &Expr| e.get_type(schema).ok();
     let arithmetic = |e: &Expr| ty(e).is_some_and(|t| t.is_integer() || t.is_floating());
     let fails = |e: &Expr| {
@@ -242,13 +255,14 @@ pub(crate) fn sum_argument(agg: &Aggregate) -> Option<Expr> {
     let plain = !p.distinct && p.filter.is_none() && p.order_by.is_empty() && p.args.len() == 1;
     // By type, not by name, as DataFusion asks of rules: a session may
     // register another function under the name `sum`.
-    let function: &dyn std::any::Any = f.func.inner().as_ref();
+    let function: &dyn Any = f.func.inner().as_ref();
     (function.is::<Sum>() && plain).then(|| p.args[0].clone())
 }
 
 /// `agg` as a fold, if it is one: a [`FoldNode`] under a projection giving it
 /// `agg`'s schema.
-fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
+fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
+    use datafusion::logical_expr::ExprSchemable;
     let Some(arg) = sum_argument(agg) else {
         return Ok(None);
     };
@@ -272,7 +286,7 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
     if join.join_type != JoinType::Inner || join.filter.is_some() || join.on.is_empty() {
         return Ok(None);
     }
-    let inputs = [join.left.schema(), join.right.schema()];
+    let inputs = [join.left.schema().as_ref(), join.right.schema().as_ref()];
     let Expr::BinaryExpr(BinaryExpr {
         left,
         op: Operator::Multiply,
@@ -287,7 +301,7 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
             return Ok(None);
         };
         if factors[s].is_some()
-            || f.get_type(inputs[s].as_ref())? != DataType::Float64
+            || f.get_type(inputs[s])? != DataType::Float64
             || !movable(&f, inputs[s])
         {
             return Ok(None);
@@ -391,8 +405,8 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
         return Ok(None);
     };
     let node = match fallback {
-        true => node.with_fallback(original),
-        false => node.marked_found(),
+        Fallback::HostPlan => node.with_fallback(original),
+        Fallback::Hash => node.marked_found(),
     }
     .into_plan();
     // Give the node the aggregate's schema: its names, qualifiers, types
@@ -406,6 +420,7 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
 /// must not run einfold again: an operator that falls back to a plan
 /// holding another of its kind would read the same operands once more.
 pub(crate) fn host_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
+    use datafusion::common::tree_node::TreeNode;
     let swapped = plan.transform_up(|plan| {
         let LogicalPlan::Extension(e) = &plan else {
             return Ok(Transformed::no(plan));
@@ -432,7 +447,7 @@ pub(crate) fn host_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
 pub(crate) fn restore(
     node: LogicalPlan,
     names: &[String],
-    schema: &DFSchemaRef,
+    schema: &DFSchema,
 ) -> Result<Option<LogicalPlan>> {
     let exprs: Vec<Expr> = names
         .iter()
@@ -447,7 +462,7 @@ pub(crate) fn restore(
 
 /// Whether two schemas have the same columns, qualifiers, types and
 /// nullability, which an optimizer rule must keep.
-pub(crate) fn same_schema(a: &DFSchemaRef, b: &DFSchemaRef) -> bool {
+pub(crate) fn same_schema(a: &DFSchema, b: &DFSchema) -> bool {
     a.fields().len() == b.fields().len()
         && a.iter().zip(b.iter()).all(|((qa, fa), (qb, fb))| {
             qa == qb
@@ -489,7 +504,7 @@ pub(crate) fn found_fold(plan: &LogicalPlan) -> Option<(&FoldNode, Vec<usize>)> 
 
 /// `p` over a left join from a relation onto a fold, with the relation as the
 /// fold's domain, if that is what `p` is.
-fn from_domain(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
+fn from_domain(p: &Projection, fallback: Fallback) -> Result<Option<LogicalPlan>> {
     let LogicalPlan::Join(join) = p.input.as_ref() else {
         return Ok(None);
     };
@@ -605,8 +620,8 @@ fn from_domain(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
         return Ok(None);
     };
     let new = match fallback {
-        true => new.with_fallback(original.clone()),
-        false => new.marked_found(),
+        Fallback::HostPlan => new.with_fallback(original.clone()),
+        Fallback::Hash => new.marked_found(),
     }
     .into_plan();
     // Rename the node's columns to the join's, so `p` reads them as before.

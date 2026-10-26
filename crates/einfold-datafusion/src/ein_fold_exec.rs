@@ -24,7 +24,7 @@ use datafusion::physical_plan::{
 };
 use einfold_ir::{ColumnIndex, Fold};
 use einfold_kernels::{Algorithm, DomainRows, Folded, Options, Relation};
-use futures::{future, stream, StreamExt, TryStreamExt};
+use futures::{future, stream};
 
 use crate::fold_node;
 use crate::HOST;
@@ -70,6 +70,7 @@ pub struct EinFoldExec {
 impl EinFoldExec {
     /// The operator computing `fold` over `inputs` (operands, then domain),
     /// producing `schema`, which [`FoldNode`](crate::FoldNode) derives.
+    #[must_use]
     pub fn new(fold: Fold, inputs: Vec<Arc<dyn ExecutionPlan>>, schema: SchemaRef) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema),
@@ -109,6 +110,7 @@ impl EinFoldExec {
     /// domain's Boolean column `column` is true, as `CASE WHEN <column> THEN
     /// NULL ELSE <value> END` does. The host's plan, if it runs, computes its
     /// own values.
+    #[must_use]
     pub fn with_null_when(mut self, column: ColumnIndex) -> Self {
         self.null_when = Some(column);
         self
@@ -116,6 +118,7 @@ impl EinFoldExec {
 
     /// The host's plan this operator runs where the dense algorithm doesn't
     /// apply, if it has one.
+    #[must_use]
     pub fn fallback(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         self.fallback.as_ref()
     }
@@ -130,6 +133,7 @@ impl EinFoldExec {
     }
 
     /// The fold this operator computes.
+    #[must_use]
     pub fn fold(&self) -> &Fold {
         &self.fold
     }
@@ -227,6 +231,7 @@ impl ExecutionPlan for EinFoldExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        use futures::{StreamExt, TryStreamExt};
         if partition != 0 {
             return internal_err!("EinFoldExec has one partition, asked for {partition}");
         }

@@ -46,7 +46,9 @@
 //! of their own, [`DimensionId`] and [`ColumnIndex`], so that one can't be
 //! passed for the other.
 
+use std::cmp::Ordering;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 /// A dimension of a fold: an index into [`Fold::dimensions`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -184,6 +186,7 @@ pub struct Aggregate {
 
 impl Aggregate {
     /// SQL `SUM`.
+    #[must_use]
     pub fn sum() -> Self {
         Aggregate {
             parts: vec![Monoid::Sum],
@@ -192,17 +195,20 @@ impl Aggregate {
     }
 
     /// The monoids folded in one pass.
+    #[must_use]
     pub fn parts(&self) -> &[Monoid] {
         &self.parts
     }
 
     /// The final function of the parts.
+    #[must_use]
     pub fn finish(&self) -> Finish {
         self.finish
     }
 
     /// Whether this is plain `SUM`, which with a [`RowValue::Product`] makes
     /// the fold an einsum: the sum-product semiring.
+    #[must_use]
     pub fn is_sum(&self) -> bool {
         self.parts == [Monoid::Sum] && self.finish == Finish::Part(0)
     }
@@ -254,20 +260,20 @@ impl PartialEq for Domain {
 
 impl Eq for Domain {}
 
-impl std::hash::Hash for Domain {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::hash::Hash::hash(&self.identity(), state)
+impl Hash for Domain {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.identity().hash(state)
     }
 }
 
 impl PartialOrd for Domain {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for Domain {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         self.identity().cmp(&other.identity())
     }
 }
@@ -380,11 +386,17 @@ impl Fold {
     }
 
     /// The dimensions.
+    #[must_use]
     pub fn dimensions(&self) -> &[Dimension] {
         &self.dimensions
     }
 
     /// Dimension `d`.
+    ///
+    /// # Panics
+    ///
+    /// If `d` isn't one of this fold's dimensions.
+    #[must_use]
     pub fn dimension(&self, d: DimensionId) -> Dimension {
         self.dimensions[d.0]
     }
@@ -395,6 +407,7 @@ impl Fold {
     }
 
     /// The operands.
+    #[must_use]
     pub fn operands(&self) -> &[Operand] {
         &self.operands
     }
@@ -402,38 +415,45 @@ impl Fold {
     /// The outputs, in order: without a domain, the result's key columns;
     /// with one, the keys matched with the domain's columns, whose carried
     /// columns are the result's (see [`Domain`]).
+    #[must_use]
     pub fn outputs(&self) -> &[Output] {
         &self.outputs
     }
 
     /// What each joined row contributes.
+    #[must_use]
     pub fn row(&self) -> RowValue {
         self.row
     }
 
     /// How joined rows combine into each group's value.
+    #[must_use]
     pub fn aggregate(&self) -> &Aggregate {
         &self.aggregate
     }
 
     /// The domain, if the output is left-joined from one (see [`Domain`]).
+    #[must_use]
     pub fn domain(&self) -> Option<&Domain> {
         self.domain.as_ref()
     }
 
     /// The position in [`Fold::outputs`] of dimension `dim`, if it is an
     /// output.
+    #[must_use]
     pub fn output_of(&self, dim: DimensionId) -> Option<usize> {
         self.outputs.iter().position(|o| o.dimension == dim)
     }
 
     /// Whether dimension `dim` is aggregated away: not an output.
+    #[must_use]
     pub fn is_aggregated(&self, dim: DimensionId) -> bool {
         self.output_of(dim).is_none()
     }
 
     /// Whether this fold is an einsum: a `SUM` of products, the sum-product
     /// semiring. Derived from the row value and the aggregate, never declared.
+    #[must_use]
     pub fn is_einsum(&self) -> bool {
         self.row == RowValue::Product && self.aggregate.is_sum()
     }

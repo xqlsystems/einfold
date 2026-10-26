@@ -8,12 +8,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::tree_node::TreeNode;
 use datafusion::common::Result;
 use datafusion::execution::context::QueryPlanner;
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
-use datafusion::optimizer::{OptimizerContext, OptimizerRule};
+use datafusion::optimizer::OptimizerContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use einfold_kernels::DomainRows;
@@ -76,6 +75,7 @@ pub struct EinFoldQueryPlanner {
 
 impl EinFoldQueryPlanner {
     /// The planner, applying `rule` to each plan before planning it.
+    #[must_use]
     pub fn detecting(rule: DetectFolds) -> Self {
         EinFoldQueryPlanner { detect: Some(rule) }
     }
@@ -88,6 +88,8 @@ impl QueryPlanner for EinFoldQueryPlanner {
         plan: &LogicalPlan,
         session: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::common::tree_node::TreeNode;
+        use datafusion::optimizer::OptimizerRule;
         let detected;
         let plan = match &self.detect {
             None => plan,

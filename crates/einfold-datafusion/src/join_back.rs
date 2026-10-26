@@ -33,15 +33,13 @@
 
 use std::sync::Arc;
 
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::Transformed;
 use datafusion::common::{Column, NullEquality, Result};
 use datafusion::logical_expr::expr::Case;
-use datafusion::logical_expr::{lit, Expr, Join, JoinType, LogicalPlan, Projection};
+use datafusion::logical_expr::{self, Expr, Join, JoinType, LogicalPlan, Projection};
 use einfold_ir::{ColumnIndex, Domain, DomainKey, Fold, KeyEquality, Output};
 
-use crate::detect_folds::{
-    found_fold, host_plan, movable, resolve, restore, same_schema, sum_argument, PREFIX,
-};
+use crate::detect_folds::{self, PREFIX};
 use crate::fold_node::FoldNode;
 
 /// `plan` without the aliases and column-only projections over it, with, for
@@ -124,7 +122,7 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
     let Some((LogicalPlan::Aggregate(agg), right_map)) = base(right) else {
         return Ok(None);
     };
-    let Some(arg) = sum_argument(agg) else {
+    let Some(arg) = detect_folds::sum_argument(agg) else {
         return Ok(None);
     };
     // Down through projections to the inner join of d2 and the fold.
@@ -143,8 +141,10 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
     if inner.join_type != JoinType::Inner || inner.filter.is_some() {
         return Ok(None);
     }
-    let (d2, f, (node, f_columns), flip) = match (found_fold(&inner.left), found_fold(&inner.right))
-    {
+    let (d2, f, (node, f_columns), flip) = match (
+        detect_folds::found_fold(&inner.left),
+        detect_folds::found_fold(&inner.right),
+    ) {
         (None, Some(found)) => (&inner.left, &inner.right, found, false),
         (Some(found), None) => (&inner.right, &inner.left, found, true),
         _ => return Ok(None),
@@ -182,7 +182,7 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
     // The second GROUP BY is by exactly those columns, each once.
     let mut grouped = Vec::new();
     for g in &agg.group_expr {
-        let Expr::Column(c) = resolve(g, &projections)? else {
+        let Expr::Column(c) = detect_folds::resolve(g, &projections)? else {
             return Ok(None);
         };
         let Ok(i) = d2.schema().index_of_column(&c) else {
@@ -229,7 +229,7 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
         return Ok(None);
     };
     let value = Column::from(f.schema().qualified_field(v));
-    let e = resolve(&arg, &projections)?;
+    let e = detect_folds::resolve(&arg, &projections)?;
     if !null_with_value(&e, &value, d2) {
         return Ok(None);
     }
@@ -275,6 +275,7 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
         let j = d_column(d2_map[i])?;
         Some(Expr::Column(Column::from(d.schema().qualified_field(j))))
     };
+    use datafusion::common::tree_node::TreeNode;
     let null_when = match &e {
         Expr::Case(Case { when_then_expr, .. }) => {
             let mut unmapped = false;
@@ -301,7 +302,7 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
             let Some(mask) = tests.into_iter().reduce(Expr::or) else {
                 return Ok(None);
             };
-            if unmapped || !movable(&mask, d.schema()) {
+            if unmapped || !detect_folds::movable(&mask, d.schema()) {
                 return Ok(None);
             }
             Some(mask)
@@ -326,7 +327,7 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
     kept.push(Expr::Column(sum.clone()));
     // The host's own plan, with the inner fold swapped back for the plan it
     // replaced, so that falling back doesn't run einfold again.
-    let input = host_plan(p.input.as_ref().clone())?;
+    let input = detect_folds::host_plan(p.input.as_ref().clone())?;
     let original = LogicalPlan::Projection(Projection::try_new(kept, Arc::new(input))?);
     let names: Vec<String> = (d.schema().fields().iter())
         .map(|f| f.name().clone())
@@ -362,7 +363,7 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
     // Over it: d's columns, and the sum as SUM of one value gives it. The
     // node has applied `e`'s tests where it computed the fold, and the host's
     // plan has where it ran.
-    let Some(columns) = restore(new, &names[..width], d.schema())? else {
+    let Some(columns) = detect_folds::restore(new, &names[..width], d.schema())? else {
         return Ok(None);
     };
     let LogicalPlan::Projection(columns) = columns else {
@@ -370,14 +371,15 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
     };
     let mut exprs = columns.expr.clone();
     let value = Expr::Column(Column::new_unqualified(&names[width]));
-    exprs.push((lit(0.0) + value).alias_qualified(sum.relation.clone(), &sum.name));
+    exprs.push((logical_expr::lit(0.0) + value).alias_qualified(sum.relation.clone(), &sum.name));
     let projection = Projection::try_new(exprs, Arc::clone(&columns.input))?;
-    if !same_schema(&projection.schema, original.schema()) {
+    if !detect_folds::same_schema(&projection.schema, original.schema()) {
         return Ok(None);
     }
     let projection = Projection::try_new(
         p.expr.clone(),
         Arc::new(LogicalPlan::Projection(projection)),
     )?;
-    Ok(same_schema(&projection.schema, &p.schema).then_some(LogicalPlan::Projection(projection)))
+    Ok(detect_folds::same_schema(&projection.schema, &p.schema)
+        .then_some(LogicalPlan::Projection(projection)))
 }

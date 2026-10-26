@@ -20,7 +20,7 @@ use std::time::Instant;
 use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::{col, lit, when, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{self, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
 use einfold_datafusion::{EinFoldQueryPlanner, FoldNode};
 use einfold_ir::{
@@ -91,9 +91,17 @@ fn gradient(
     .map_err(|e| DataFusionError::Plan(e.to_string()))?;
     let names = [cols[0], cols[2], "v", "g"].map(String::from).to_vec();
     let node = FoldNode::try_new(fold, vec![l, r], Some(domain), names)?;
-    let value = when(col("v").is_null(), lit(ScalarValue::Float64(None))).otherwise(col("g"))?;
+    let value = logical_expr::when(
+        logical_expr::col("v").is_null(),
+        logical_expr::lit(ScalarValue::Float64(None)),
+    )
+    .otherwise(logical_expr::col("g"))?;
     LogicalPlanBuilder::from(node.into_plan())
-        .project(vec![col(cols[0]), col(cols[2]), value.alias("v")])?
+        .project(vec![
+            logical_expr::col(cols[0]),
+            logical_expr::col(cols[2]),
+            value.alias("v"),
+        ])?
         .build()
 }
 

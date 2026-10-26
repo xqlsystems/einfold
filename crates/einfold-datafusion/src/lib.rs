@@ -32,6 +32,7 @@ pub use planner::{EinFoldPlanner, EinFoldQueryPlanner};
 
 /// `builder` with einfold installed: an [`EinFoldQueryPlanner`] that applies
 /// [`DetectFolds`] to each optimized plan, then plans the nodes it makes.
+#[must_use]
 pub fn install(builder: SessionStateBuilder) -> SessionStateBuilder {
     builder.with_query_planner(Arc::new(EinFoldQueryPlanner::detecting(
         DetectFolds::default(),

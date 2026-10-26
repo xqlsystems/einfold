@@ -40,16 +40,18 @@
 //! Reproduce a failure with `EINFOLD_SEED=<seed printed>`; search longer with
 //! `EINFOLD_CASES=<n>`.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
     Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::arrow::util::display::array_value_to_string;
+use datafusion::arrow::util::display;
 use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use einfold_datafusion::{DetectFolds, EinFoldExec, EinFoldQueryPlanner, FoldNode};
 
@@ -363,7 +365,7 @@ fn einfold(threads: usize, fallback: bool) -> SessionContext {
 /// domain.
 fn exec_folds(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> (usize, usize) {
     let (mut all, mut domains) = (0, 0);
-    let any: &dyn std::any::Any = plan.as_ref();
+    let any: &dyn Any = plan.as_ref();
     if let Some(e) = any.downcast_ref::<EinFoldExec>() {
         all += 1;
         domains += usize::from(e.fold().domain().is_some());
@@ -407,7 +409,7 @@ fn rows(batches: &[RecordBatch]) -> Vec<String> {
                     // them apart.
                     Some(f) if f.is_valid(r) && f.value(r).is_nan() => "NaN".into(),
                     Some(f) if f.is_valid(r) => format!("{:x}", f.value(r).to_bits()),
-                    _ => array_value_to_string(c, r).unwrap(),
+                    _ => display::array_value_to_string(c, r).unwrap(),
                 })
                 .collect();
             out.push(row.join("|"));
@@ -514,11 +516,9 @@ async fn sweep(default_seed: u64, joined_back: bool) -> (usize, usize, usize, (u
         let got = datafusion::physical_plan::collect(Arc::clone(&physical), ours.task_ctx())
             .await
             .unwrap();
-        let shown = datafusion::physical_plan::display::DisplayableExecutionPlan::with_metrics(
-            physical.as_ref(),
-        )
-        .indent(true)
-        .to_string();
+        let shown = DisplayableExecutionPlan::with_metrics(physical.as_ref())
+            .indent(true)
+            .to_string();
         dense += usize::from(shown.contains("dense_folds=1"));
         host_plans += usize::from(shown.contains("host_plans=1"));
         if expect == Expect::JoinedBack && fallback {

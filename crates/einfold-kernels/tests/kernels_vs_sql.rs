@@ -38,7 +38,7 @@
 //! Reproduce a failure with `EINFOLD_SEED=<seed printed>`; search longer with
 //! `EINFOLD_CASES=<n>` (and a starting `EINFOLD_SEED`).
 
-use std::fmt::Write as _;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -326,6 +326,7 @@ const LARGE: [[usize; 3]; 2] = [[300, 7, 16], [3, 9000, 5]];
 /// case of one dimension per role, `x` in `a`, `z` in both and `y` in `b`,
 /// with those extents.
 fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
+    use std::fmt::Write as _;
     let dense = dense || large.is_some();
     let n = if large.is_some() { 3 } else { 1 + rng.below(4) };
     let types: Vec<KeyType> = (0..n)
@@ -560,6 +561,7 @@ fn register(ctx: &SessionContext, name: &str, t: &Table, rng: &mut Rng) {
 type Row = (String, Option<f64>);
 
 fn rows(batches: &[RecordBatch], keys: usize) -> Vec<Row> {
+    use std::fmt::Write as _;
     let mut out = Vec::new();
     for b in batches {
         let v = b
@@ -707,11 +709,11 @@ fn check_unique_domain(case: &Case, rng: &mut Rng, fail: impl Fn(String)) -> boo
         None,
     )
     .unwrap();
-    let groups: std::collections::HashSet<String> = match dense(&bare, None, DomainRows::Any) {
+    let groups: HashSet<String> = match dense(&bare, None, DomainRows::Any) {
         Some(out) => rows(&out, keys).into_iter().map(|(k, _)| k).collect(),
         None => return false,
     };
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let repeated = rows(&unchecked, keys)
         .into_iter()
         .any(|(k, _)| groups.contains(&k) && !seen.insert(k));

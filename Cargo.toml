@@ -42,3 +42,5 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 dbg_macro = "warn"
 todo = "warn"
+# Google's Rust style guide: mark functions whose result must not be ignored.
+must_use_candidate = "warn"

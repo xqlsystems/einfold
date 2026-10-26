@@ -47,9 +47,9 @@ use std::sync::Arc;
 use std::thread;
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch};
-use arrow::compute::cast;
+use arrow::compute;
 use arrow::datatypes::{DataType, SchemaRef};
-use einfold_ir::{ColumnIndex, DimensionId, Domain, Fold};
+use einfold_ir::{ColumnIndex, DimensionId, Domain, Fold, Operand};
 
 use crate::options::DomainRows;
 use crate::Result;
@@ -82,7 +82,7 @@ fn keys(column: &ArrayRef) -> Option<(Int64Array, usize)> {
         return None;
     }
     // The cast turns a key too large for i64 into NULL, which reads as 0.
-    let keys = cast(column, &DataType::Int64).ok()?;
+    let keys = compute::cast(column, &DataType::Int64).ok()?;
     let keys = keys.as_any().downcast_ref::<Int64Array>()?.clone();
     // One pass for both bounds, which the compiler vectorizes.
     let (lo, hi) = (keys.values().iter()).fold((0, -1), |(lo, hi), &k| (k.min(lo), k.max(hi)));
@@ -183,7 +183,7 @@ pub(crate) fn fold(
     // Each batch's key columns as non-negative i64, cast once; and each
     // dimension's extent, its largest key in either operand, plus one.
     let mut extent = vec![0usize; fold.dimensions().len()];
-    let mut cast_keys = |op: &einfold_ir::Operand, batches: &[RecordBatch]| {
+    let mut cast_keys = |op: &Operand, batches: &[RecordBatch]| {
         (batches.iter())
             .map(|batch| {
                 (op.keys.iter())
@@ -217,7 +217,7 @@ pub(crate) fn fold(
     {
         return Ok(None);
     }
-    let factors = |op: &einfold_ir::Operand, batch: &'_ RecordBatch| {
+    let factors = |op: &Operand, batch: &'_ RecordBatch| {
         op.factor
             .and_then(|c| batch.column(c.0).as_any().downcast_ref::<Float64Array>())
             .cloned()
@@ -383,7 +383,7 @@ pub(crate) fn fold(
                 }
                 let key = Int64Array::from(key);
                 let ty = schema.field(columns.len()).data_type();
-                columns.push(cast(&(Arc::new(key) as ArrayRef), ty)?);
+                columns.push(compute::cast(&(Arc::new(key) as ArrayRef), ty)?);
             }
             let result = if rows.iter().all(|&x| valued[x]) {
                 // No NULLs: the output's rows as they are, copied only when
@@ -429,7 +429,7 @@ fn locate(batch: &RecordBatch, cells: &Cells) -> Result<Vec<usize>> {
     let mut cell = vec![0usize; batch.num_rows()];
     for ((&d, &stride), &ColumnIndex(col)) in cells.dims.iter().zip(cells.strides).zip(cells.keys) {
         // Out-of-range unsigned keys become NULL here, so match no group.
-        let k = cast(batch.column(col), &DataType::Int64)?;
+        let k = compute::cast(batch.column(col), &DataType::Int64)?;
         let k = k
             .as_any()
             .downcast_ref::<Int64Array>()

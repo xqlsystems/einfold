@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "einfold-kernels"
+description = "EinFold's algorithms for folds over joins, on Arrow arrays, for any engine that speaks Arrow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Only Arrow, at the version DataFusion uses, so engines pass their batches
+# without a copy. No query engine.
+arrow = { workspace = true }
+einfold-ir = { workspace = true }
+
+[dev-dependencies]
+# The property test checks the kernels against SQL that DataFusion runs.
+datafusion = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

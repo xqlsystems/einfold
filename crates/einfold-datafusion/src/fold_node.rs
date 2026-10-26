@@ -16,7 +16,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::common::{plan_err, DFSchema, DFSchemaRef, Result};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan, UserDefinedLogicalNodeCore};
-use einfold_ir::{ColumnIndex, DimensionId, Fold};
+use einfold_ir::{ColumnIndex, Comparison, DimensionId, Fold};
 use einfold_kernels::DomainRows;
 
 /// A fold over a join in a DataFusion logical plan. Its inputs are the fold's
@@ -233,7 +233,7 @@ impl UserDefinedLogicalNodeCore for FoldNode {
 /// The fold in einsum notation for `EXPLAIN`: each operand's dimensions,
 /// then the outputs, such as `a,b * b,c -> a,c` for a matrix product, with
 /// `+ domain` when there is one (`+ unique domain` when the node requires
-/// its keys to be unique). Dimensions are lettered by number, as the
+/// its keys to be unique), and its conditions after `where`. Dimensions are lettered by number, as the
 /// fold names none; past `z`, they are shown as `#26`, `#27`, ….
 pub(crate) fn describe(fold: &Fold, domain_rows: DomainRows) -> String {
     let name = |DimensionId(d): DimensionId| match u8::try_from(d) {
@@ -252,14 +252,30 @@ pub(crate) fn describe(fold: &Fold, domain_rows: DomainRows) -> String {
         })
         .collect();
     let outputs: Vec<String> = fold.outputs().iter().map(|o| name(o.dimension)).collect();
+    let conditions: Vec<String> = (fold.conditions().iter())
+        .map(|c| {
+            let op = match c.comparison {
+                Comparison::Less => "<",
+                Comparison::LessOrEqual => "<=",
+                Comparison::Greater => ">",
+                Comparison::GreaterOrEqual => ">=",
+                _ => "?",
+            };
+            format!(" {} {op} {}", name(c.left), name(c.right))
+        })
+        .collect();
     format!(
-        "{} -> {}{}",
+        "{} -> {}{}{}",
         operands.join(" * "),
         outputs.join(","),
         match (fold.domain(), domain_rows) {
             (None, _) => "",
             (Some(_), DomainRows::Any) => " + domain",
             (Some(_), DomainRows::UniqueKeys) => " + unique domain",
+        },
+        match conditions.is_empty() {
+            true => String::new(),
+            false => format!(" where{}", conditions.join(" and")),
         }
     )
 }

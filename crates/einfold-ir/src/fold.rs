@@ -40,7 +40,9 @@
 //!
 //! A fold may also have a **domain**: a relation that the output is
 //! left-joined from, so that the output has one row per domain row (see
-//! [`Domain`]).
+//! [`Domain`]), and **conditions**: comparisons between dimensions that a
+//! joined row must meet, such as causal attention's `q.t >= k.t` (see
+//! [`Condition`]).
 //!
 //! Indices into a fold's dimensions and into its inputs' columns have types
 //! of their own, [`DimensionId`] and [`ColumnIndex`], so that one can't be
@@ -129,6 +131,49 @@ impl DomainKey {
     pub fn new(column: ColumnIndex, equality: KeyEquality) -> Self {
         DomainKey { column, equality }
     }
+}
+
+/// How a [`Condition`] compares two keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum Comparison {
+    /// SQL `<`.
+    Less,
+    /// SQL `<=`.
+    LessOrEqual,
+    /// SQL `>`.
+    Greater,
+    /// SQL `>=`.
+    GreaterOrEqual,
+}
+
+impl Comparison {
+    /// Whether `left <op> right` holds.
+    #[must_use]
+    pub fn holds<T: PartialOrd>(self, left: T, right: T) -> bool {
+        match self {
+            Comparison::Less => left < right,
+            Comparison::LessOrEqual => left <= right,
+            Comparison::Greater => left > right,
+            Comparison::GreaterOrEqual => left >= right,
+        }
+    }
+}
+
+/// A comparison of two dimensions' keys that every joined row must meet, in
+/// SQL a condition of the join: `ON … AND <left's column> >= <right's
+/// column>`. It is a *mask* given by a predicate rather than by an operand's
+/// rows: the pairs of keys it allows join, and the others are absent, as if
+/// they had no row. A comparison with a NULL key isn't true, so a row with a
+/// NULL key in either dimension doesn't join.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Condition {
+    /// The dimension on the comparison's left.
+    pub left: DimensionId,
+    /// How the keys compare.
+    pub comparison: Comparison,
+    /// The dimension on its right.
+    pub right: DimensionId,
 }
 
 /// One key column of a fold's result.
@@ -290,11 +335,12 @@ pub struct Fold {
     row: RowValue,
     aggregate: Aggregate,
     domain: Option<Domain>,
+    conditions: Vec<Condition>,
 }
 
 /// Why a fold's description is inconsistent.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InvalidFold(String);
+pub struct InvalidFold(pub(crate) String);
 
 impl fmt::Display for InvalidFold {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -382,7 +428,29 @@ impl Fold {
             row,
             aggregate,
             domain,
+            conditions: Vec::new(),
         })
+    }
+
+    /// This fold, with `conditions` that every joined row must meet, if each
+    /// compares two different dimensions of the fold.
+    pub fn with_conditions(mut self, conditions: Vec<Condition>) -> Result<Self, InvalidFold> {
+        let n = self.dimensions.len();
+        for c in &conditions {
+            let (DimensionId(l), DimensionId(r)) = (c.left, c.right);
+            if l >= n || r >= n {
+                return Err(InvalidFold(format!(
+                    "a condition compares dimensions {l} and {r}, of {n}"
+                )));
+            }
+            if l == r {
+                return Err(InvalidFold(format!(
+                    "a condition compares dimension {l} with itself"
+                )));
+            }
+        }
+        self.conditions = conditions;
+        Ok(self)
     }
 
     /// The dimensions.
@@ -436,6 +504,12 @@ impl Fold {
     #[must_use]
     pub fn domain(&self) -> Option<&Domain> {
         self.domain.as_ref()
+    }
+
+    /// The conditions every joined row must meet (see [`Condition`]).
+    #[must_use]
+    pub fn conditions(&self) -> &[Condition] {
+        &self.conditions
     }
 
     /// The position in [`Fold::outputs`] of dimension `dim`, if it is an
@@ -552,5 +626,24 @@ mod tests {
         assert!(fold(1, vec![op(&[(0, 0)], None)], vec![], None).is_err());
         let mask_and_factor = vec![op(&[(0, 0)], None), op(&[(0, 0)], Some(1))];
         assert!(fold(1, mask_and_factor, vec![], None).is_ok());
+    }
+
+    #[test]
+    fn conditions_compare_two_dimensions_of_the_fold() {
+        let at = |l, r| Condition {
+            left: DimensionId(l),
+            comparison: Comparison::GreaterOrEqual,
+            right: DimensionId(r),
+        };
+        let f = || matmul(vec![out(0), out(2)], None).unwrap();
+        assert_eq!(
+            f().with_conditions(vec![at(0, 2)]).unwrap().conditions(),
+            [at(0, 2)]
+        );
+        assert!(f().with_conditions(vec![at(0, 0)]).is_err());
+        assert!(f().with_conditions(vec![at(0, 3)]).is_err());
+        assert!(Comparison::GreaterOrEqual.holds(2, 2));
+        assert!(!Comparison::Greater.holds(2, 2));
+        assert!(Comparison::Less.holds(1, 2) && Comparison::LessOrEqual.holds(2, 2));
     }
 }

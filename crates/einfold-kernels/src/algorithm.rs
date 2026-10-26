@@ -37,9 +37,10 @@ pub struct Folded {
     pub batches: Vec<RecordBatch>,
 }
 
-/// [`fold`] by the dense algorithm alone, or `None` when its conditions don't
-/// hold, for a caller that would rather run something else, such as the
-/// host's plan, than the discrimination algorithm.
+/// [`fold`] by the dense algorithm alone, or `None` when its requirements
+/// don't hold (as for a fold with [conditions](einfold_ir::Condition)), for a
+/// caller that would rather run something else, such as the host's plan,
+/// than the discrimination algorithm.
 pub fn fold_dense(
     fold: &Fold,
     a: Relation,
@@ -64,13 +65,14 @@ pub fn fold_dense(
 /// `fold` over operands `a` and `b`, and its domain if it has one, as
 /// batches of `schema` (which [`schema`](crate::schema) gives): one batch per
 /// domain batch, or one in all without a domain. The dense algorithm runs
-/// when its conditions hold, and the discrimination one otherwise.
+/// when its requirements hold, and the discrimination one otherwise.
 ///
 /// The result's bits depend only on the inputs' rows, not on how they were
 /// batched or ordered, nor on the number of threads.
 ///
 /// Fails if `options` asks for [`DomainRows::UniqueKeys`], which only
-/// [`fold_dense`] can check.
+/// [`fold_dense`] can check, or if the fold has conditions, which neither
+/// algorithm supports yet.
 pub fn fold(
     fold: &Fold,
     a: Relation,
@@ -81,6 +83,9 @@ pub fn fold(
 ) -> Result<Folded> {
     if options.domain_rows == DomainRows::UniqueKeys {
         return bad("only fold_dense checks that a domain's keys are unique".into());
+    }
+    if !fold.conditions().is_empty() {
+        return bad("the fold kernels don't support conditions".into());
     }
     let threads = options.threads.max(1);
     let domain = domain.map(|d| d.batches);

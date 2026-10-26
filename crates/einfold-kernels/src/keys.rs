@@ -38,22 +38,21 @@ impl Keys {
     }
 }
 
-/// Column `$c`, of float type `$t`, with `-0.0` replaced by `0.0`, or `$c`
-/// itself if it has none. `-0.0` is the one value whose bits are the sign
-/// bit alone.
-macro_rules! zero_signs {
-    ($c:expr, $t:ty) => {{
-        let values = $c.as_primitive::<$t>();
-        let negative_zero =
-            |v: <$t as ArrowPrimitiveType>::Native| v.to_bits() != 0 && v.to_bits() << 1 == 0;
-        if values.values().iter().any(|&v| negative_zero(v)) {
-            let zero = <$t as ArrowPrimitiveType>::Native::default();
-            let fixed = values.unary::<_, $t>(|v| if negative_zero(v) { zero } else { v });
-            Arc::new(fixed) as ArrayRef
-        } else {
-            Arc::clone($c)
-        }
-    }};
+/// `column`, of float type `T`, with `-0.0` replaced by `0.0`, or `column`
+/// itself if it has none. `negative_zero` says whether a value is `-0.0`:
+/// the one value whose bits are the sign bit alone.
+fn zero_signs<T: ArrowPrimitiveType>(
+    column: &ArrayRef,
+    negative_zero: impl Fn(T::Native) -> bool,
+) -> ArrayRef {
+    let values = column.as_primitive::<T>();
+    if values.values().iter().any(|&v| negative_zero(v)) {
+        let zero = T::Native::default();
+        let fixed = values.unary::<_, T>(|v| if negative_zero(v) { zero } else { v });
+        Arc::new(fixed)
+    } else {
+        Arc::clone(column)
+    }
 }
 
 /// `columns` as the host compares them: with [`FloatKeys::SignedZerosEqual`],
@@ -65,9 +64,11 @@ pub(crate) fn host_keys(columns: &[ArrayRef], host: Host) -> Vec<ArrayRef> {
         FloatKeys::SignedZerosEqual => columns
             .iter()
             .map(|c| match c.data_type() {
-                DataType::Float16 => zero_signs!(c, Float16Type),
-                DataType::Float32 => zero_signs!(c, Float32Type),
-                DataType::Float64 => zero_signs!(c, Float64Type),
+                DataType::Float16 => zero_signs::<Float16Type>(c, |v| v.to_bits() == 0x8000),
+                DataType::Float32 => zero_signs::<Float32Type>(c, |v| v.to_bits() == 0x8000_0000),
+                DataType::Float64 => {
+                    zero_signs::<Float64Type>(c, |v| v.to_bits() == 0x8000_0000_0000_0000)
+                }
                 _ => Arc::clone(c),
             })
             .collect(),

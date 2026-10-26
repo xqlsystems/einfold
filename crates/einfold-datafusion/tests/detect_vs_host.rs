@@ -421,7 +421,13 @@ fn rows(batches: &[RecordBatch]) -> Vec<String> {
 
 #[tokio::test]
 async fn einfold_changes_no_answer() {
-    let (cases, dense, host_plans, joined) = sweep(0xde7e_c7ed, false).await;
+    let Ran {
+        cases,
+        dense,
+        host_plans,
+        joined_dense,
+        joined_host,
+    } = sweep(0xde7e_c7ed, false).await;
     // Most spellings rule the dense path out (a group key that is a join key,
     // a summed key held by one side, keys that can't be positions), and the
     // kernels' own test covers it. Here both it and the host's plan must run.
@@ -432,15 +438,16 @@ async fn einfold_changes_no_answer() {
             some(host_plans),
             "the host's plan ran in only {host_plans} cases"
         );
-        assert!(joined.0 + joined.1 > 0, "no fold joined back ran");
+        assert!(joined_dense + joined_host > 0, "no fold joined back ran");
     }
 }
 
 #[tokio::test]
 async fn folds_joined_back_check_their_domain() {
-    let (cases, _, _, (dense, host)) = sweep(0x10_1ced, true).await;
-    if cases >= 100 {
-        let some = |n: usize| n * 10 >= cases;
+    let ran = sweep(0x10_1ced, true).await;
+    let (dense, host) = (ran.joined_dense, ran.joined_host);
+    if ran.cases >= 100 {
+        let some = |n: usize| n * 10 >= ran.cases;
         assert!(
             some(dense) && some(host),
             "folds joined back ran dense in {dense} cases and on the host in {host}"
@@ -448,12 +455,23 @@ async fn folds_joined_back_check_their_domain() {
     }
 }
 
+/// How many cases a sweep ran, and how many ran each path.
+struct Ran {
+    cases: usize,
+    /// Cases that ran the dense algorithm.
+    dense: usize,
+    /// Cases that ran the host's own plan in place of einfold's.
+    host_plans: usize,
+    /// Folds joined back to their domain that ran the dense algorithm.
+    joined_dense: usize,
+    /// Folds joined back to their domain that ran the host's plan.
+    joined_host: usize,
+}
+
 /// Runs the cases from `default_seed`, or as `EINFOLD_SEED` and
 /// `EINFOLD_CASES` say, panicking at the first that fails; with
-/// `joined_back`, only folds joined back to their domain. Returns how many
-/// cases ran, how many ran the dense path and the host's plan, and how many
-/// folds joined back ran each.
-async fn sweep(default_seed: u64, joined_back: bool) -> (usize, usize, usize, (usize, usize)) {
+/// `joined_back`, only folds joined back to their domain.
+async fn sweep(default_seed: u64, joined_back: bool) -> Ran {
     let seed: u64 = std::env::var("EINFOLD_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -537,12 +555,13 @@ async fn sweep(default_seed: u64, joined_back: bool) -> (usize, usize, usize, (u
     eprintln!(
         "folds joined back to their domain: the dense path ran in {joined_dense}, the host's plan in {joined_host}"
     );
-    (
-        cases as usize,
+    Ran {
+        cases: cases as usize,
         dense,
         host_plans,
-        (joined_dense, joined_host),
-    )
+        joined_dense,
+        joined_host,
+    }
 }
 
 /// Runs `setup`'s statements, then `sql` with and without einfold, and

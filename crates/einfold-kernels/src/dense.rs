@@ -165,7 +165,8 @@ pub(crate) fn fold(
     // The roles: X and Y in output order, Z in dimension order. Here a
     // dimension is its index, which indexes the extents too.
     let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
-    for d in fold.outputs().iter().map(|o| o.dimension) {
+    let output_dimensions = fold.outputs().iter().map(|o| o.dimension);
+    for d in output_dimensions {
         match (op_a.column_of(d), op_b.column_of(d)) {
             (Some(_), None) => xs.push(d.0),
             (None, Some(_)) => ys.push(d.0),
@@ -232,30 +233,30 @@ pub(crate) fn fold(
     // x positions it reaches; whether each has a non-NULL factor,
     // `valued[x]`, which existence needs only without the 0.0 default; and
     // whether every non-NULL factor is finite.
-    let mut am = vec![0.0; nx * nz];
+    let mut a_matrix = vec![0.0; nx * nz];
     let mut held = vec![ABSENT; nx * nz];
     let mut reached = vec![false; nx];
     let mut valued = vec![false; if zero_default { 0 } else { nx }];
     let mut finite = true;
     for (batch, keys) in a.iter().zip(&a_keys) {
-        let (ax, az) = (
+        let (a_x, a_z) = (
             Position::new(keys, &xs, &extent),
             Position::new(keys, &zs, &extent),
         );
-        let Some(av) = factors(op_a, batch) else {
+        let Some(a_factors) = factors(op_a, batch) else {
             return Ok(None);
         };
         for r in 0..batch.num_rows() {
-            let x = ax.of(r);
-            let p = x * nz + az.of(r);
-            let valid = av.is_valid(r);
+            let x = a_x.of(r);
+            let p = x * nz + a_z.of(r);
+            let valid = a_factors.is_valid(r);
             if std::mem::replace(&mut held[p], if valid { VALUED } else { NULL }) != ABSENT {
                 return Ok(None);
             }
             reached[x] = true;
             if valid {
-                am[p] = av.value(r);
-                finite &= am[p].is_finite();
+                a_matrix[p] = a_factors.value(r);
+                finite &= a_matrix[p].is_finite();
             }
             if !zero_default {
                 valued[x] |= valid;
@@ -263,25 +264,25 @@ pub(crate) fn fold(
         }
     }
     // b as a dense matrix [z][y], with holes (missing or NULL rows) as 0.
-    let mut bm = vec![0.0; nz * ny];
+    let mut b_matrix = vec![0.0; nz * ny];
     let mut present = vec![false; nz * ny];
     let mut b_nulls = false;
     for (batch, keys) in b.iter().zip(&b_keys) {
-        let (bz, by) = (
+        let (b_z, b_y) = (
             Position::new(keys, &zs, &extent),
             Position::new(keys, &ys, &extent),
         );
-        let Some(bv) = factors(op_b, batch) else {
+        let Some(b_factors) = factors(op_b, batch) else {
             return Ok(None);
         };
-        b_nulls |= bv.null_count() > 0;
+        b_nulls |= b_factors.null_count() > 0;
         for r in 0..batch.num_rows() {
-            let p = bz.of(r) * ny + by.of(r);
+            let p = b_z.of(r) * ny + b_y.of(r);
             if std::mem::replace(&mut present[p], true) {
                 return Ok(None);
             }
-            if bv.is_valid(r) {
-                bm[p] = bv.value(r);
+            if b_factors.is_valid(r) {
+                b_matrix[p] = b_factors.value(r);
             }
         }
     }
@@ -293,24 +294,22 @@ pub(crate) fn fold(
     // and is NULL when all of that row's factors are: when `valued[x]` is
     // false.
 
-    let out = accumulate(&am, &held, &bm, (nx, nz, ny), threads);
+    let out = accumulate(&a_matrix, &held, &b_matrix, (nx, nz, ny), threads);
     match (fold.domain(), domain) {
         (Some(spec), Some(domain)) => {
             // The dense output is laid out [x][y], X's and Y's dimensions each
             // first-slowest, so a key's stride is the product of the extents
             // after it in that order.
             let order: Vec<usize> = xs.iter().chain(&ys).copied().collect();
-            let dims: Vec<usize> = fold.outputs().iter().map(|o| o.dimension.0).collect();
-            let keys: Vec<ColumnIndex> = fold
-                .outputs()
-                .iter()
-                .map(|o| o.domain_key.expect("a fold with a domain").column)
-                .collect();
-            let strides: Vec<usize> = dims
-                .iter()
-                .map(|d| {
-                    let slot = order.iter().position(|e| e == d).expect("an output");
-                    order[slot + 1..].iter().map(|&e| extent[e]).product()
+            let cell_keys: Vec<CellKey> = (fold.outputs().iter())
+                .map(|o| {
+                    let d = o.dimension.0;
+                    let slot = order.iter().position(|&e| e == d).expect("an output");
+                    CellKey {
+                        column: o.domain_key.expect("a fold with a domain").column,
+                        extent: extent[d],
+                        stride: order[slot + 1..].iter().map(|&e| extent[e]).product(),
+                    }
                 })
                 .collect();
             // A cell's value as the left join gives it: its sum where the
@@ -330,15 +329,9 @@ pub(crate) fn fold(
                     spec.missing
                 }
             };
-            let cells = Cells {
-                dims: &dims,
-                keys: &keys,
-                strides: &strides,
-                extent: &extent,
-            };
             // Each batch's cells, then its rows, on the threads in turn: the
             // batches are independent, and each comes back in its place.
-            let located = par_tasks(domain.len(), threads, |i| locate(&domain[i], &cells))
+            let located = par_tasks(domain.len(), threads, |i| locate(&domain[i], &cell_keys))
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?;
             if domain_rows == DomainRows::UniqueKeys {
@@ -360,7 +353,8 @@ pub(crate) fn fold(
             let rows: Vec<usize> = (0..nx).filter(|&x| reached[x]).collect();
             let n = rows.len() * ny;
             let mut columns: Vec<ArrayRef> = Vec::with_capacity(fold.outputs().len() + 1);
-            for d in fold.outputs().iter().map(|o| o.dimension.0) {
+            let output_dimensions = fold.outputs().iter().map(|o| o.dimension.0);
+            for d in output_dimensions {
                 // The key's place in x's or y's position, first dimension
                 // slowest.
                 let (in_x, role) = match xs.contains(&d) {
@@ -409,14 +403,13 @@ pub(crate) fn fold(
     }
 }
 
-/// Where the output's cells are: each output dimension, its stride in the
-/// dense output, and every dimension's extent.
-struct Cells<'a> {
-    dims: &'a [usize],
-    /// The domain's column for each output.
-    keys: &'a [ColumnIndex],
-    strides: &'a [usize],
-    extent: &'a [usize],
+/// How one of a domain's key columns places a row in the dense output: an
+/// output's key, the extent of its dimension, and its stride.
+struct CellKey {
+    /// The domain's column for the output.
+    column: ColumnIndex,
+    extent: usize,
+    stride: usize,
 }
 
 /// A domain row whose keys locate no cell of the output.
@@ -425,21 +418,22 @@ const NO_GROUP: usize = usize::MAX;
 /// The cell of the output that each row of a domain batch's keys locate, or
 /// [`NO_GROUP`]. A NULL key, or one outside every operand's range, matches no
 /// group (the operands have no NULL keys), under either key equality.
-fn locate(batch: &RecordBatch, cells: &Cells) -> Result<Vec<usize>> {
+fn locate(batch: &RecordBatch, cell_keys: &[CellKey]) -> Result<Vec<usize>> {
     let mut cell = vec![0usize; batch.num_rows()];
-    for ((&d, &stride), &ColumnIndex(col)) in cells.dims.iter().zip(cells.strides).zip(cells.keys) {
+    for key in cell_keys {
         // Out-of-range unsigned keys become NULL here, so match no group.
-        let k = compute::cast(batch.column(col), &DataType::Int64)?;
+        let k = compute::cast(batch.column(key.column.0), &DataType::Int64)?;
         let k = k
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("cast to Int64");
-        let range = 0..cells.extent[d] as i64;
-        for (r, (c, key)) in cell.iter_mut().zip(k.values()).enumerate() {
-            let in_range = range.contains(key) && k.is_valid(r);
+        let range = 0..key.extent as i64;
+        let rows = cell.iter_mut().zip(k.values()).enumerate();
+        for (r, (c, &value)) in rows {
+            let in_range = range.contains(&value) && k.is_valid(r);
             *c = match (*c, in_range) {
                 (NO_GROUP, _) | (_, false) => NO_GROUP,
-                (c, true) => c + *key as usize * stride,
+                (c, true) => c + value as usize * key.stride,
             };
         }
     }
@@ -485,16 +479,16 @@ fn domain_batch(
 /// value (`held` says which), skipping missing rows and NULL factors, in
 /// fixed blocks.
 fn accumulate(
-    am: &[f64],
+    a_matrix: &[f64],
     held: &[u8],
-    bm: &[f64],
+    b_matrix: &[f64],
     (nx, nz, ny): (usize, usize, usize),
     threads: usize,
 ) -> Vec<f64> {
     let add = |row: &mut [f64], x: usize, z: usize| {
         if held[x * nz + z] == VALUED {
-            let v = am[x * nz + z];
-            for (o, b) in row.iter_mut().zip(&bm[z * ny..(z + 1) * ny]) {
+            let v = a_matrix[x * nz + z];
+            for (o, b) in row.iter_mut().zip(&b_matrix[z * ny..(z + 1) * ny]) {
                 *o += v * b;
             }
         }

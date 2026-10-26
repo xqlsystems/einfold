@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "m1-gate"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "einfold's M1 gate: ddx's matmul gradient program, end to end, with einfold on and off"
+
+# A standalone crate, not a member of einfold's workspace, so that einfold's
+# crates don't depend on ddx: the two projects are siblings.
+[workspace]
+
+[dependencies]
+datafusion = "=55.2.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+einfold-datafusion = { path = "../../crates/einfold-datafusion" }
+# ddx's public main; `internals` exposes `engine`, which ddx's own benchmark
+# uses to run a program.
+ddx-datafusion = { git = "https://github.com/xqlsystems/ddx", rev = "921aef1a34baa3b58ab32a5a68bd663b35060bfd", features = ["internals"] }
+
+[profile.release]
+debug = false

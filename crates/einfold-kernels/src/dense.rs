@@ -153,7 +153,7 @@ pub(crate) fn par_tasks<T: Send>(
 }
 
 /// The fold of `a` and `b`'s batches (and `domain`'s, if the fold has one)
-/// by the dense algorithm on `threads` threads, or `None` when its conditions
+/// by the dense algorithm on `threads` threads, or `None` when its requirements
 /// don't hold and the discrimination algorithm must be used instead. With a domain, there is
 /// one output batch per domain batch. With [`DomainRows::UniqueKeys`], it is
 /// also `None` when two of the domain's rows locate the same cell of the
@@ -167,7 +167,7 @@ pub(crate) fn fold(
     threads: usize,
     domain_rows: DomainRows,
 ) -> Result<Option<Vec<RecordBatch>>> {
-    let [op_a, op_b] = fold.operands() else {
+    let ([op_a, op_b], []) = (fold.operands(), fold.conditions()) else {
         return Ok(None);
     };
     // The roles: X and Y in output order, Z in dimension order. Here a

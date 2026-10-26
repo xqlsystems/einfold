@@ -2,8 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! einfold's M1 gate (design §16): ddx's `matmul` gradient program, end to
-//! end, with einfold on against off, on the same DataFusion. ddx is an XQL
+//! einfold's first milestone, timed: ddx's `matmul` gradient program, end to
+//! end, with einfold on against off, on the same DataFusion. The milestone is
+//! met when einfold makes it at least 4× faster at `n = 50,000`. ddx is an XQL
 //! Systems project for automatic differentiation of SQL queries; the program
 //! is the one its benchmark `crates/ddx-datafusion/tests/ad_perf.rs` builds,
 //! for `SUM(tanh(a·w)²)` with `a` of `n × 16` and `w` of `16 × 8`.

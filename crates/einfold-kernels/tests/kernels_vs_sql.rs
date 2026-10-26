@@ -746,7 +746,7 @@ async fn fold_matches_sql() {
         dense_ran += usize::from(ran == Algorithm::Dense);
         if ran == Algorithm::Dense && case.domain.is_some() {
             unique_checked += 1;
-            unique_accepted += usize::from(check_unique_domain(&case, &mut rng, |w| fail(w)));
+            unique_accepted += usize::from(check_unique_domain(&case, &mut rng, fail));
         }
         let (ours, again) = (rows(&ours, keys), rows(&again, keys));
         // SQL doesn't order rows, so the outputs are compared as multisets.

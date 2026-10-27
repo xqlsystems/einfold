@@ -96,17 +96,6 @@ use rng::Rng;
 /// says what is left out. Remove an entry when its issue is fixed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Known {
-    /// Factors that can fail are evaluated below the join, on rows the join
-    /// drops: no fallible factors (einfold#61).
-    FallibleFactors,
-    /// A fold joined back to a domain with duplicate keys runs the host's
-    /// plan, then applies the regroup's `CASE` to its result again: the
-    /// regroup sums the fold's value alone (einfold#60).
-    JoinedBackReappliesCase,
-    /// `EinFoldExec`'s fallback isn't one of its children, so
-    /// `reset_plan_states` can't reset it: no `[rerun]` where it ran
-    /// (einfold#62).
-    FallbackNotReset,
     /// DataFusion's TopK prunes with a dynamic filter that compares `-0.0`
     /// and `0.0` as equal, while its sort orders `-0.0` first, so `ORDER BY
     /// … LIMIT` over float keys depends on timing: no `LIMIT` over them
@@ -114,12 +103,7 @@ enum Known {
     TopKSignedZeros,
 }
 
-const KNOWN: &[Known] = &[
-    Known::FallibleFactors,
-    Known::JoinedBackReappliesCase,
-    Known::FallbackNotReset,
-    Known::TopKSignedZeros,
-];
+const KNOWN: &[Known] = &[Known::TopKSignedZeros];
 
 /// Whether the simulation steps around `bug`.
 fn avoids(bug: Known) -> bool {
@@ -161,12 +145,8 @@ fn case(seed: u64) -> Case {
     let (ti, tj, tk) = (ty(&mut rng), ty(&mut rng), ty(&mut rng));
     let float = |t: KeyType| matches!(t, KeyType::Float64 | KeyType::DictFloat64);
     let options = Options {
-        fallible: values == Values::Exact && rng.chance(0.25) && !avoids(Known::FallibleFactors),
+        fallible: values == Values::Exact && rng.chance(0.25),
         exact: values == Values::Exact,
-        regroup_value_only: avoids(Known::JoinedBackReappliesCase),
-        // A key of one type joined to one of another is cast, and a cast
-        // can fail on rows the join drops, as factors do.
-        cross_key: ti == tk || !avoids(Known::FallibleFactors),
         limit: !([ti, tj, tk].into_iter().any(float) && avoids(Known::TopKSignedZeros)),
     };
     // Sometimes r's J column is narrower than l's, so the join casts it.
@@ -450,8 +430,7 @@ async fn run_case(case: &Case) -> Outcome {
         _ => false,
     };
     out.host_rerun_failed = !host_reruns;
-    let rerun = !(r.host > 0 && avoids(Known::FallbackNotReset));
-    if bits_must_match && host_reruns && rerun {
+    if bits_must_match && host_reruns {
         match check::rerun(&ours, &mine).await {
             Some(Ok(again)) if check::exact(&again) != check::exact(got) => {
                 fail(

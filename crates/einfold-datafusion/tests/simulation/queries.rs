@@ -68,12 +68,8 @@ pub struct Options {
     /// Whether values are exact (see `data::Values`): only then may factors
     /// add constants, which change the magnitudes the bound is computed from.
     pub exact: bool,
-    /// Whether a fold joined back sums only the fold's value, with no `CASE`.
-    pub regroup_value_only: bool,
     /// Whether the query may be ordered and limited above.
     pub limit: bool,
-    /// Whether the fold may also join `l.a` to `r.b`.
-    pub cross_key: bool,
 }
 
 /// An expression of one side's row, as a factor.
@@ -146,7 +142,7 @@ impl Fold {
         let mut on = vec![eq.render("l.b", "r.a")];
         // Sometimes a second key; and rarely the two equalities mixed, which
         // DataFusion keeps as a join filter.
-        if !keyed && options.cross_key && rng.chance(0.15) {
+        if !keyed && rng.chance(0.15) {
             let second = if rng.chance(0.2) { Eq::draw(rng) } else { eq };
             on.push(second.render("l.a", "r.b"));
         }
@@ -386,9 +382,6 @@ fn joined_back(rng: &mut Rng, options: Options, ctes: &mut Vec<String>) -> (Stri
     // magnitudes, so only exact cases use it.
     if options.exact {
         tests.push("CASE WHEN d2.v < 0 THEN NULL ELSE f.v END");
-    }
-    if options.regroup_value_only {
-        tests.truncate(1);
     }
     let e = rng.pick(&tests).to_string();
     let d2 = match rng.below(8) {

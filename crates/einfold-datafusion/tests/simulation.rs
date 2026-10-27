@@ -128,6 +128,10 @@ enum Known {
     /// (apache/datafusion#24414, fixed after 55.2): no sort-merge joins with
     /// a join filter.
     SortMergeFilterProjection,
+    /// DataFusion's plan, reset with `reset_plan_states` and run again under
+    /// a small memory pool, can hang: no `[rerun]` with a pool
+    /// (einfold#71, upstream).
+    ResetRerunUnderPool,
 }
 
 const KNOWN: &[Known] = &[
@@ -135,6 +139,7 @@ const KNOWN: &[Known] = &[
     Known::FallbackOptimizedTwice,
     Known::SortMergeSignedZeros,
     Known::SortMergeFilterProjection,
+    Known::ResetRerunUnderPool,
 ];
 
 /// Whether the simulation steps around `bug`.
@@ -443,7 +448,9 @@ async fn run_case(case: &Case) -> Outcome {
     );
     register(&host, &case.tables);
     register(&ours, &case.tables);
+    trace("host");
     let theirs = check::run(&host, sql).await;
+    trace("einfold");
     let mine = check::run(&ours, sql).await;
     out.routes = mine.routes();
     let mut fail = |tag: &str, what: String, ran: Option<&check::Ran>| {
@@ -452,6 +459,7 @@ async fn run_case(case: &Case) -> Outcome {
     // The host itself under default settings: where its answer depends on the
     // settings, that's DataFusion's bug, and einfold can't match both.
     if case.values == Values::Exact && case.settings.pool.is_none() {
+        trace("host, default settings");
         let default = check::session(case.threads[0], None, 8192, check::Settings::default());
         register(&default, &case.tables);
         if let (Ok(a), Ok(b)) = (&theirs.result, &check::run(&default, sql).await.result) {
@@ -536,32 +544,59 @@ async fn run_case(case: &Case) -> Outcome {
     let r = out.routes;
     out.deterministic = r.folds > 0 && r.host == 0 && r.other_aggregates == 0;
     let bits_must_match = out.deterministic || case.values == Values::Exact;
-    // The host's own plan, run again, is the control: where it can't run
-    // twice, einfold's needn't either.
-    let host_reruns = match check::rerun(&host, &theirs).await {
-        Some(Ok(again)) => {
-            check::exact(&again) == check::exact(want) || case.values == Values::Inexact
+    // [rerun], on sessions of their own without dynamic filters: DataFusion's
+    // `reset_plan_states` doesn't support plans with them, and a hash join's
+    // can hang a plan run again. The host's own plan, run again, is the
+    // control: where it can't run twice, einfold's needn't either.
+    let mut settings = case.settings;
+    settings.no_dynamic_filters = true;
+    if avoids(Known::ResetRerunUnderPool) {
+        settings.pool = None;
+    }
+    let host2 = check::session(case.threads[0], None, case.batch_sizes[0], settings);
+    let ours2 = check::session(
+        case.threads[1],
+        Some(case.fallback),
+        case.batch_sizes[1],
+        settings,
+    );
+    register(&host2, &case.tables);
+    register(&ours2, &case.tables);
+    trace(&format!("host, first run for rerun, {settings:?}"));
+    let theirs2 = check::run(&host2, sql).await;
+    trace(&format!(
+        "host's first run: {:?}",
+        theirs2.result.as_ref().map(|b| b.len())
+    ));
+    trace("einfold, first run for rerun");
+    let mine2 = check::run(&ours2, sql).await;
+    trace("host, rerun");
+    let host_reruns = match (&theirs2.result, check::rerun(&host2, &theirs2).await) {
+        (Ok(first), Some(Ok(again))) => {
+            check::exact(&again) == check::exact(first) || case.values == Values::Inexact
         }
         _ => false,
     };
     out.host_rerun_failed = !host_reruns;
-    if bits_must_match && host_reruns {
-        match check::rerun(&ours, &mine).await {
-            Some(Ok(again)) if check::exact(&again) != check::exact(got) => {
+    if let (true, true, Ok(first)) = (bits_must_match, host_reruns, &mine2.result) {
+        trace("einfold, rerun");
+        match check::rerun(&ours2, &mine2).await {
+            Some(Ok(again)) if check::exact(&again) != check::exact(first) => {
                 fail(
                     "rerun",
-                    diff(&check::exact(&again), &check::exact(got)),
-                    Some(&mine),
+                    diff(&check::exact(&again), &check::exact(first)),
+                    Some(&mine2),
                 );
             }
             Some(Err(e)) if !out_of_memory(&e) => fail(
                 "rerun",
                 format!("running the reset plan again failed: {e}"),
-                Some(&mine),
+                Some(&mine2),
             ),
             _ => {}
         }
     }
+    trace("einfold, other threads");
     if out.deterministic {
         let other = check::session(
             case.threads[2],
@@ -589,6 +624,7 @@ async fn run_case(case: &Case) -> Outcome {
             case.settings,
         );
         register(&hash, &case.tables);
+        trace("einfold, hash");
         let ran = check::run(&hash, sql).await;
         match &ran.result {
             Err(e) if out_of_memory(e) => {}
@@ -688,6 +724,14 @@ async fn within_bound(
         }
     }
     Ok(())
+}
+
+/// With `EINFOLD_SIM_TRACE` set, says which stage of a case is starting, so
+/// that a hang shows where it is.
+fn trace(stage: &str) {
+    if std::env::var("EINFOLD_SIM_TRACE").is_ok() {
+        eprintln!("TRACE {stage}");
+    }
 }
 
 fn env_u64(name: &str) -> Option<u64> {
@@ -869,4 +913,59 @@ fn soak() {
         "the soak found {} failure(s); see FAILURE lines",
         tally.failures
     );
+}
+
+/// Plain DataFusion's plan for `EINFOLD_SEED`'s query (default the seed that
+/// found einfold#71), reset with `reset_plan_states` and run again,
+/// on several partition counts and batch sizes, with and without a small
+/// memory pool: prints each setting under which a rerun didn't finish in
+/// 3 s. A reproduction for that issue, not a property.
+#[test]
+#[ignore]
+fn host_rerun_hang() {
+    let seed = env_u64("EINFOLD_SEED").unwrap_or(70019748);
+    let rt = runtime();
+    let case = case(seed);
+    eprintln!(
+        "threads={:?} batch_sizes={:?} settings={:?}",
+        case.threads, case.batch_sizes, case.settings
+    );
+    for threads in [1usize, 2, 4, 6] {
+        for batch in [1usize, 3, 8192] {
+            for pool in [None, Some(8192usize)] {
+                let mut hangs = 0;
+                for _ in 0..8 {
+                    let settings = check::Settings {
+                        pool,
+                        no_dynamic_filters: true,
+                        ..Default::default()
+                    };
+                    let host = check::session(threads, None, batch, settings);
+                    register(&host, &case.tables);
+                    let ran = rt.block_on(check::run(&host, &case.query.sql));
+                    if ran.result.is_err() {
+                        continue;
+                    }
+                    let plan = ran.plan.clone().expect("a plan");
+                    let reset = datafusion::physical_plan::execution_plan::reset_plan_states(plan)
+                        .expect("reset");
+                    let task = host.task_ctx();
+                    let done = rt.block_on(async move {
+                        let run = tokio::spawn(async move {
+                            datafusion::physical_plan::collect(reset, task)
+                                .await
+                                .is_ok()
+                        });
+                        tokio::time::timeout(std::time::Duration::from_secs(3), run)
+                            .await
+                            .is_ok()
+                    });
+                    hangs += usize::from(!done);
+                }
+                if hangs > 0 {
+                    eprintln!("HANG threads={threads} batch={batch} pool={pool:?}: {hangs} of 8");
+                }
+            }
+        }
+    }
 }

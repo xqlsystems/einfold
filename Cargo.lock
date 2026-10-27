@@ -1356,6 +1356,16 @@ name = "einfold-ir"
 version = "0.0.0"
 
 [[package]]
+name = "einfold-kernels"
+version = "0.0.0"
+dependencies = [
+ "arrow",
+ "datafusion",
+ "einfold-ir",
+ "tokio",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

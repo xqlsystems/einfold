@@ -7,6 +7,7 @@
 resolver = "3"
 members = [
     "crates/einfold-ir",
+    "crates/einfold-kernels",
     "crates/einfold-datafusion",
 ]
 
@@ -27,7 +28,12 @@ rust-version = "1.94"
 # deliberate change made together with ddx.
 datafusion = { version = "=55.2.0" }
 
+# Arrow at the version `datafusion` uses: einfold-kernels takes and returns
+# its arrays, and einfold-datafusion hands it DataFusion's batches.
+arrow = { version = "=59.3.1", default-features = false }
+
 einfold-ir = { path = "crates/einfold-ir", version = "0.0.0" }
+einfold-kernels = { path = "crates/einfold-kernels", version = "0.0.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

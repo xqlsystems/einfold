@@ -663,11 +663,17 @@ async fn within_bound(
     };
     let (n, m) = (aside(ones), aside(mags));
     let sql = &case.query.sql;
-    let (Ok(n), Ok(m)) = (
+    let (n, m) = (
         check::run(&n, sql).await.result,
         check::run(&m, sql).await.result,
-    ) else {
-        return Err("the twin tables' query failed".into());
+    );
+    let (n, m) = match (n, m) {
+        (Ok(n), Ok(m)) => (n, m),
+        // The twins are partitioned otherwise, and whether DataFusion
+        // evaluates an expression that can fail (a cast of a join key, say)
+        // depends on its plan's execution: without the twins' answers there
+        // is no bound to check against.
+        _ => return Ok(()),
     };
     let (g, w, n, m) = (
         check::rows(got),

@@ -322,8 +322,12 @@ pub fn query(rng: &mut Rng, options: Options) -> Query {
     if options.limit && shape != Shape::Fold && rng.chance(0.08) {
         sql = format!("SELECT * FROM ({sql}) q ORDER BY 1, 2, 3 LIMIT 5");
     }
-    // The mask (`l.a >= r.b`) is the only inequality the generator writes.
-    let join_filter = sql.contains(" >= ");
+    // DataFusion keeps as a join filter the mask (`l.a >= r.b`, the only
+    // inequality the generator writes) and a second key compared otherwise
+    // than the first.
+    let mixed = (sql.contains("l.b = r.a") && sql.contains("(l.a IS NOT DISTINCT FROM r.b)"))
+        || (sql.contains("(l.b IS NOT DISTINCT FROM r.a)") && sql.contains("l.a = r.b"));
+    let join_filter = sql.contains(" >= ") || mixed;
     Query {
         sql,
         shape,

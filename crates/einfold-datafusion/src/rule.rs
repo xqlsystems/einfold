@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, DFSchemaRef, NullEquality, Result};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, NullEquality, Result};
 use datafusion::functions_aggregate::sum::Sum;
 use datafusion::logical_expr::{
     Aggregate, BinaryExpr, Expr, ExprSchemable, Join, JoinType, LogicalPlan, Operator, Projection,
@@ -136,6 +136,94 @@ fn side(e: &Expr, inputs: [&DFSchemaRef; 2]) -> Option<usize> {
     (0..2).find(|&s| cols.iter().all(|c| inputs[s].has_column(c)))
 }
 
+/// Scalar functions that a factor may apply, when every argument is
+/// `Float64`. Each returns NaN, ±inf or NULL rather than an error for any
+/// input, which `tests/detect_vs_host.rs` checks over NaN, ±inf, ±0,
+/// negatives and NULL. `power` and `sqrt` are left out: `power(0, -1)` and
+/// `sqrt(-1)` raise errors in DataFusion 55.
+pub const MOVABLE_FUNCTIONS: &[&str] = &["abs", "exp", "ln", "tanh", "signum"];
+
+/// Whether `e`, an expression over `schema`, may be computed on every row of
+/// a join's input rather than on the joined rows only, as the host's plan
+/// computes it. A fold's operands compute their keys and factors that way,
+/// so a row that joins nothing must not make the query fail where the host
+/// answers it: `CAST('oops' AS DOUBLE)` or `n / 0` on such a row would. So
+/// only deterministic, row-wise expressions that can't raise an error move;
+/// a volatile one, such as `random()`, would also be drawn once per input
+/// row rather than once per joined pair.
+fn movable(e: &Expr, schema: &DFSchema) -> bool {
+    let ty = |e: &Expr| e.get_type(schema).ok();
+    let arithmetic = |e: &Expr| ty(e).is_some_and(|t| t.is_integer() || t.is_floating());
+    let fails = |e: &Expr| {
+        let ok = match e {
+            Expr::Alias(_) | Expr::Column(_) | Expr::Literal(..) => true,
+            // Integer arithmetic wraps in DataFusion, and float arithmetic
+            // gives ±inf or NaN. `/` and `%` can fail on integers.
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
+                Operator::Plus | Operator::Minus | Operator::Multiply => {
+                    arithmetic(left) && arithmetic(right)
+                }
+                Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+                | Operator::And
+                | Operator::Or
+                | Operator::IsDistinctFrom
+                | Operator::IsNotDistinctFrom => true,
+                _ => false,
+            },
+            Expr::Negative(inner) => arithmetic(inner),
+            Expr::Not(_)
+            | Expr::IsNotNull(_)
+            | Expr::IsNull(_)
+            | Expr::IsTrue(_)
+            | Expr::IsFalse(_)
+            | Expr::IsUnknown(_)
+            | Expr::IsNotTrue(_)
+            | Expr::IsNotFalse(_)
+            | Expr::IsNotUnknown(_)
+            | Expr::Between(_)
+            | Expr::Case(_)
+            | Expr::TryCast(_) => true,
+            Expr::InList(list) => list.list.iter().all(|e| matches!(e, Expr::Literal(..))),
+            Expr::Cast(cast) => {
+                ty(&cast.expr).is_some_and(|from| widens(&from, cast.field.data_type()))
+            }
+            Expr::ScalarFunction(f) => {
+                MOVABLE_FUNCTIONS.contains(&f.name())
+                    && f.args.iter().all(|a| ty(a) == Some(DataType::Float64))
+            }
+            _ => false,
+        };
+        Ok(!ok)
+    };
+    // Every node of `e` must be one of those: a CASE's branches are nodes too.
+    !e.exists(fails).expect("the check doesn't fail")
+}
+
+/// Whether a cast from `from` to `to` can't fail: any integer or float to
+/// `Float64`, rounding if it must, or an integer to an integer type that
+/// holds all its values, as DataFusion's coercion inserts for `INT * 2`.
+fn widens(from: &DataType, to: &DataType) -> bool {
+    use DataType::{Int16, Int32, Int8, UInt16, UInt32, UInt8};
+    let bits = |t: &DataType| match t {
+        Int8 | UInt8 => 8,
+        Int16 | UInt16 => 16,
+        Int32 | UInt32 => 32,
+        _ => 64,
+    };
+    match (from, to) {
+        (f, DataType::Float64) => f.is_integer() || f.is_floating(),
+        (f, t) if f.is_signed_integer() && t.is_signed_integer() => bits(f) <= bits(t),
+        (f, t) if f.is_unsigned_integer() && t.is_unsigned_integer() => bits(f) <= bits(t),
+        (f, t) if f.is_unsigned_integer() && t.is_signed_integer() => bits(f) < bits(t),
+        _ => false,
+    }
+}
+
 /// The sum's argument, if `agg` computes exactly one plain `SUM`.
 fn sum_argument(agg: &Aggregate) -> Option<Expr> {
     let [aggregate] = agg.aggr_expr.as_slice() else {
@@ -192,7 +280,10 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
         let Some(s) = side(&f, inputs) else {
             return Ok(None);
         };
-        if factors[s].is_some() || f.get_type(inputs[s].as_ref())? != DataType::Float64 {
+        if factors[s].is_some()
+            || f.get_type(inputs[s].as_ref())? != DataType::Float64
+            || !movable(&f, inputs[s])
+        {
             return Ok(None);
         }
         factors[s] = Some(f);
@@ -219,6 +310,9 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
         true
     };
     for (l, r) in &join.on {
+        if !movable(l, inputs[0]) || !movable(r, inputs[1]) {
+            return Ok(None);
+        }
         let d = dimensions.len();
         dimensions.push(Dimension { equality });
         if !hold(0, d, l.clone(), &mut columns) || !hold(1, d, r.clone(), &mut columns) {

@@ -422,3 +422,107 @@ async fn einfold_changes_no_answer() {
         );
     }
 }
+
+/// Runs `setup`'s statements, then `sql` with and without einfold, and
+/// returns how many folds einfold found, after checking both give the same
+/// rows.
+async fn same_answer(setup: &[&str], sql: &str) -> usize {
+    let (plain, with) = (host(4), einfold(4, true));
+    for ctx in [&plain, &with] {
+        for s in setup {
+            ctx.sql(s).await.unwrap().collect().await.unwrap();
+        }
+    }
+    let expected = rows(&plain.sql(sql).await.unwrap().collect().await.unwrap());
+    let frame = with.sql(sql).await.unwrap();
+    let state = Arc::new(frame.task_ctx());
+    let plan = frame.create_physical_plan().await.unwrap();
+    let found = exec_folds(&plan).0;
+    let got = datafusion::physical_plan::collect(plan, state)
+        .await
+        .unwrap_or_else(|e| panic!("einfold failed where DataFusion answers: {e}\n{sql}"));
+    assert_eq!(rows(&got), expected, "{sql}");
+    found
+}
+
+/// A factor that can fail stays where the host computes it, on joined rows
+/// only: `l`'s third row joins nothing, so DataFusion never casts `'oops'`
+/// or divides by its zero.
+#[tokio::test]
+async fn fallible_factors_stay_above_the_join() {
+    let setup = [
+        "CREATE TABLE l (a BIGINT, b BIGINT, t VARCHAR, n BIGINT) AS VALUES \
+         (0, 0, '1.5', 1), (1, 0, '2.5', 2), (1, 9, 'oops', 0)",
+        "CREATE TABLE r (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0, 0, 1.0), (0, 1, 2.0)",
+    ];
+    for factor in [
+        "CAST(l.t AS DOUBLE)",
+        "CAST(l.a / l.n AS DOUBLE)",
+        "CAST(l.a % l.n AS DOUBLE)",
+    ] {
+        let sql = format!(
+            "SELECT l.a, r.b, SUM({factor} * r.v) AS v FROM l JOIN r ON l.b = r.a GROUP BY l.a, r.b"
+        );
+        assert_eq!(same_answer(&setup, &sql).await, 0, "{sql}");
+    }
+}
+
+/// A volatile factor is drawn once per joined pair in the host's plan, and
+/// would be drawn once per input row in a fold's operand.
+#[tokio::test]
+async fn volatile_factors_are_left_alone() {
+    let setup = [
+        "CREATE TABLE l (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0, 0, 1.0)",
+        "CREATE TABLE r (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0, 0, 1.0)",
+    ];
+    let sql = "SELECT l.a, r.b, SUM((l.v * 0.0 + random() * 0.0) * r.v) AS v \
+               FROM l JOIN r ON l.b = r.a GROUP BY l.a, r.b";
+    assert_eq!(same_answer(&setup, sql).await, 0);
+}
+
+/// Factors built from infallible pieces are still found.
+#[tokio::test]
+async fn infallible_factors_are_found() {
+    let setup = [
+        "CREATE TABLE l (a BIGINT, b BIGINT, v DOUBLE, i INT) AS VALUES (0, 0, 1.0, 3), (1, 0, -2.0, 4)",
+        "CREATE TABLE r (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0, 0, 1.0), (0, 1, 2.0)",
+    ];
+    let factors = [
+        "exp(l.v)",
+        "CAST(l.i * 2 AS DOUBLE)",
+        "CASE WHEN l.v > 0 THEN ln(l.v) ELSE -l.v END",
+        "COALESCE(abs(l.v), 0.0)",
+    ];
+    for factor in factors {
+        let sql = format!(
+            "SELECT l.a, r.b, SUM({factor} * r.v) AS v FROM l JOIN r ON l.b = r.a GROUP BY l.a, r.b"
+        );
+        assert_eq!(same_answer(&setup, &sql).await, 1, "{sql}");
+    }
+}
+
+/// Every function a factor may apply evaluates without error on awkward
+/// `Float64` inputs.
+#[tokio::test]
+async fn movable_functions_never_fail() {
+    let ctx = host(1);
+    let values = "(CAST('NaN' AS DOUBLE)), (CAST('inf' AS DOUBLE)), (CAST('-inf' AS DOUBLE)), \
+                  (0.0), (-0.0), (-2.5), (-3.0), (0.5), (2.0), (1.7976931348623157e308), \
+                  (2.2250738585072014e-308), (NULL)";
+    ctx.sql(&format!("CREATE TABLE vals (x DOUBLE) AS VALUES {values}"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    for f in einfold_datafusion::MOVABLE_FUNCTIONS {
+        let sql = format!("SELECT {f}(x) FROM vals");
+        let batches = (ctx.sql(&sql).await.unwrap().collect().await)
+            .unwrap_or_else(|e| panic!("{sql} failed: {e}"));
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            12,
+            "{sql}"
+        );
+    }
+}

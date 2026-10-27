@@ -25,7 +25,7 @@ use datafusion::execution::SessionStateBuilder;
 
 pub use exec::{EinFoldExec, EinFoldPlanner, EinFoldQueryPlanner};
 pub use node::FoldNode;
-pub use rule::DetectFolds;
+pub use rule::{DetectFolds, MOVABLE_FUNCTIONS};
 
 /// `builder` with einfold installed: an [`EinFoldQueryPlanner`] that applies
 /// [`DetectFolds`] to each optimized plan, then plans the nodes it makes.

@@ -24,7 +24,9 @@
 //! of the second `GROUP BY` holds one row, and the query is the fold with `d`
 //! as its domain: each row of `d` gets `0.0 + e` evaluated on itself and its
 //! group's value, where `0.0 +` is what `SUM` of one value computes, and NULL
-//! where no group matched. `e` is NULL where `f`'s value is, so a missing
+//! where no group matched. The node computes `e`'s tests as a column of its
+//! domain, and makes the value NULL where one holds, so that the host's plan,
+//! when it runs instead, isn't given them a second time. `e` is NULL where `f`'s value is, so a missing
 //! group and a group with a NULL sum agree. Whether the keys are unique is
 //! known only when the query runs, so the node checks it then, and runs the
 //! host's own plan where they aren't.
@@ -38,7 +40,7 @@ use datafusion::logical_expr::{lit, Expr, Join, JoinType, LogicalPlan, Projectio
 use einfold_ir::{ColumnIndex, Domain, Fold, KeyEquality, Output};
 
 use crate::node::FoldNode;
-use crate::rule::{found_fold, resolve, restore, same_schema, sum_argument, PREFIX};
+use crate::rule::{found_fold, movable, resolve, restore, same_schema, sum_argument, PREFIX};
 
 /// `plan` without the aliases and column-only projections over it, with, for
 /// each of `plan`'s columns, its column in what is left. A table scan's
@@ -262,6 +264,48 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
         });
     }
     let width = d.schema().fields().len();
+    // `e`'s tests, as a column of d: true where `e` is NULL whatever the
+    // fold's value. The tests are then computed on every row of d, where the
+    // host's plan computes them only on rows that joined the fold, so they
+    // must be unable to fail.
+    let d_expr = |c: &Column| -> Option<Expr> {
+        let i = d2.schema().index_of_column(c).ok()?;
+        let j = d_column(d2_map[i])?;
+        Some(Expr::Column(Column::from(d.schema().qualified_field(j))))
+    };
+    let null_when = match &e {
+        Expr::Case(Case { when_then_expr, .. }) => {
+            let mut unmapped = false;
+            let mut tests = Vec::new();
+            for (test, _) in when_then_expr {
+                let test = (test.as_ref().clone())
+                    .transform(|x| match &x {
+                        Expr::Column(c) => match d_expr(c) {
+                            Some(e) => Ok(Transformed::yes(e)),
+                            None => {
+                                unmapped = true;
+                                Ok(Transformed::no(x))
+                            }
+                        },
+                        _ => Ok(Transformed::no(x)),
+                    })?
+                    .data;
+                // A CASE branch is taken where its test is true, not NULL.
+                tests.push(match test {
+                    Expr::IsNull(_) | Expr::IsNotNull(_) => test,
+                    test => Expr::IsTrue(Box::new(test)),
+                });
+            }
+            let Some(mask) = tests.into_iter().reduce(Expr::or) else {
+                return Ok(None);
+            };
+            if unmapped || !movable(&mask, d.schema()) {
+                return Ok(None);
+            }
+            Some(mask)
+        }
+        _ => None,
+    };
     let Ok(with_domain) = Fold::try_new(
         fold.dimensions().to_vec(),
         fold.operands().to_vec(),
@@ -284,44 +328,35 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
         .chain([format!("{PREFIX}v")])
         .collect();
     let inputs = node.inputs_owned();
+    // The domain: d, and the mask after its columns.
+    let domain = match &null_when {
+        None => d.as_ref().clone(),
+        Some(mask) => {
+            let mut columns: Vec<Expr> =
+                d.schema().columns().into_iter().map(Expr::Column).collect();
+            columns.push(mask.clone().alias(format!("{PREFIX}null")));
+            LogicalPlan::Projection(Projection::try_new(columns, Arc::clone(d))?)
+        }
+    };
     let Ok(new) = FoldNode::try_new(
         with_domain,
         inputs[..2].to_vec(),
-        Some(d.as_ref().clone()),
+        Some(domain),
         names.clone(),
     ) else {
         return Ok(None);
     };
     let new = new
         .with_fallback(original.clone())
-        .requiring_unique_domain()
-        .into_plan();
-    // Over it: d's columns, and the sum as SUM of one value gives it, `e`
-    // reading d2's columns from the node's copy of d.
-    let mut unmapped = false;
-    let renamed = e
-        .transform(|x| match &x {
-            Expr::Column(c) if *c == value => Ok(Transformed::yes(Expr::Column(
-                Column::new_unqualified(&names[width]),
-            ))),
-            Expr::Column(c) => {
-                let column = d2.schema().index_of_column(c).ok();
-                match column.and_then(|i| d_column(d2_map[i])) {
-                    Some(i) => Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
-                        &names[i],
-                    )))),
-                    None => {
-                        unmapped = true;
-                        Ok(Transformed::no(x))
-                    }
-                }
-            }
-            _ => Ok(Transformed::no(x)),
-        })?
-        .data;
-    if unmapped {
-        return Ok(None);
+        .requiring_unique_domain();
+    let new = match null_when {
+        Some(_) => new.with_null_when(ColumnIndex(width)),
+        None => new,
     }
+    .into_plan();
+    // Over it: d's columns, and the sum as SUM of one value gives it. The
+    // node has applied `e`'s tests where it computed the fold, and the host's
+    // plan has where it ran.
     let Some(columns) = restore(new, &names[..width], d.schema())? else {
         return Ok(None);
     };
@@ -329,7 +364,8 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
         return Ok(None);
     };
     let mut exprs = columns.expr.clone();
-    exprs.push((lit(0.0) + renamed).alias_qualified(sum.relation.clone(), &sum.name));
+    let value = Expr::Column(Column::new_unqualified(&names[width]));
+    exprs.push((lit(0.0) + value).alias_qualified(sum.relation.clone(), &sum.name));
     let projection = Projection::try_new(exprs, Arc::clone(&columns.input))?;
     if !same_schema(&projection.schema, original.schema()) {
         return Ok(None);

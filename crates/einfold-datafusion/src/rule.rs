@@ -157,7 +157,7 @@ pub const MOVABLE_FUNCTIONS: &[&str] = &["abs", "exp", "ln", "tanh", "signum"];
 /// only deterministic, row-wise expressions that can't raise an error move;
 /// a volatile one, such as `random()`, would also be drawn once per input
 /// row rather than once per joined pair.
-fn movable(e: &Expr, schema: &DFSchema) -> bool {
+pub(crate) fn movable(e: &Expr, schema: &DFSchema) -> bool {
     let ty = |e: &Expr| e.get_type(schema).ok();
     let arithmetic = |e: &Expr| ty(e).is_some_and(|t| t.is_integer() || t.is_floating());
     let fails = |e: &Expr| {

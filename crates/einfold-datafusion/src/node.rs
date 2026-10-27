@@ -15,7 +15,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::common::{plan_err, DFSchema, DFSchemaRef, Result};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan, UserDefinedLogicalNodeCore};
-use einfold_ir::{DimensionId, Fold};
+use einfold_ir::{ColumnIndex, DimensionId, Fold};
 
 /// A fold over a join in a DataFusion logical plan. Its inputs are the fold's
 /// two operands, then its domain if it has one; its schema is
@@ -33,6 +33,9 @@ pub struct FoldNode {
     /// Whether the node computes its fold only when no two domain rows reach
     /// one group, and runs its fallback otherwise.
     unique_domain: bool,
+    /// A Boolean column of the domain whose rows get a NULL value where it is
+    /// true, whatever their group's.
+    null_when: Option<ColumnIndex>,
 }
 
 impl FoldNode {
@@ -75,6 +78,7 @@ impl FoldNode {
             fallback: None,
             found: false,
             unique_domain: false,
+            null_when: None,
         })
     }
 
@@ -101,6 +105,21 @@ impl FoldNode {
     /// unique, running its fallback otherwise.
     pub fn unique_domain(&self) -> bool {
         self.unique_domain
+    }
+
+    /// This node, giving a NULL value to each row of its domain where the
+    /// domain's Boolean column `column` is true, as `CASE WHEN <column> THEN
+    /// NULL ELSE <value> END` does.
+    pub(crate) fn with_null_when(mut self, column: ColumnIndex) -> Self {
+        self.null_when = Some(column);
+        self
+    }
+
+    /// The domain's column that makes a row's value NULL where it is true, if
+    /// any: such a row gets a NULL value, as `CASE WHEN <column> THEN NULL
+    /// ELSE <value> END` gives it.
+    pub fn null_when(&self) -> Option<ColumnIndex> {
+        self.null_when
     }
 
     /// This node, marked as made by [`DetectFolds`](crate::DetectFolds)
@@ -142,7 +161,14 @@ impl FoldNode {
 impl PartialOrd for FoldNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         fn key(n: &FoldNode) -> impl PartialOrd + '_ {
-            (&n.fold, &n.inputs, &n.fallback, n.found, n.unique_domain)
+            (
+                &n.fold,
+                &n.inputs,
+                &n.fallback,
+                n.found,
+                n.unique_domain,
+                n.null_when,
+            )
         }
         key(self).partial_cmp(&key(other))
     }
@@ -166,7 +192,11 @@ impl UserDefinedLogicalNodeCore for FoldNode {
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Fold: {}", describe(&self.fold, self.unique_domain))
+        write!(f, "Fold: {}", describe(&self.fold, self.unique_domain))?;
+        match self.null_when {
+            Some(ColumnIndex(c)) => write!(f, ", NULL where domain column {c}"),
+            None => Ok(()),
+        }
     }
 
     fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
@@ -185,6 +215,7 @@ impl UserDefinedLogicalNodeCore for FoldNode {
             fallback: self.fallback.clone(),
             found: self.found,
             unique_domain: self.unique_domain,
+            null_when: self.null_when,
             ..node
         })
     }

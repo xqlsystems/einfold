@@ -9,8 +9,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::compute::concat_batches;
+use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
+use datafusion::arrow::compute::{concat_batches, nullif};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::runtime::SpawnedTask;
@@ -31,7 +31,7 @@ use datafusion::physical_plan::{
     PlanProperties,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
-use einfold_ir::Fold;
+use einfold_ir::{ColumnIndex, Fold};
 use einfold_kernels::{Algorithm, Options};
 use futures::future::try_join_all;
 use futures::{stream, StreamExt, TryStreamExt};
@@ -72,6 +72,8 @@ pub struct EinFoldExec {
     fallback: Option<Arc<dyn ExecutionPlan>>,
     /// Whether to run the fallback unless no two domain rows reach one group.
     unique_domain: bool,
+    /// The domain's Boolean column that makes a row's value NULL where true.
+    null_when: Option<ColumnIndex>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -91,6 +93,7 @@ impl EinFoldExec {
             inputs,
             fallback: None,
             unique_domain: false,
+            null_when: None,
             properties: Arc::new(properties),
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -112,6 +115,15 @@ impl EinFoldExec {
         self
     }
 
+    /// This operator, giving a NULL value to each row of its domain where the
+    /// domain's Boolean column `column` is true, as `CASE WHEN <column> THEN
+    /// NULL ELSE <value> END` does. The host's plan, if it runs, computes its
+    /// own values.
+    pub fn with_null_when(mut self, column: ColumnIndex) -> Self {
+        self.null_when = Some(column);
+        self
+    }
+
     /// The host's plan this operator runs where the dense algorithm doesn't
     /// apply, if it has one.
     pub fn fallback(&self) -> Option<&Arc<dyn ExecutionPlan>> {
@@ -123,6 +135,7 @@ impl EinFoldExec {
         let mut exec = EinFoldExec::new(self.fold.clone(), inputs, self.schema());
         exec.fallback = self.fallback.clone();
         exec.unique_domain = self.unique_domain;
+        exec.null_when = self.null_when;
         exec
     }
 
@@ -260,6 +273,7 @@ impl ExecutionPlan for EinFoldExec {
         let hash_folds = builder().global_counter("hash_folds");
         let host_plans = builder().global_counter("host_plans");
         let fallback = self.fallback.clone();
+        let null_when = self.null_when;
         let compute = builder().elapsed_compute(0);
         let output_rows = builder().output_rows(0);
         // Shared with the kernel's task, which holds the inputs it counts: a
@@ -279,6 +293,11 @@ impl ExecutionPlan for EinFoldExec {
             )
             .await?;
             let domain = (batches.len() == 3).then(|| batches.pop().unwrap());
+            // Each domain batch's NULL mask: the kernels give one output batch
+            // per domain batch, row for row.
+            let masks: Option<Vec<ArrayRef>> = null_when
+                .zip(domain.as_ref())
+                .map(|(c, d)| d.iter().map(|b| Arc::clone(b.column(c.0))).collect());
             let b = concat(&schemas[1], batches.pop().unwrap(), &reservation)?;
             let a = concat(&schemas[0], batches.pop().unwrap(), &reservation)?;
             let timer = compute.timer();
@@ -304,14 +323,31 @@ impl ExecutionPlan for EinFoldExec {
             // memory they would have had without einfold. The output, which
             // may share the domain's columns, is counted below.
             reservation.free();
+            let masked = |batches: Vec<RecordBatch>| -> Result<Vec<RecordBatch>> {
+                let Some(masks) = &masks else {
+                    return Ok(batches);
+                };
+                (batches.iter().zip(masks))
+                    .map(|(b, mask)| {
+                        let mask = mask.as_any().downcast_ref::<BooleanArray>();
+                        let Some(mask) = mask else {
+                            return internal_err!("EinFoldExec's NULL mask isn't Boolean");
+                        };
+                        let mut columns = b.columns().to_vec();
+                        let last = columns.len() - 1;
+                        columns[last] = nullif(&columns[last], mask)?;
+                        Ok(RecordBatch::try_new(b.schema(), columns)?)
+                    })
+                    .collect()
+            };
             let batches = match (ran, fallback) {
                 (Some((Algorithm::Dense, batches)), _) => {
                     dense_folds.add(1);
-                    batches
+                    masked(batches)?
                 }
                 (Some((Algorithm::Hash, batches)), _) => {
                     hash_folds.add(1);
-                    batches
+                    masked(batches)?
                 }
                 (None, Some(plan)) => {
                     // The host's plan, its columns under this operator's names.
@@ -379,6 +415,9 @@ impl ExtensionPlanner for EinFoldPlanner {
         }
         if node.unique_domain() {
             exec = exec.requiring_unique_domain();
+        }
+        if let Some(c) = node.null_when() {
+            exec = exec.with_null_when(c);
         }
         Ok(Some(Arc::new(exec)))
     }

@@ -253,6 +253,10 @@ fn query(rng: &mut Rng, joined_back: bool) -> (String, Expect) {
                 eq(&format!("d.{col}"), "s.b", outer),
             ];
             let outer_keys = outer_keys.join(" AND ");
+            // The regroup's test: ddx's, or one of another column, which
+            // duplicate rows of d may disagree on.
+            let test = ["d2.v IS NULL", "d2.v < 0.0", "d2.v IS NULL OR d2.v > 2.0"][rng.below(3)];
+            let masked = format!("SUM(CASE WHEN {test} THEN NULL ELSE f.v END)");
             let (group, sum, d2, reads) = match look {
                 0 => ("d2.a, d2.b", "SUM(f.v * 2.0)", "d", "d.b"),
                 1 => ("d2.a, d2.b", "SUM(COALESCE(f.v, 1.0))", "d", "d.b"),
@@ -266,12 +270,7 @@ fn query(rng: &mut Rng, joined_back: bool) -> (String, Expect) {
                 4 => ("d2.b, d2.a", "SUM(f.v)", "d", "d.b"),
                 5 => ("d2.a, d2.b", "SUM(f.v)", "(SELECT a, b, v FROM d)", "d.b"),
                 10 => ("d2.a, d2.v", "SUM(f.v)", "d", "d.b"),
-                _ => (
-                    "d2.a, d2.b",
-                    "SUM(CASE WHEN d2.v IS NULL THEN NULL ELSE f.v END)",
-                    "d",
-                    "d.b",
-                ),
+                _ => ("d2.a, d2.b", masked.as_str(), "d", "d.b"),
             };
             let expect = match (look, inner, outer) {
                 (0..=3 | 10, _, _) | (_, true, false) => Expect::FoldOnly,
@@ -282,10 +281,16 @@ fn query(rng: &mut Rng, joined_back: bool) -> (String, Expect) {
                  GROUP BY {group}",
                 fold(&product, false)
             );
+            // The value as ddx reads it, masked by d's own row, or plainly;
+            // d.v is read either way, so that the test's column is d's.
+            let value = [
+                "CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 ELSE s.v END",
+                "s.v",
+                "COALESCE(s.v, 0.0)",
+            ][rng.below(3)];
             (
                 format!(
-                    "SELECT d.a, {reads}, CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 \
-                     ELSE s.v END AS v FROM d LEFT JOIN ({regroup}) s ON {outer_keys}"
+                    "SELECT d.a, {reads}, d.v AS w, {value} AS v FROM d LEFT JOIN ({regroup}) s ON {outer_keys}"
                 ),
                 expect,
             )
@@ -740,4 +745,34 @@ async fn fallbacks_hold_only_the_hosts_plan() {
     let mut inner = Vec::new();
     execs(fallback, &mut inner);
     assert!(inner.is_empty(), "the fallback runs einfold again");
+}
+
+/// A domain whose duplicate rows disagree on the regroup's test: the uniqueness
+/// check declines, and the host's plan gives every row of a group the same
+/// sum, which the node mustn't mask a second time (#60).
+#[tokio::test]
+async fn joined_back_tests_apply_once() {
+    let setup = [
+        "CREATE TABLE l (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,2.0),(1,0,3.0),(1,1,4.0)",
+        "CREATE TABLE r (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,10.0),(1,0,100.0),(1,1,1000.0)",
+        "CREATE TABLE d (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,NULL),(0,0,5.0),(1,1,7.0)",
+        "CREATE TABLE e (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,NULL),(0,1,5.0),(1,1,-7.0)",
+    ];
+    for (table, test) in [
+        ("d", "d2.v IS NULL"),
+        ("d", "d2.v > 6.0"),
+        ("e", "d2.v < 0.0"),
+    ] {
+        let sql = format!(
+            "SELECT d.a, d.b, d.v AS w, COALESCE(s.v, 0.0) AS v FROM {table} d LEFT JOIN ( \
+               SELECT d2.a AS a, d2.b AS b, SUM(CASE WHEN {test} THEN NULL ELSE f.v END) AS v \
+               FROM {table} d2 JOIN (SELECT l.a AS g0, r.b AS g1, SUM(l.v * r.v) AS v \
+                                     FROM l JOIN r ON l.b = r.a GROUP BY l.a, r.b) f \
+                 ON d2.a = f.g0 AND d2.b = f.g1 \
+               GROUP BY d2.a, d2.b) s \
+             ON d.a = s.a AND d.b = s.b"
+        );
+        // Table e's keys are unique, so there the dense path runs.
+        assert!(same_answer(&setup, &sql).await > 0, "{sql}");
+    }
 }

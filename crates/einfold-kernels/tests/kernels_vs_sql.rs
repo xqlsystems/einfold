@@ -31,7 +31,7 @@
 //! Half the cases are drawn from a *dense family*, shaped so that the dense
 //! algorithm may apply: non-negative integer keys with no NULLs in the
 //! operands, and every dimension either an output of one operand or summed
-//! and held by both. Some of them still take the hash path (duplicate key
+//! and held by both. Some of them still take the discrimination algorithm (duplicate key
 //! tuples, or holes in an operand beside NaN or ±inf), and the test checks
 //! that the dense path ran in a good share of them.
 //!

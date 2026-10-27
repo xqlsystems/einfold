@@ -75,18 +75,18 @@ enum Fallback {
     /// the host's own plan.
     #[default]
     HostPlan,
-    /// EinFold's hash algorithm.
-    Hash,
+    /// EinFold's discrimination algorithm.
+    Kernels,
 }
 
 impl DetectFolds {
-    /// The rule, but with nodes that run EinFold's hash algorithm where the
-    /// dense one doesn't apply, rather than the host's plan. Slower, and for
+    /// The rule, but with nodes that run EinFold's discrimination algorithm
+    /// where the dense one doesn't apply, rather than the host's plan. For
     /// tests: it makes every fold the rule describes run through einfold.
     #[must_use]
     pub fn without_fallback() -> Self {
         DetectFolds {
-            fallback: Fallback::Hash,
+            fallback: Fallback::Kernels,
         }
     }
 }
@@ -406,7 +406,7 @@ fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
     };
     let node = match fallback {
         Fallback::HostPlan => node.with_fallback(original),
-        Fallback::Hash => node.marked_found(),
+        Fallback::Kernels => node.marked_found(),
     }
     .into_plan();
     // Give the node the aggregate's schema: its names, qualifiers, types
@@ -621,7 +621,7 @@ fn from_domain(p: &Projection, fallback: Fallback) -> Result<Option<LogicalPlan>
     };
     let new = match fallback {
         Fallback::HostPlan => new.with_fallback(original.clone()),
-        Fallback::Hash => new.marked_found(),
+        Fallback::Kernels => new.marked_found(),
     }
     .into_plan();
     // Rename the node's columns to the join's, so `p` reads them as before.

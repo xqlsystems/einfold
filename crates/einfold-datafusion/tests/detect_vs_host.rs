@@ -345,7 +345,7 @@ fn host(threads: usize) -> SessionContext {
 }
 
 /// DataFusion with einfold. With `fallback` false, every fold the rule finds
-/// runs through einfold's kernels, the hash algorithm included, rather than
+/// runs through einfold's kernels, the discrimination algorithm included, rather than
 /// through the host's plan where the dense algorithm doesn't apply.
 fn einfold(threads: usize, fallback: bool) -> SessionContext {
     let config = SessionConfig::new().with_target_partitions(threads);

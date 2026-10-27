@@ -25,7 +25,7 @@ use arrow::error::ArrowError;
 
 mod algorithm;
 mod dense;
-mod hash;
+mod discriminate;
 mod keys;
 mod options;
 mod relation;

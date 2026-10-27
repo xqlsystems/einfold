@@ -36,14 +36,14 @@ use crate::HOST;
 /// reads every partition of each, and emits one partition, in batches of the
 /// session's batch size. It runs `einfold_kernels`' dense algorithm, on as
 /// many threads as the session's target partitions, when the keys and rows
-/// allow it, and the hash algorithm otherwise. Neither result depends on the
+/// allow it, and the discrimination algorithm otherwise. Neither result depends on the
 /// number of threads or on the order rows arrive in.
 ///
 /// Like DataFusion's own operators, it reserves the memory its inputs take
 /// from the session's memory pool, and fails if the pool can't give it; it
 /// runs the kernels on a blocking thread, off the async runtime; and its
 /// metrics, shown by `EXPLAIN ANALYZE`, count which algorithm ran
-/// (`dense_folds`, `hash_folds`), its compute time and its output rows.
+/// (`dense_folds`, `discrimination_folds`), its compute time and its output rows.
 ///
 /// Given the plan it replaced (see [`EinFoldExec::with_fallback`]), it runs
 /// that plan where the dense algorithm doesn't apply, and counts it in
@@ -57,7 +57,7 @@ use crate::HOST;
 pub struct EinFoldExec {
     fold: Fold,
     inputs: Vec<Arc<dyn ExecutionPlan>>,
-    /// The host's plan for the same rows, run instead of the hash algorithm.
+    /// The host's plan for the same rows, run instead of the discrimination algorithm.
     fallback: Option<Arc<dyn ExecutionPlan>>,
     /// Whether to run the fallback unless no two domain rows reach one group.
     domain_rows: DomainRows,
@@ -90,7 +90,7 @@ impl EinFoldExec {
     }
 
     /// This operator, running `plan` when the dense algorithm doesn't apply,
-    /// instead of the hash algorithm. `plan` must produce the operator's
+    /// instead of the discrimination algorithm. `plan` must produce the operator's
     /// columns, in order, under any names.
     pub fn with_fallback(mut self, plan: Arc<dyn ExecutionPlan>) -> Self {
         self.fallback = Some(plan);
@@ -293,7 +293,7 @@ impl ExecutionPlan for EinFoldExec {
         }
         let builder = || MetricBuilder::new(&self.metrics);
         let dense_folds = builder().global_counter("dense_folds");
-        let hash_folds = builder().global_counter("hash_folds");
+        let discrimination_folds = builder().global_counter("discrimination_folds");
         let host_plans = builder().global_counter("host_plans");
         let fallback = self.fallback.clone();
         let null_when = self.null_when;
@@ -382,7 +382,7 @@ impl ExecutionPlan for EinFoldExec {
                 (Some(Folded { algorithm, batches }), _) => {
                     match algorithm {
                         Algorithm::Dense => dense_folds.add(1),
-                        Algorithm::Hash => hash_folds.add(1),
+                        Algorithm::Discriminate => discrimination_folds.add(1),
                         // An algorithm added later, which no metric counts yet.
                         _ => {}
                     }

@@ -12,7 +12,7 @@ use einfold_ir::Fold;
 
 use crate::options::{DomainRows, Options};
 use crate::relation::Relation;
-use crate::{bad, dense, hash, Result};
+use crate::{bad, dense, discriminate, Result};
 
 /// Which algorithm computed a fold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -22,9 +22,10 @@ pub enum Algorithm {
     /// used as array indices. Work is split into fixed blocks chosen from the
     /// shape alone, so the bits don't depend on the number of threads.
     Dense,
-    /// Gustavson's row-by-row sparse product, generalized to folds: hash
-    /// tables keyed by the join's and the groups' keys. Any keys, any density.
-    Hash,
+    /// Gustavson's row-by-row sparse product, generalized to folds, over
+    /// keys ranked by discrimination, a radix sort of their bytes: no hashing
+    /// and no comparisons of keys. Any keys, any density.
+    Discriminate,
 }
 
 /// A fold's result, and the algorithm that computed it.
@@ -37,8 +38,8 @@ pub struct Folded {
 }
 
 /// [`fold`] by the dense algorithm alone, or `None` when its conditions don't
-/// hold, for a caller that would rather run something else than the hash
-/// algorithm.
+/// hold, for a caller that would rather run something else, such as the
+/// host's plan, than the discrimination algorithm.
 pub fn fold_dense(
     fold: &Fold,
     a: Relation,
@@ -63,7 +64,7 @@ pub fn fold_dense(
 /// `fold` over operands `a` and `b`, and its domain if it has one, as
 /// batches of `schema` (which [`schema`](crate::schema) gives): one batch per
 /// domain batch, or one in all without a domain. The dense algorithm runs
-/// when its conditions hold, and the hash one otherwise.
+/// when its conditions hold, and the discrimination one otherwise.
 ///
 /// The result's bits depend only on the inputs' rows, not on how they were
 /// batched or ordered, nor on the number of threads.
@@ -98,12 +99,12 @@ pub fn fold(
             batches,
         });
     }
-    // The hash algorithm reads each operand as one batch.
+    // The discrimination algorithm reads each operand as one batch.
     let whole = |r: Relation| compute::concat_batches(r.schema, r.batches);
     let (a, b) = (whole(a)?, whole(b)?);
-    let batches = hash::fold(fold, &a, &b, domain, schema, options.host)?;
+    let batches = discriminate::fold(fold, &a, &b, domain, schema, options.host, threads)?;
     Ok(Folded {
-        algorithm: Algorithm::Hash,
+        algorithm: Algorithm::Discriminate,
         batches,
     })
 }

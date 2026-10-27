@@ -22,12 +22,14 @@
 //!    of products and `u = 2⁻⁵³`. Any order of the additions is within half
 //!    that of the exact sum, and so is the host's.
 //! 3. **Deterministic.** The same rows, in another order and other batches,
-//!    give the same rows, bit for bit.
+//!    on another number of threads, give the same rows, bit for bit.
 //!
-//! Half the cases are drawn from a *dense family*, shaped so that a dense,
-//! positional algorithm may apply: non-negative integer keys with no NULLs in
-//! the operands, and every dimension either an output of one operand or
-//! summed and held by both.
+//! Half the cases are drawn from a *dense family*, shaped so that the dense
+//! algorithm may apply: non-negative integer keys with no NULLs in the
+//! operands, and every dimension either an output of one operand or summed
+//! and held by both. Some of them still take the hash path (duplicate key
+//! tuples, or holes in an operand beside NaN or ±inf), and the test checks
+//! that the dense path ran in a good share of them.
 //!
 //! Reproduce a failure with `EINFOLD_SEED=<seed printed>`; search longer with
 //! `EINFOLD_CASES=<n>` (and a starting `EINFOLD_SEED`).
@@ -48,7 +50,7 @@ use einfold_ir::{
     Aggregate, ColumnIndex, Dimension, DimensionId, Domain, Fold, KeyEquality, Operand, Output,
     RowValue,
 };
-use einfold_kernels::{FloatKeys, Host};
+use einfold_kernels::{Algorithm, FloatKeys, Host, Options};
 
 struct Rng(u64);
 
@@ -365,7 +367,7 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
     }
     let how = |rng: &mut Rng| match dense {
         true => Rows {
-            present: if rng.chance(0.5) { 1.0 } else { 0.75 },
+            present: if rng.chance(0.6) { 1.0 } else { 0.75 },
             duplicates: rng.chance(0.2),
             null_keys: false,
             specials: rng.chance(0.5),
@@ -407,7 +409,13 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
     };
     let domain = with_domain.then(|| Domain {
         carry: (0..outputs.len()).map(ColumnIndex).collect(),
-        missing: [Some(0.0), None, Some(2.5)][rng.below(3)],
+        // The dense family leans to 0.0, the default ddx's gradients use, and
+        // the one that lets the dense path ignore which groups exist.
+        missing: match rng.below(if dense { 5 } else { 3 }) {
+            0 => None,
+            1 => Some(2.5),
+            _ => Some(0.0),
+        },
     });
     let fold = Fold::try_new(
         dims.clone(),
@@ -610,8 +618,8 @@ const HOST: Host = Host {
 };
 
 /// The kernels' output, from the tables' rows in a random order and random
-/// batches.
-fn run_fold(case: &Case, rng: &mut Rng) -> Vec<RecordBatch> {
+/// batches, on a random number of threads, and which algorithm ran.
+fn run_fold(case: &Case, rng: &mut Rng) -> (Vec<RecordBatch>, Algorithm) {
     let batches = |t: &Table, rng: &mut Rng| -> Vec<RecordBatch> {
         t.partitions(rng).into_iter().flatten().collect()
     };
@@ -624,9 +632,13 @@ fn run_fold(case: &Case, rng: &mut Rng) -> Vec<RecordBatch> {
         case.domain.as_ref().map(|t| t.schema.as_ref()),
     )
     .unwrap();
-    let (_, out) =
-        einfold_kernels::fold(&case.fold, &a, &b, domain.as_deref(), schema, HOST).unwrap();
-    out
+    let options = Options {
+        host: HOST,
+        threads: 1 + rng.below(8),
+    };
+    let (algorithm, out) =
+        einfold_kernels::fold(&case.fold, &a, &b, domain.as_deref(), schema, options).unwrap();
+    (out, algorithm)
 }
 
 #[tokio::test]
@@ -640,6 +652,7 @@ async fn fold_matches_sql() {
         Err(_) if std::env::var("EINFOLD_SEED").is_ok() => 1,
         Err(_) => 400,
     };
+    let (mut dense_family, mut dense_ran) = (0, 0);
     for i in 0..cases {
         let seed = seed.wrapping_add(i);
         let mut rng = Rng::new(seed);
@@ -650,8 +663,10 @@ async fn fold_matches_sql() {
         let keys = case.fold.outputs().len();
         let fail = |what: String| panic!("seed {seed}: {what}\nSQL: {}", case.sql);
 
-        let ours = run_fold(&case, &mut rng);
-        let again = run_fold(&case, &mut rng);
+        let (ours, ran) = run_fold(&case, &mut rng);
+        let (again, _) = run_fold(&case, &mut rng);
+        dense_family += usize::from(dense);
+        dense_ran += usize::from(ran == Algorithm::Dense);
         let (ours, again) = (rows(&ours, keys), rows(&again, keys));
         // SQL doesn't order rows, so the outputs are compared as multisets.
         let bits = |r: &[Row]| -> Vec<(String, Option<u64>)> {
@@ -664,7 +679,7 @@ async fn fold_matches_sql() {
         };
         if bits(&ours) != bits(&again) {
             fail(format!(
-                "two arrival orders gave different outputs:\n{ours:?}\n{again:?}"
+                "two arrival orders and thread counts gave different outputs:\n{ours:?}\n{again:?}"
             ));
         }
 
@@ -688,5 +703,15 @@ async fn fold_matches_sql() {
                 fail(format!("row {o:?}, SQL's ({k}, {v:?}) within {bound:e}"));
             }
         }
+    }
+    eprintln!("dense path: {dense_ran} of {cases} cases; dense family: {dense_family}");
+    // About a third of the dense family qualifies (the rest has duplicate
+    // tuples, keys too large for BIGINT, or holes where existence matters);
+    // if far fewer did, the dense path would go untested.
+    if cases >= 100 {
+        assert!(
+            dense_ran * 4 >= dense_family,
+            "the dense path ran in only {dense_ran} of {dense_family} dense-family cases"
+        );
     }
 }

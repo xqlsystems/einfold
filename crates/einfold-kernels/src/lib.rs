@@ -28,6 +28,7 @@ use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use einfold_ir::{ColumnIndex, Fold};
 
+mod dense;
 mod hash;
 mod keys;
 
@@ -53,9 +54,22 @@ pub struct Host {
     pub float_keys: FloatKeys,
 }
 
+/// How to run a fold.
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    /// What the host decides.
+    pub host: Host,
+    /// The most threads to use. The result's bits don't depend on it.
+    pub threads: usize,
+}
+
 /// Which algorithm computed a fold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Algorithm {
+    /// By positions, with no hashing: keys are small non-negative integers,
+    /// used as array indices. Work is split into fixed blocks chosen from the
+    /// shape alone, so the bits don't depend on the number of threads.
+    Dense,
     /// Gustavson's row-by-row sparse product, generalized to folds: hash
     /// tables keyed by the join's and the groups' keys. Any keys, any density.
     Hash,
@@ -172,18 +186,23 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
 
 /// `fold` over operands `a` and `b`, and the batches of its domain if it has
 /// one, as batches of `schema` (which [`schema`] gives): one batch per domain
-/// batch, or one in all without a domain. Also says which algorithm ran.
+/// batch, or one in all without a domain. Also says which algorithm ran: the
+/// dense one when its conditions hold, and the hash one otherwise.
 ///
 /// The result's bits depend only on the inputs' rows, not on how they were
-/// batched or ordered.
+/// batched or ordered, nor on the number of threads.
 pub fn fold(
     fold: &Fold,
     a: &RecordBatch,
     b: &RecordBatch,
     domain: Option<&[RecordBatch]>,
     schema: SchemaRef,
-    host: Host,
+    options: Options,
 ) -> Result<(Algorithm, Vec<RecordBatch>)> {
-    let batches = hash::fold(fold, a, b, domain, schema, host)?;
+    let threads = options.threads.max(1);
+    if let Some(batches) = dense::fold(fold, a, b, domain, schema.clone(), threads)? {
+        return Ok((Algorithm::Dense, batches));
+    }
+    let batches = hash::fold(fold, a, b, domain, schema, options.host)?;
     Ok((Algorithm::Hash, batches))
 }

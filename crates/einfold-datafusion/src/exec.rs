@@ -198,7 +198,11 @@ impl ExecutionPlan for EinFoldExec {
         let hash_folds = builder().global_counter("hash_folds");
         let compute = builder().elapsed_compute(0);
         let output_rows = builder().output_rows(0);
-        let reservation = MemoryConsumer::new("EinFoldExec").register(context.memory_pool());
+        // Shared with the kernel's task, which holds the inputs it counts: a
+        // query cancelled while the kernel runs drops this future, but the
+        // task runs on, and its inputs stay counted until it ends.
+        let reservation =
+            Arc::new(MemoryConsumer::new("EinFoldExec").register(context.memory_pool()));
         let out = Arc::clone(&schema);
         let result = async move {
             // The operands are read whole; the domain, whose rows the output
@@ -214,8 +218,11 @@ impl ExecutionPlan for EinFoldExec {
             let b = concat(&schemas[1], batches.pop().unwrap(), &reservation)?;
             let a = concat(&schemas[0], batches.pop().unwrap(), &reservation)?;
             let timer = compute.timer();
+            let held = Arc::clone(&reservation);
             let (algorithm, batches) = SpawnedTask::spawn_blocking(move || {
-                einfold_kernels::fold(&fold, &a, &b, domain.as_deref(), out, options)
+                let folded = einfold_kernels::fold(&fold, &a, &b, domain.as_deref(), out, options);
+                drop(held);
+                folded
             })
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))??;

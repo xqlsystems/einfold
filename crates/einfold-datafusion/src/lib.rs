@@ -19,6 +19,7 @@
 //! that depends on a query engine.
 
 mod detect_folds;
+mod detect_pipelines;
 mod ein_fold_exec;
 mod fold_node;
 mod join_back;

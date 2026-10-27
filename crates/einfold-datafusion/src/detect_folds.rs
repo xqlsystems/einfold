@@ -49,10 +49,11 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use einfold_ir::{
-    Aggregate as FoldAggregate, ColumnIndex, Dimension, DimensionId, Domain, DomainKey, Fold, Key,
-    KeyEquality, Operand, Output, RowValue,
+    Aggregate as FoldAggregate, ColumnIndex, Comparison, Condition, Dimension, DimensionId, Domain,
+    DomainKey, Fold, Key, KeyEquality, Operand, Output, RowValue,
 };
 
+use crate::detect_pipelines;
 use crate::fold_node::FoldNode;
 use crate::join_back;
 
@@ -96,6 +97,32 @@ impl DetectFolds {
         DetectFolds {
             fallback: Fallback::HostPlan,
         }
+    }
+}
+
+impl DetectFolds {
+    /// `plan` with every fold pipeline and fold this rule finds replaced by
+    /// its node. Pipelines are found first, from the top down, since a
+    /// pipeline's producer is itself a fold, which the rule's bottom-up pass
+    /// would otherwise replace first. As an optimizer rule, [`DetectFolds`]
+    /// finds folds only.
+    pub fn detect(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        use datafusion::common::tree_node::TreeNode;
+        use datafusion::optimizer::OptimizerContext;
+        let plan = plan
+            .transform_down(|node| {
+                let found = match &node {
+                    LogicalPlan::Projection(p) => detect_pipelines::pipeline(p)?,
+                    _ => None,
+                };
+                Ok(match found {
+                    Some(rewritten) => Transformed::yes(rewritten),
+                    None => Transformed::no(node),
+                })
+            })?
+            .data;
+        let config = OptimizerContext::new();
+        Ok(plan.transform_up(|node| self.rewrite(node, &config))?.data)
     }
 }
 
@@ -253,9 +280,15 @@ fn widens(from: &DataType, to: &DataType) -> bool {
 
 /// The sum's argument, if `agg` computes exactly one plain `SUM`.
 pub(crate) fn sum_argument(agg: &Aggregate) -> Option<Expr> {
-    let [aggregate] = agg.aggr_expr.as_slice() else {
-        return None;
-    };
+    match agg.aggr_expr.len() {
+        1 => sum_argument_at(agg, 0),
+        _ => None,
+    }
+}
+
+/// The argument of `agg`'s aggregate `a`, if it is a plain `SUM`.
+pub(crate) fn sum_argument_at(agg: &Aggregate, a: usize) -> Option<Expr> {
+    let aggregate = agg.aggr_expr.get(a)?;
     let Expr::AggregateFunction(f) = aggregate.clone().unalias() else {
         return None;
     };
@@ -267,9 +300,49 @@ pub(crate) fn sum_argument(agg: &Aggregate) -> Option<Expr> {
     (function.is::<Sum>() && plain).then(|| p.args[0].clone())
 }
 
+/// A fold found in an aggregate: its description, and its operands' plans.
+pub(crate) struct Found {
+    pub(crate) fold: Fold,
+    pub(crate) operands: Vec<LogicalPlan>,
+}
+
 /// `agg` as a fold, if it is one: a [`FoldNode`] under a projection giving it
-/// `agg`'s schema.
+/// `agg`'s schema. A fold whose join has a condition, a mask, is left alone:
+/// the fold kernels don't compute masks yet.
 fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
+    let Some(Found {
+        fold: spec,
+        operands: plans,
+    }) = analyze(agg)?
+    else {
+        return Ok(None);
+    };
+    if !spec.conditions().is_empty() {
+        return Ok(None);
+    }
+    let original = LogicalPlan::Aggregate(agg.clone());
+    let names: Vec<String> = (0..agg.group_expr.len())
+        .map(|i| format!("{PREFIX}o{i}"))
+        .chain([format!("{PREFIX}v")])
+        .collect();
+    let Ok(node) = FoldNode::try_new(spec, plans, None, names.clone()) else {
+        return Ok(None);
+    };
+    let node = match fallback {
+        Fallback::HostPlan => node.with_fallback(original),
+        Fallback::Kernels => node.marked_found(),
+    }
+    .into_plan();
+    // Give the node the aggregate's schema: its names, qualifiers, types
+    // and nullability.
+    restore(node, &names, &agg.schema)
+}
+
+/// `agg` as a fold, if it is one: a `SUM` of a product of one factor from
+/// each side of an inner equi-join, grouped by columns, through projections.
+/// A condition of the join that compares two of the fold's dimensions, such
+/// as `q.t >= k.t`, becomes one of the fold's conditions; any other declines.
+pub(crate) fn analyze(agg: &Aggregate) -> Result<Option<Found>> {
     use datafusion::logical_expr::ExprSchemable;
     let Some(arg) = sum_argument(agg) else {
         return Ok(None);
@@ -291,7 +364,7 @@ fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
             _ => return Ok(None),
         }
     };
-    if join.join_type != JoinType::Inner || join.filter.is_some() || join.on.is_empty() {
+    if join.join_type != JoinType::Inner || join.on.is_empty() {
         return Ok(None);
     }
     let inputs = [join.left.schema().as_ref(), join.right.schema().as_ref()];
@@ -374,6 +447,16 @@ fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
             domain_key: None,
         });
     }
+    // The join's condition: comparisons between two of the dimensions.
+    let mut conditions = Vec::new();
+    if let Some(filter) = &join.filter {
+        for c in datafusion::logical_expr::utils::split_conjunction(filter) {
+            let Some(condition) = comparison(c, &columns, &keys, inputs) else {
+                return Ok(None);
+            };
+            conditions.push(condition);
+        }
+    }
     let mut operands = Vec::new();
     for (s, (input, factor)) in [(&join.left, lf), (&join.right, rf)]
         .into_iter()
@@ -393,9 +476,10 @@ fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
             LogicalPlan::Projection(Projection::try_new(exprs, Arc::clone(input))?),
         ));
     }
+    let operand_specs = operands.iter().map(|(o, _)| o.clone()).collect();
     let Ok(spec) = Fold::try_new(
         dimensions,
-        operands.iter().map(|(o, _)| o.clone()).collect(),
+        operand_specs,
         outputs,
         RowValue::Product,
         FoldAggregate::sum(),
@@ -403,23 +487,47 @@ fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
     ) else {
         return Ok(None);
     };
-    let plans = operands.into_iter().map(|(_, p)| p).collect();
-    let original = LogicalPlan::Aggregate(agg.clone());
-    let names: Vec<String> = (0..agg.group_expr.len())
-        .map(|i| format!("{PREFIX}o{i}"))
-        .chain([format!("{PREFIX}v")])
-        .collect();
-    let Ok(node) = FoldNode::try_new(spec, plans, None, names.clone()) else {
+    let Ok(spec) = spec.with_conditions(conditions) else {
         return Ok(None);
     };
-    let node = match fallback {
-        Fallback::HostPlan => node.with_fallback(original),
-        Fallback::Kernels => node.marked_found(),
-    }
-    .into_plan();
-    // Give the node the aggregate's schema: its names, qualifiers, types
-    // and nullability.
-    restore(node, &names, &agg.schema)
+    let operands = operands.into_iter().map(|(_, p)| p).collect();
+    Ok(Some(Found {
+        fold: spec,
+        operands,
+    }))
+}
+
+/// `e` as a condition between two of a fold's dimensions: `l <op> r` with
+/// `l` and `r` columns that an operand holds as keys (`columns` and `keys`,
+/// per side of the join), on different sides.
+fn comparison(
+    e: &Expr,
+    columns: &[Vec<Expr>; 2],
+    keys: &[Vec<Key>; 2],
+    inputs: [&DFSchema; 2],
+) -> Option<Condition> {
+    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = e else {
+        return None;
+    };
+    let comparison = match op {
+        Operator::Lt => Comparison::Less,
+        Operator::LtEq => Comparison::LessOrEqual,
+        Operator::Gt => Comparison::Greater,
+        Operator::GtEq => Comparison::GreaterOrEqual,
+        _ => return None,
+    };
+    let dimension = |e: &Expr| -> Option<(usize, DimensionId)> {
+        let s = side(e, inputs)?;
+        let c = columns[s].iter().position(|k| k == e)?;
+        let key = keys[s].iter().find(|k| k.column == ColumnIndex(c))?;
+        Some((s, key.dimension))
+    };
+    let ((ls, l), (rs, r)) = (dimension(left)?, dimension(right)?);
+    (ls != rs && l != r).then_some(Condition {
+        left: l,
+        comparison,
+        right: r,
+    })
 }
 
 /// `plan` with each [`FoldNode`] that keeps the plan it replaced swapped

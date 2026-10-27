@@ -12,7 +12,6 @@ use datafusion::common::Result;
 use datafusion::execution::context::QueryPlanner;
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
-use datafusion::optimizer::OptimizerContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use einfold_kernels::DomainRows;
@@ -99,17 +98,11 @@ impl QueryPlanner for EinFoldQueryPlanner {
         plan: &LogicalPlan,
         session: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        use datafusion::common::tree_node::TreeNode;
-        use datafusion::optimizer::OptimizerRule;
         let detected;
         let plan = match &self.detect {
             None => plan,
             Some(rule) => {
-                let config = OptimizerContext::new();
-                detected = plan
-                    .clone()
-                    .transform_up(|node| rule.rewrite(node, &config))?
-                    .data;
+                detected = rule.detect(plan.clone())?;
                 &detected
             }
         };

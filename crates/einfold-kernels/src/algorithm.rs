@@ -3,16 +3,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! [`fold`] and [`fold_dense`], which run a fold by the best algorithm that
-//! applies, and [`Algorithm`], which says which one ran.
+//! applies, [`Algorithm`], which says which one ran, and [`pipeline`], which
+//! runs a fold pipeline.
 
 use arrow::compute;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use einfold_ir::Fold;
+use einfold_ir::{Fold, Pipeline};
 
+use crate::fused::Piped;
 use crate::options::{DomainRows, Options};
 use crate::relation::Relation;
-use crate::{bad, dense, discriminate, Result};
+use crate::{bad, dense, discriminate, fused, Result};
 
 /// Which algorithm computed a fold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -112,4 +114,25 @@ pub fn fold(
         algorithm: Algorithm::Discriminate,
         batches,
     })
+}
+
+/// `pipeline` over its producer's operands `q` and `k` and its values `v`, as
+/// batches of `schema` (which [`pipeline_schema`](crate::pipeline_schema)
+/// gives), by the fused algorithm: tile by tile, without the producer's
+/// results ever existing in full. `None` when the algorithm's requirements
+/// don't hold: every input complete, with one row and a non-NULL factor at
+/// every position of its dimensions, keys small non-negative integers, and
+/// at most one condition, between the producer's two outputs. The caller
+/// then runs something else, such as the host's plan.
+///
+/// The result's bits depend only on the inputs' rows, not on how they were
+/// batched or ordered, nor on the number of threads.
+pub fn pipeline(
+    pipeline: &Pipeline,
+    [q, k, v]: [Relation; 3],
+    schema: SchemaRef,
+    options: Options,
+) -> Result<Option<Piped>> {
+    let threads = options.threads.max(1);
+    fused::pipeline(pipeline, [q.batches, k.batches, v.batches], schema, threads)
 }

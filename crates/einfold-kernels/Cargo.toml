@@ -17,6 +17,9 @@ rust-version.workspace = true
 # without a copy. No query engine.
 arrow = { workspace = true }
 einfold-ir = { workspace = true }
+# Matrix products for the fused pipeline's tiles: ndarray's safe interface
+# to matrixmultiply, which picks AVX2 and FMA kernels at run time.
+ndarray = { version = "0.16", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # The property test checks the kernels against SQL that DataFusion runs.

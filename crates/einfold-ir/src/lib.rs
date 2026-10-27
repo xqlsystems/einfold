@@ -6,3 +6,10 @@
 //!
 //! Nothing in this crate depends on a query engine, so every engine
 //! integration can share it.
+
+pub mod fold;
+
+pub use fold::{
+    Aggregate, ColumnIndex, Dimension, DimensionId, Domain, Finish, Fold, InvalidFold, KeyEquality,
+    Monoid, Operand, Output, RowValue,
+};

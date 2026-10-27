@@ -164,6 +164,9 @@ fn case(seed: u64) -> Case {
         fallible: values == Values::Exact && rng.chance(0.25) && !avoids(Known::FallibleFactors),
         exact: values == Values::Exact,
         regroup_value_only: avoids(Known::JoinedBackReappliesCase),
+        // A key of one type joined to one of another is cast, and a cast
+        // can fail on rows the join drops, as factors do.
+        cross_key: ti == tk || !avoids(Known::FallibleFactors),
         limit: !([ti, tj, tk].into_iter().any(float) && avoids(Known::TopKSignedZeros)),
     };
     // Sometimes r's J column is narrower than l's, so the join casts it.
@@ -540,13 +543,28 @@ async fn within_bound(
             m.len()
         ));
     }
-    for (((g, w), n), m) in g.iter().zip(&w).zip(&n).zip(&m) {
+    // Rows can share keys and differ in value, so the twins' rows can't be
+    // paired one by one: each key's bound uses the largest count and
+    // magnitude among its rows.
+    let mut most: std::collections::HashMap<(&[String], usize), (f64, f64)> =
+        std::collections::HashMap::new();
+    for (n, m) in n.iter().zip(&m) {
+        for i in 0..n.values.len() {
+            let e = most.entry((n.keys.as_slice(), i)).or_default();
+            e.0 = e.0.max(n.values[i].unwrap_or(0.0).abs());
+            let e = most.entry((m.keys.as_slice(), i)).or_default();
+            e.1 = e.1.max(m.values[i].unwrap_or(0.0).abs());
+        }
+    }
+    for (g, w) in g.iter().zip(&w) {
         if g.keys != w.keys {
             return Err(format!("row {g:?}, the host's {w:?}"));
         }
         for (i, (&x, &y)) in g.values.iter().zip(&w.values).enumerate() {
-            let count = n.values[i].unwrap_or(0.0).abs();
-            let mag = m.values[i].unwrap_or(0.0).abs();
+            let (count, mag) = most
+                .get(&(g.keys.as_slice(), i))
+                .copied()
+                .unwrap_or_default();
             let bound = 2.0 * (count - 1.0).max(0.0) * (f64::EPSILON / 2.0) * mag;
             if !check::agree(x, y, bound) {
                 return Err(format!(

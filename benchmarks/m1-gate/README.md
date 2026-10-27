@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # M1's gate
 
-einfold's milestone M1 (design §16) is gated on ddx's `matmul` gradient program, end to end, at n = 50,000: einfold on must be at least 4× faster than einfold off, on the same DataFusion. ddx is an XQL Systems project for automatic differentiation of SQL queries. This benchmark builds the program as ddx's own benchmark does (`crates/ddx-datafusion/tests/ad_perf.rs`), for `SUM(tanh(a·w)²)` with `a` of `n × 16` and `w` of `16 × 8`. It runs the program with einfold off and on (`einfold_datafusion::install`), and checks that both give the same gradients.
+einfold's milestone M1 (design §16) is gated on ddx's `matmul` gradient program, end to end, at n = 50,000: einfold on must be at least 4× faster than einfold off, on the same DataFusion. ddx is an XQL Systems project for automatic differentiation of SQL queries. This benchmark builds the program as ddx's own benchmark does (`crates/ddx-datafusion/tests/ad_perf.rs`), for `SUM(tanh(a·w)²)` with `a` of `n × 16` and `w` of `16 × 8`. It runs the program with einfold off and on (`einfold_datafusion::install`). It checks that both give the same gradients, within how far two correct evaluations can differ when each adds its sums in its own order, and that einfold's gradients are the same bits on one thread as on every thread.
 
 It is a crate of its own, not a member of einfold's workspace, so that einfold doesn't depend on ddx. It runs on Tokio's multi-threaded runtime, as a host does; ddx's `ad_perf` runs on the single-threaded one, where DataFusion gets one core. JAX on CPU uses every core too: on the same machine, `jax.jit(jax.grad(…))` of this loss takes 1.6 ms.
 
@@ -26,7 +26,11 @@ Run with `cargo run --release [n …]`, with `protoc` on the `PATH` or in `PROTO
 | `grad_1_w` (W̄) | 33.1 | 14.2 |
 | **whole program** | **368.9** | **89.8** |
 
-**4.0–4.1× at n = 50,000 over five runs, so M1's gate, 4×, is passed, just.** At n = 10,000 it's 2.5–2.6× (75 ms against 30). The gradients agree to a relative 1e-12.
+**4.0–4.1× at n = 50,000 over five runs, so M1's gate, 4×, is passed, just.** At n = 10,000 it's 2.5–2.6× (75 ms against 30).
+
+**Since the fixes for #60–#62, 3.9–4.0×** (360–362 ms against 91.2–91.8, three runs), about 2 ms slower with einfold on: the joined-back steps now compute the regroup's test as a column of the domain (#60), and detection checks that each moved expression can't fail (#61). That is within noise of the gate, but leaves no margin.
+
+The gradients agree within their derived bounds (`bounds` in `src/main.rs`), and einfold's are the same bits on 1 thread as on 12.
 
 einfold finds each gradient step whole: ddx's transposed contraction, joined back to the table, grouped again by the table's keys, and left-joined from it. It runs the step as the contraction with the table as its domain, checking as it runs that the table's keys are unique. That took Ā from 246 ms to 14.
 

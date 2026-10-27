@@ -19,8 +19,13 @@
 //!
 //! Each case runs the query on plain DataFusion (the *host*) and on
 //! DataFusion with einfold, on different numbers of partitions and batch
-//! sizes, and checks:
+//! sizes, with the same session settings, drawn per case: sort-merge rather
+//! than hash joins, no repartitioning, no dynamic filters, and sometimes a
+//! small memory pool. It checks:
 //!
+//! - **`[host-settings]`** DataFusion's own answer doesn't depend on those
+//!   settings. Where it does, that's DataFusion's bug, and einfold can't
+//!   match both answers.
 //! - **`[error]`** einfold succeeds wherever the host does. A query the host
 //!   can answer is one einfold must answer too: moving an expression below a
 //!   join must not make it fail on rows the join drops.
@@ -45,6 +50,14 @@
 //!   einfold's own kernels (`DetectFolds::without_fallback`), so the hash
 //!   algorithm is checked on the plans detection finds, not only the dense
 //!   one and the host's.
+//!
+//! - **`[stall]`** (soak only) no case runs longer than
+//!   `EINFOLD_SOAK_STALL_SECS` (default 120): a watchdog reports a hang as a
+//!   failure of its seed, then ends the soak.
+//!
+//! Under a small memory pool, either side may run out of memory where the
+//! other doesn't, by its operators' peaks. Those cases are tallied rather
+//! than failed: `EinFoldExec` holds its inputs and can't spill.
 //!
 //! Tallies of which shapes fired and which algorithm ran are asserted on
 //! long enough runs, so a generator that drifted into shapes detection never
@@ -105,9 +118,24 @@ enum Known {
     /// child of the plan, and `JoinSelection` can't swap a join that already
     /// has dynamic filters: that planning error isn't reported (einfold#66).
     FallbackOptimizedTwice,
+    /// DataFusion's sort-merge join on a float key and another key drops
+    /// matches when a side holds both `-0.0` and `0.0`: no sort-merge joins
+    /// over float keys (einfold#67, upstream).
+    SortMergeSignedZeros,
+    /// DataFusion 55.2's sort-merge join keeps its filter's column indices
+    /// when a projection is pushed into it, so a join with a filter beyond
+    /// its equalities can drop rows or fail on a column's type
+    /// (apache/datafusion#24414, fixed after 55.2): no sort-merge joins with
+    /// a join filter.
+    SortMergeFilterProjection,
 }
 
-const KNOWN: &[Known] = &[Known::TopKSignedZeros, Known::FallbackOptimizedTwice];
+const KNOWN: &[Known] = &[
+    Known::TopKSignedZeros,
+    Known::FallbackOptimizedTwice,
+    Known::SortMergeSignedZeros,
+    Known::SortMergeFilterProjection,
+];
 
 /// Whether the simulation steps around `bug`.
 fn avoids(bug: Known) -> bool {
@@ -128,6 +156,7 @@ struct Case {
     threads: [usize; 3],
     batch_sizes: [usize; 3],
     fallback: bool,
+    settings: check::Settings,
 }
 
 fn case(seed: u64) -> Case {
@@ -148,10 +177,11 @@ fn case(seed: u64) -> Case {
     };
     let (ti, tj, tk) = (ty(&mut rng), ty(&mut rng), ty(&mut rng));
     let float = |t: KeyType| matches!(t, KeyType::Float64 | KeyType::DictFloat64);
+    let floats = [ti, tj, tk].into_iter().any(float);
     let options = Options {
         fallible: values == Values::Exact && rng.chance(0.25),
         exact: values == Values::Exact,
-        limit: !([ti, tj, tk].into_iter().any(float) && avoids(Known::TopKSignedZeros)),
+        limit: !(floats && avoids(Known::TopKSignedZeros)),
     };
     // Sometimes r's J column is narrower than l's, so the join casts it.
     let tj_r = match tj {
@@ -189,6 +219,7 @@ fn case(seed: u64) -> Case {
         ]
     });
     let query = queries::query(&mut rng, options);
+    let join_filter = query.join_filter;
     let threads = [1 + rng.below(6), 1 + rng.below(6), 1 + rng.below(6)];
     let batch_sizes = [*rng.pick(&[1, 3, 8192]), *rng.pick(&[1, 3, 8192]), 8192];
     Case {
@@ -200,6 +231,16 @@ fn case(seed: u64) -> Case {
         threads,
         batch_sizes,
         fallback: rng.chance(0.8),
+        settings: check::Settings {
+            sort_merge: rng.chance(0.2)
+                && !(floats && avoids(Known::SortMergeSignedZeros))
+                && !(join_filter && avoids(Known::SortMergeFilterProjection)),
+            no_repartition: rng.chance(0.15),
+            no_dynamic_filters: rng.chance(0.15),
+            pool: rng
+                .chance(0.15)
+                .then(|| *rng.pick(&[8 << 10, 32 << 10, 256 << 10])),
+        },
     }
 }
 
@@ -225,6 +266,20 @@ fn twin(t: &Table, f: impl Fn(f64) -> f64) -> Table {
     }
 }
 
+/// Whether an error says a memory pool was exhausted.
+fn out_of_memory(e: &str) -> bool {
+    e.contains("Resources exhausted") || e.contains("Not enough memory")
+}
+
+/// Which side alone ran out of memory under a small pool, if one did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Memory {
+    #[default]
+    Neither,
+    EinfoldOnly,
+    HostOnly,
+}
+
 /// What one case found.
 #[derive(Default)]
 struct Outcome {
@@ -235,6 +290,8 @@ struct Outcome {
     host_rerun_failed: bool,
     deterministic: bool,
     look_alike: bool,
+    memory: Memory,
+    pooled: bool,
 }
 
 /// The tallies of a run.
@@ -246,6 +303,10 @@ struct Tally {
     host_rerun_failed: usize,
     /// Cases built as something detection must leave alone at the top.
     look_alikes: usize,
+    /// Cases with a small memory pool, and those where only einfold, or
+    /// only the host, ran out of memory.
+    pooled: usize,
+    out_of_memory: [usize; 2],
     /// Per shape: cases, cases where einfold ran a fold, and the routes.
     by_shape: BTreeMap<String, [usize; 6]>,
     deterministic: usize,
@@ -258,6 +319,9 @@ impl Tally {
         self.host_failed += usize::from(o.host_failed);
         self.host_rerun_failed += usize::from(o.host_rerun_failed);
         self.look_alikes += usize::from(o.look_alike);
+        self.pooled += usize::from(o.pooled);
+        self.out_of_memory[0] += usize::from(o.memory == Memory::EinfoldOnly);
+        self.out_of_memory[1] += usize::from(o.memory == Memory::HostOnly);
         self.deterministic += usize::from(o.deterministic);
         let s = self
             .by_shape
@@ -280,6 +344,11 @@ impl Tally {
         let mut s = format!(
             "cases={} failures={} host_failed={} host_rerun_failed={} deterministic={} look_alikes={}",
             self.cases, self.failures, self.host_failed, self.host_rerun_failed, self.deterministic, self.look_alikes
+        );
+        let _ = write!(
+            s,
+            "\n  memory pools: {} cases; out of memory in einfold only {}, in the host only {}",
+            self.pooled, self.out_of_memory[0], self.out_of_memory[1]
         );
         for (shape, [n, fired, dense, hash, host, domains]) in &self.by_shape {
             let _ = write!(
@@ -307,8 +376,8 @@ fn register(ctx: &SessionContext, tables: &[Table]) {
 /// A failure report: the tag, what differed, and how to replay it.
 fn report(case: &Case, tag: &str, what: &str, ours: Option<&check::Ran>) -> String {
     let mut s = format!(
-        "[{tag}] {what}\n  shape={:?} values={:?} fallback={} threads={:?} batch_sizes={:?}\n  SQL: {}\n",
-        case.query.shape, case.values, case.fallback, case.threads, case.batch_sizes, case.query.sql
+        "[{tag}] {what}\n  shape={:?} values={:?} fallback={} threads={:?} batch_sizes={:?}\n  settings={:?}\n  SQL: {}\n",
+        case.query.shape, case.values, case.fallback, case.threads, case.batch_sizes, case.settings, case.query.sql
     );
     for t in &case.tables {
         s += &t.dump();
@@ -361,11 +430,17 @@ async fn run_case(case: &Case) -> Outcome {
     let mut out = Outcome {
         shape: Some(case.query.shape),
         look_alike: case.query.look_alike,
+        pooled: case.settings.pool.is_some(),
         ..Outcome::default()
     };
     let sql = &case.query.sql;
-    let host = check::session(case.threads[0], None, case.batch_sizes[0]);
-    let ours = check::session(case.threads[1], Some(case.fallback), case.batch_sizes[1]);
+    let host = check::session(case.threads[0], None, case.batch_sizes[0], case.settings);
+    let ours = check::session(
+        case.threads[1],
+        Some(case.fallback),
+        case.batch_sizes[1],
+        case.settings,
+    );
     register(&host, &case.tables);
     register(&ours, &case.tables);
     let theirs = check::run(&host, sql).await;
@@ -374,8 +449,38 @@ async fn run_case(case: &Case) -> Outcome {
     let mut fail = |tag: &str, what: String, ran: Option<&check::Ran>| {
         out.failures.push(report(case, tag, &what, ran));
     };
+    // The host itself under default settings: where its answer depends on the
+    // settings, that's DataFusion's bug, and einfold can't match both.
+    if case.values == Values::Exact && case.settings.pool.is_none() {
+        let default = check::session(case.threads[0], None, 8192, check::Settings::default());
+        register(&default, &case.tables);
+        if let (Ok(a), Ok(b)) = (&theirs.result, &check::run(&default, sql).await.result) {
+            let (a, b) = (check::exact(a), check::exact(b));
+            if a != b {
+                fail(
+                    "host-settings",
+                    format!(
+                        "DataFusion's own answer depends on the settings: {}",
+                        diff(&a, &b)
+                    ),
+                    None,
+                );
+                return out;
+            }
+        }
+    }
     let (want, got) = match (&theirs.result, &mine.result) {
         (Ok(w), Ok(g)) => (w, g),
+        // Under a small memory pool, either side may run out where the other
+        // doesn't, by its operators' peaks: tallied, not failed.
+        (Ok(_), Err(e)) if out_of_memory(e) => {
+            out.memory = Memory::EinfoldOnly;
+            return out;
+        }
+        (Err(e), Ok(_)) if out_of_memory(e) => {
+            out.memory = Memory::HostOnly;
+            return out;
+        }
         (Ok(_), Err(e))
             if avoids(Known::FallbackOptimizedTwice)
                 && e.contains("Cannot swap HashJoinExec inputs after dynamic filters") =>
@@ -449,7 +554,7 @@ async fn run_case(case: &Case) -> Outcome {
                     Some(&mine),
                 );
             }
-            Some(Err(e)) => fail(
+            Some(Err(e)) if !out_of_memory(&e) => fail(
                 "rerun",
                 format!("running the reset plan again failed: {e}"),
                 Some(&mine),
@@ -458,7 +563,12 @@ async fn run_case(case: &Case) -> Outcome {
         }
     }
     if out.deterministic {
-        let other = check::session(case.threads[2], Some(case.fallback), case.batch_sizes[2]);
+        let other = check::session(
+            case.threads[2],
+            Some(case.fallback),
+            case.batch_sizes[2],
+            case.settings,
+        );
         register(&other, &case.tables);
         if let Ok(b) = check::run(&other, sql).await.result {
             if check::exact(&b) != check::exact(got) {
@@ -472,10 +582,16 @@ async fn run_case(case: &Case) -> Outcome {
     }
     // Every fold through einfold's kernels, the hash algorithm included.
     if case.fallback && r.folds > 0 && case.seed.is_multiple_of(3) {
-        let hash = check::session(case.threads[2], Some(false), case.batch_sizes[2]);
+        let hash = check::session(
+            case.threads[2],
+            Some(false),
+            case.batch_sizes[2],
+            case.settings,
+        );
         register(&hash, &case.tables);
         let ran = check::run(&hash, sql).await;
         match &ran.result {
+            Err(e) if out_of_memory(e) => {}
             Err(e) => fail(
                 "hash",
                 format!("failed where the host succeeded: {e}"),
@@ -505,7 +621,7 @@ async fn within_bound(
 ) -> Result<(), String> {
     let [ones, mags] = case.twins.as_ref().expect("an inexact case has twins");
     let aside = |tables: &[Table]| {
-        let ctx = check::session(1, None, 8192);
+        let ctx = check::session(1, None, 8192, check::Settings::default());
         register(&ctx, tables);
         ctx
     };
@@ -555,6 +671,14 @@ async fn within_bound(
                 .copied()
                 .unwrap_or_default();
             let bound = 2.0 * (count - 1.0).max(0.0) * (f64::EPSILON / 2.0) * mag;
+            // With an infinite or NaN magnitude, a term is non-finite, and an
+            // inexact sum it multiplies can be 0 in one order of additions
+            // and not in another: 0·∞ is NaN, while x·∞ is ±∞. The bound
+            // then promises only that both results are non-finite.
+            let non_finite = |v: Option<f64>| v.is_some_and(|v| !v.is_finite());
+            if !mag.is_finite() && non_finite(x) && non_finite(y) {
+                continue;
+            }
             if !check::agree(x, y, bound) {
                 return Err(format!(
                     "row {:?}: einfold {x:?}, the host {y:?}, beyond {bound:e} ({count} terms of magnitude {mag:e})",
@@ -685,8 +809,36 @@ fn soak() {
         "REPRO EINFOLD_SEED={seed} cargo test -p einfold-datafusion --test simulation \
          --release -- --nocapture simulation",
     );
+    // A watchdog: a case that runs for more than `EINFOLD_SOAK_STALL_SECS`
+    // (default 120) is a hang, reported as a failure of its seed before the
+    // soak exits, since the stuck case can't be abandoned.
+    let stall = env_u64("EINFOLD_SOAK_STALL_SECS").unwrap_or(120);
+    let running = Arc::new(std::sync::Mutex::new((u64::MAX, Instant::now())));
+    {
+        let running = Arc::clone(&running);
+        let log_path = log_path.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let (seed, since) = *running.lock().expect("the watchdog's lock");
+            if seed != u64::MAX && since.elapsed().as_secs() > stall {
+                let line = format!(
+                    "FAILURE (seed={seed}, base={base}):\n[stall] the case ran for more than {stall} s; \
+                     replay: EINFOLD_SEED={seed} cargo test -p einfold-datafusion --test simulation \
+                     --release -- --nocapture simulation\n"
+                );
+                eprintln!("{line}");
+                if let Some(p) = &log_path {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(p) {
+                        let _ = writeln!(f, "{line}");
+                    }
+                }
+                std::process::exit(1);
+            }
+        });
+    }
     while start.elapsed().as_secs() < budget {
         let seed = base.wrapping_add(iters);
+        *running.lock().expect("the watchdog's lock") = (seed, Instant::now());
         let o = rt.block_on(run_case(&case(seed)));
         tally.add(&o);
         for f in &o.failures {

@@ -9,32 +9,76 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, ArrayRef, Float64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::arrow::util::display;
+use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use einfold_datafusion::{DetectFolds, EinFoldQueryPlanner};
 
-/// A session on `threads` partitions: plain DataFusion, or with einfold
-/// installed; with `fallback` false, every fold einfold finds runs through
-/// its own kernels, the hash algorithm included.
-pub fn session(threads: usize, einfold: Option<bool>, batch_size: usize) -> SessionContext {
+/// Session settings a case varies, the same for the host and einfold: how
+/// DataFusion plans joins and aggregates, and how much memory it may use.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Settings {
+    /// Sort-merge joins rather than hash joins.
+    pub sort_merge: bool,
+    /// No repartitioning of joins and aggregates.
+    pub no_repartition: bool,
+    /// No dynamic filters pushed from joins and TopK into scans.
+    pub no_dynamic_filters: bool,
+    /// A memory pool of this many bytes, which DataFusion's own operators
+    /// can spill from, rather than an unbounded one.
+    pub pool: Option<usize>,
+}
+
+/// A session on `threads` partitions with `settings`: plain DataFusion, or
+/// with einfold installed; with `fallback` false, every fold einfold finds
+/// runs through its own kernels, the hash algorithm included.
+pub fn session(
+    threads: usize,
+    einfold: Option<bool>,
+    batch_size: usize,
+    settings: Settings,
+) -> SessionContext {
     let config = SessionConfig::new()
         .with_target_partitions(threads)
-        .with_batch_size(batch_size);
-    let Some(fallback) = einfold else {
-        return SessionContext::new_with_config(config);
-    };
-    let rule = match fallback {
-        true => DetectFolds::default(),
-        false => DetectFolds::without_fallback(),
-    };
-    let state = SessionStateBuilder::new()
+        .with_batch_size(batch_size)
+        .set_bool(
+            "datafusion.optimizer.prefer_hash_join",
+            !settings.sort_merge,
+        )
+        .set_bool(
+            "datafusion.optimizer.repartition_joins",
+            !settings.no_repartition,
+        )
+        .set_bool(
+            "datafusion.optimizer.repartition_aggregations",
+            !settings.no_repartition,
+        )
+        .set_bool(
+            "datafusion.optimizer.enable_dynamic_filter_pushdown",
+            !settings.no_dynamic_filters,
+        );
+    let mut runtime = RuntimeEnvBuilder::new();
+    if let Some(bytes) = settings.pool {
+        runtime = runtime.with_memory_pool(Arc::new(FairSpillPool::new(bytes)));
+    }
+    let builder = SessionStateBuilder::new()
         .with_default_features()
         .with_config(config)
-        .with_query_planner(Arc::new(EinFoldQueryPlanner::detecting(rule)))
-        .build();
-    SessionContext::new_with_state(state)
+        .with_runtime_env(runtime.build_arc().expect("a runtime"));
+    let builder = match einfold {
+        None => builder,
+        Some(fallback) => {
+            let rule = match fallback {
+                true => DetectFolds::default(),
+                false => DetectFolds::without_fallback(),
+            };
+            builder.with_query_planner(Arc::new(EinFoldQueryPlanner::detecting(rule)))
+        }
+    };
+    SessionContext::new_with_state(builder.build())
 }
 
 /// What running a query gave.

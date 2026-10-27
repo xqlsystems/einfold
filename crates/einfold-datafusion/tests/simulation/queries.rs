@@ -261,6 +261,9 @@ pub struct Query {
     /// Whether the generator built something detection must leave alone at
     /// its outermost fold. Only for tallies: detection may decline more.
     pub look_alike: bool,
+    /// Whether some join has a condition beyond equalities, as a mask's
+    /// `l.a >= r.b`: DataFusion keeps it as the join's filter.
+    pub join_filter: bool,
 }
 
 pub fn query(rng: &mut Rng, options: Options) -> Query {
@@ -319,10 +322,13 @@ pub fn query(rng: &mut Rng, options: Options) -> Query {
     if options.limit && shape != Shape::Fold && rng.chance(0.08) {
         sql = format!("SELECT * FROM ({sql}) q ORDER BY 1, 2, 3 LIMIT 5");
     }
+    // The mask (`l.a >= r.b`) is the only inequality the generator writes.
+    let join_filter = sql.contains(" >= ");
     Query {
         sql,
         shape,
         look_alike,
+        join_filter,
     }
 }
 

@@ -21,6 +21,14 @@
 //! **TopK over signed zeros** (einfold issue #63). `ORDER BY … LIMIT` over a
 //! float column holding `-0.0` and `0.0` gives answers that depend on
 //! partitions, batch sizes and timing.
+//!
+//! **Sort-merge joins over signed zeros** (einfold issue #67). A sort-merge
+//! join on a float key and another key can drop a match when one side holds
+//! both `-0.0` and `0.0`.
+//!
+//! **Sort-merge join filters** (apache/datafusion#24414, fixed after 55.2).
+//! A sort-merge join's filter can read the wrong columns once a projection is
+//! pushed into the join.
 
 use std::sync::Arc;
 
@@ -262,4 +270,61 @@ async fn top_k_over_signed_zeros_depends_on_timing() {
     let right: Vec<(u64, i64)> = [0, 0, 1, 2, 3].map(|i| ((-0.0f64).to_bits(), i)).to_vec();
     assert!(answers.contains(&right));
     assert!(answers.len() > 1, "fixed: one answer, {answers:?}");
+}
+
+/// Issue #67. A sort-merge join on a `DOUBLE` key and a second key
+/// drops a match when one side holds both `-0.0` and `0.0`: the sort orders
+/// `-0.0` first, while the merge compares with `=`, under which they are
+/// equal, so it decides by the second key and passes the match. `d`'s row
+/// `(0.0, 0)` matches `e`'s; the hash join finds it. Fails once fixed.
+#[tokio::test]
+async fn sort_merge_join_over_signed_zeros_drops_a_match() {
+    use datafusion::prelude::SessionConfig;
+    let mut found = Vec::new();
+    for hash in [true, false] {
+        let config = SessionConfig::new()
+            .with_target_partitions(4)
+            .set_bool("datafusion.optimizer.prefer_hash_join", hash);
+        let ctx = SessionContext::new_with_config(config);
+        run(
+            &ctx,
+            "CREATE TABLE d (a DOUBLE, b BIGINT) AS VALUES (0.0, 0), (-0.0, 1)",
+        )
+        .await;
+        run(
+            &ctx,
+            "CREATE TABLE e (a DOUBLE, b BIGINT) AS VALUES (0.0, 0)",
+        )
+        .await;
+        let sql = "SELECT d.a, d.b FROM d JOIN e ON d.a = e.a AND d.b = e.b";
+        found.push(count(&ctx, sql).await);
+    }
+    assert_eq!(
+        found,
+        [1, 0],
+        "wrong: the sort-merge join should find 1 row"
+    );
+}
+
+/// apache/datafusion#24414, fixed on DataFusion's main after 55.2. A
+/// sort-merge join with a filter beyond its equalities keeps the filter's
+/// column indices when a projection is pushed into it, so the filter reads
+/// the wrong columns: here it drops the one row that joins. Upstream's own
+/// reproduction. Fails once fixed.
+#[tokio::test]
+async fn sort_merge_join_filter_reads_stale_columns() {
+    use datafusion::prelude::SessionConfig;
+    let config = SessionConfig::new()
+        .with_target_partitions(2)
+        .set_bool("datafusion.optimizer.prefer_hash_join", false)
+        .set_bool("datafusion.optimizer.repartition_joins", true);
+    let ctx = SessionContext::new_with_config(config);
+    let sql = "SELECT t1.column2 AS left_b1, t2.column2 AS right_b1 \
+               FROM (VALUES (100, 1, 0)) t1 JOIN (VALUES (10, 1)) t2 \
+               ON t1.column2 = t2.column2 AND t1.column1 > t2.column1";
+    assert_eq!(
+        count(&ctx, sql).await,
+        0,
+        "fixed: the right answer is 1 row"
+    );
 }

@@ -101,9 +101,13 @@ enum Known {
     /// … LIMIT` over float keys depends on timing: no `LIMIT` over them
     /// (einfold#63, upstream).
     TopKSignedZeros,
+    /// `EinFoldExec`'s fallback is optimized when planned, then again as a
+    /// child of the plan, and `JoinSelection` can't swap a join that already
+    /// has dynamic filters: that planning error isn't reported (einfold#66).
+    FallbackOptimizedTwice,
 }
 
-const KNOWN: &[Known] = &[Known::TopKSignedZeros];
+const KNOWN: &[Known] = &[Known::TopKSignedZeros, Known::FallbackOptimizedTwice];
 
 /// Whether the simulation steps around `bug`.
 fn avoids(bug: Known) -> bool {
@@ -372,6 +376,12 @@ async fn run_case(case: &Case) -> Outcome {
     };
     let (want, got) = match (&theirs.result, &mine.result) {
         (Ok(w), Ok(g)) => (w, g),
+        (Ok(_), Err(e))
+            if avoids(Known::FallbackOptimizedTwice)
+                && e.contains("Cannot swap HashJoinExec inputs after dynamic filters") =>
+        {
+            return out;
+        }
         (Ok(_), Err(e)) => {
             fail(
                 "error",

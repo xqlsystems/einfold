@@ -29,9 +29,13 @@
 //!
 //! The rule runs after DataFusion's own rules, so filters are already pushed
 //! below the join, and keeps every plan's schema exactly: names, qualifiers,
-//! types and nullability. Each node also keeps the plan it replaced, which
-//! [`EinFoldExec`](crate::EinFoldExec) runs when its dense algorithm doesn't
-//! apply, so a detected fold is never slower than the host's own plan.
+//! types and nullability. [`EinFoldExec`](crate::EinFoldExec) runs each
+//! node by the dense algorithm where its keys and rows allow, and by the
+//! discrimination algorithm otherwise. A node that can be computed only under
+//! a condition known when it runs, such as a fold joined back to its domain,
+//! keeps the plan it replaced and runs that where the condition fails. With
+//! [`DetectFolds::with_host_fallback`], every node keeps it, and runs it
+//! wherever the dense algorithm doesn't apply.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -73,20 +77,24 @@ pub struct DetectFolds {
 enum Fallback {
     /// The plan each node replaced, so a detected fold is never slower than
     /// the host's own plan.
-    #[default]
     HostPlan,
-    /// EinFold's discrimination algorithm.
+    /// EinFold's discrimination algorithm, for any keys and density. The
+    /// default: on the folds in einfold's demos and xarray-sql's benchmarks
+    /// that the dense algorithm can't take (sparse weight tables, graph
+    /// edges, embedding lookups), it beats the host's plan.
+    #[default]
     Kernels,
 }
 
 impl DetectFolds {
-    /// The rule, but with nodes that run EinFold's discrimination algorithm
-    /// where the dense one doesn't apply, rather than the host's plan. For
-    /// tests: it makes every fold the rule describes run through einfold.
+    /// The rule, but with nodes that keep the plan they replaced and run it
+    /// wherever the dense algorithm doesn't apply, rather than the
+    /// discrimination algorithm: so that a detected fold is never slower
+    /// than the host's own plan by more than reading its inputs once.
     #[must_use]
-    pub fn without_fallback() -> Self {
+    pub fn with_host_fallback() -> Self {
         DetectFolds {
-            fallback: Fallback::Kernels,
+            fallback: Fallback::HostPlan,
         }
     }
 }
@@ -110,7 +118,7 @@ impl OptimizerRule for DetectFolds {
             LogicalPlan::Projection(p) => match from_domain(p, self.fallback)? {
                 // A fold joined back to its domain needs the host's plan
                 // for when the domain's keys aren't unique.
-                None if self.fallback == Fallback::HostPlan => join_back::joined_back(p)?,
+                None => join_back::joined_back(p)?,
                 found => found,
             },
             _ => None,

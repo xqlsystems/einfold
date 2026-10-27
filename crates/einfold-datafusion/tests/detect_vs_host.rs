@@ -34,7 +34,7 @@
 //! joined back, over operands the dense algorithm takes and a domain whose
 //! keys are duplicated half the time, so that both outcomes of the
 //! uniqueness check are exercised. Half the cases run every fold the rule finds through einfold's
-//! own kernels (`DetectFolds::without_fallback`), so that the folds the rule
+//! own kernels (`DetectFolds::default`), so that the folds the rule
 //! describes are checked even where the dense algorithm doesn't apply.
 //!
 //! Reproduce a failure with `EINFOLD_SEED=<seed printed>`; search longer with
@@ -344,14 +344,14 @@ fn host(threads: usize) -> SessionContext {
     SessionContext::new_with_config(SessionConfig::new().with_target_partitions(threads))
 }
 
-/// DataFusion with einfold. With `fallback` false, every fold the rule finds
-/// runs through einfold's kernels, the discrimination algorithm included, rather than
-/// through the host's plan where the dense algorithm doesn't apply.
+/// DataFusion with einfold. With `fallback`, a fold the rule finds runs the
+/// host's plan where the dense algorithm doesn't apply; without it, as by
+/// default, every fold runs through einfold's kernels.
 fn einfold(threads: usize, fallback: bool) -> SessionContext {
     let config = SessionConfig::new().with_target_partitions(threads);
     let rule = match fallback {
-        true => DetectFolds::default(),
-        false => DetectFolds::without_fallback(),
+        true => DetectFolds::with_host_fallback(),
+        false => DetectFolds::default(),
     };
     let state = SessionStateBuilder::new()
         .with_default_features()
@@ -521,7 +521,7 @@ async fn sweep(default_seed: u64, joined_back: bool) -> Ran {
         let ok = match expect {
             Expect::Fold | Expect::FoldOnly => found == 1 && domains == 0,
             Expect::FromDomain => found == 1 && domains == 1,
-            Expect::JoinedBack => found == 1 && domains == usize::from(fallback),
+            Expect::JoinedBack => found == 1 && domains == 1,
             Expect::Decline => found == 0,
         };
         if !ok {
@@ -539,7 +539,7 @@ async fn sweep(default_seed: u64, joined_back: bool) -> Ran {
             .to_string();
         dense += usize::from(shown.contains("dense_folds=1"));
         host_plans += usize::from(shown.contains("host_plans=1"));
-        if expect == Expect::JoinedBack && fallback {
+        if expect == Expect::JoinedBack {
             joined_dense += usize::from(shown.contains("dense_folds=1"));
             joined_host += usize::from(shown.contains("host_plans=1"));
         }

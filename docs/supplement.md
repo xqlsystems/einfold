@@ -759,14 +759,14 @@ for each tile I of the consumer's groups (one thread per tile, fixed order):
 
 - Caching each training step's physical plan. Plans don't change between steps, so they need planning once. Once contractions are fast, the roughly 3 ms of planning per step would otherwise dominate. einfold's program-level cache (section 8.5) complements this by caching its own rewrite decisions across steps.
 - Forward-mode differentiation inside long chains of row-by-row operations. Forward mode carries derivatives alongside values instead of working backward, which keeps plans growing linearly, not quadratically, in the chain's length.
-- Emitting gradient contributions in a canonical, einsum-shaped form, so detection recognizes them cleanly. Later, ddx could emit the `Fold` relation directly, as an option in its `ddx_ad::Options` settings.
+- Emitting gradient contributions in a canonical, einsum-shaped form, so detection recognizes them cleanly. Since ddx#126 they are (spike S28). One step remains: writing a transposed contraction as a plain left join from the table it is the gradient of, rather than joining back and grouping again (xqlsystems/ddx#208). ddx doesn't emit einfold's `Fold` relation: the two projects are siblings, with no dependency either way.
 - Simplifying scalar derivative expressions, and choices specific to automatic differentiation such as saving versus recomputing a region (section 7.6).
 
 ## 13. Spikes and literature, in detail
 
 A spike is a short, time-boxed experiment that answers one design question. Spike code and reports live in [`docs/spikes/`](spikes/).
 
-Status as of design v15: 22 of 25 spikes done, and three blocked on access. The index [`docs/spikes/README.md`](spikes/README.md) lists every spike with its report.
+Status as of design v17: 25 of 28 spikes done, and three blocked on access. The index [`docs/spikes/README.md`](spikes/README.md) lists every spike with its report.
 
 ### 13.1 Facts
 
@@ -796,6 +796,7 @@ Status as of design v15: 22 of 25 spikes done, and three blocked on access. The 
 | **S24** Deterministic dense kernels. Done: [`s24-deterministic-kernels`](spikes/s24-deterministic-kernels/README.md) | What do bit-for-bit repeatable dense kernels cost? | Fixed, shape-chosen blocks and position order make them repeatable at no cost. A one-pass reproducible accumulator, which needs no maximum in advance, costs 2–25× (section 8.6). |
 | **S25** ddx emits the fold. Done: [`s25-ddx-emits-fold`](spikes/s25-ddx-emits-fold/README.md) | If ddx emitted its gradient contractions as a fold node, what would it take and give? | About 300 lines for node, operator and planner; matches ddx on 300 random cases; `matmul`'s gradient steps 33–57× faster; covers 86% of `matmul`'s step time, 4% of attention's (sections 7.3 and 16). |
 | **S27** Fused attention. Done: [`s27-fused-attention`](spikes/s27-fused-attention/README.md) | How do the hosts run demo 1's attention in SQL, and what does a fused, tiled online-softmax kernel give on the same rows? | The hosts hold all `N²` scores: DataFusion fails at 8,192 tokens and DuckDB at 16,384. The fused kernel is 280–390× faster than DuckDB and 500–2,000× faster than DataFusion, more accurate than DataFusion, and deterministic. A partly masked tile must skip masked pairs, not zero them (sections 8.3, 8.6, 9.6 and 10.2). |
+| **S28** Detecting ddx's folds. Done: [`s28-detect-ddx-folds`](spikes/s28-detect-ddx-folds/README.md) | Since ddx#126, can einfold find ddx's folds in DataFusion's plans by itself? | Yes: a narrow detector finds folds that account for 59–79% of the step time in ddx's benchmarks (S22: 13–32%) and 34–62% of demo 1's gradient, masked folds included. Each gradient step ends in a NULL-safe left join from its domain, the table being differentiated. M1 detects rather than waiting for ddx to emit (sections 7.3 and 16). |
 
 ### 13.3 Optimizer engine
 

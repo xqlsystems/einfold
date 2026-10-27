@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`EinFoldExec`], the physical operator that computes a [`FoldNode`](crate::FoldNode).
+//! [`EinFoldExec`], the physical operator that computes a
+//! [`FoldNode`](crate::FoldNode) or a [`PipelineNode`](crate::PipelineNode).
 
 use std::fmt;
 use std::future::Future;
@@ -23,28 +24,42 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     self, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
 };
-use einfold_ir::{ColumnIndex, Fold};
+use einfold_ir::{ColumnIndex, Fold, Pipeline};
 use einfold_kernels::{Algorithm, DomainRows, Folded, Options, Relation};
 use futures::{future, stream};
 
-use crate::fold_node;
 use crate::HOST;
+use crate::{fold_node, pipeline_node};
 
-/// Computes a fold over a join (see [`FoldNode`](crate::FoldNode)) without forming the join's
-/// rows: each joined pair updates its output group directly.
+/// What an [`EinFoldExec`] computes.
+#[derive(Clone, Debug)]
+enum Work {
+    Fold(Fold),
+    Pipeline(Pipeline),
+}
+
+/// Computes a fold over a join (see [`FoldNode`](crate::FoldNode)) without
+/// forming the join's rows: each joined pair updates its output group
+/// directly. Or computes a fold pipeline (see
+/// [`PipelineNode`](crate::PipelineNode)) without forming its producer's
+/// results: each tile of them is folded into the consumer as it is made.
 ///
-/// Its children are the fold's operands, then its domain if it has one. It
-/// reads every partition of each, and emits one partition, in batches of the
-/// session's batch size. It runs `einfold_kernels`' dense algorithm, on as
-/// many threads as the session's target partitions, when the keys and rows
-/// allow it, and the discrimination algorithm otherwise. Neither result depends on the
-/// number of threads or on the order rows arrive in.
+/// Its children are a fold's operands, then its domain if it has one, or a
+/// pipeline's producer operands, then its values. It reads every partition of
+/// each, and emits one partition, in batches of the session's batch size. It
+/// runs `einfold_kernels`' algorithms on as many threads as the session's
+/// target partitions: for a fold, the dense algorithm when the keys and rows
+/// allow it, and the discrimination algorithm otherwise; for a pipeline, the
+/// fused algorithm. No result depends on the number of threads or on the
+/// order rows arrive in.
 ///
 /// Like DataFusion's own operators, it reserves the memory its inputs take
 /// from the session's memory pool, and fails if the pool can't give it; it
 /// runs the kernels on a blocking thread, off the async runtime; and its
 /// metrics, shown by `EXPLAIN ANALYZE`, count which algorithm ran
-/// (`dense_folds`, `discrimination_folds`), its compute time and its output rows.
+/// (`dense_folds`, `discrimination_folds`, `fused_pipelines`), the pairs of
+/// tiles a pipeline visited of all it has (`tiles_visited`, `tiles`), its
+/// compute time and its output rows.
 ///
 /// Given the plan it replaced (see [`EinFoldExec::with_fallback`]), it runs
 /// that plan where the dense algorithm doesn't apply, and counts it in
@@ -56,7 +71,7 @@ use crate::HOST;
 /// before each iteration, resets the fallback's too.
 #[derive(Debug)]
 pub struct EinFoldExec {
-    fold: Fold,
+    work: Work,
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     /// The host's plan for the same rows, run instead of the discrimination algorithm.
     fallback: Option<Arc<dyn ExecutionPlan>>,
@@ -73,6 +88,24 @@ impl EinFoldExec {
     /// producing `schema`, which [`FoldNode`](crate::FoldNode) derives.
     #[must_use]
     pub fn new(fold: Fold, inputs: Vec<Arc<dyn ExecutionPlan>>, schema: SchemaRef) -> Self {
+        EinFoldExec::computing(Work::Fold(fold), inputs, schema)
+    }
+
+    /// The operator computing `pipeline` over `inputs` (its producer's two
+    /// operands, then its values), producing `schema`, which
+    /// [`PipelineNode`](crate::PipelineNode) derives. The fused algorithm
+    /// declines inputs it can't compute, so the operator needs a fallback
+    /// (see [`EinFoldExec::with_fallback`]).
+    #[must_use]
+    pub fn for_pipeline(
+        pipeline: Pipeline,
+        inputs: Vec<Arc<dyn ExecutionPlan>>,
+        schema: SchemaRef,
+    ) -> Self {
+        EinFoldExec::computing(Work::Pipeline(pipeline), inputs, schema)
+    }
+
+    fn computing(work: Work, inputs: Vec<Arc<dyn ExecutionPlan>>, schema: SchemaRef) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(1),
@@ -80,7 +113,7 @@ impl EinFoldExec {
             Boundedness::Bounded,
         );
         EinFoldExec {
-            fold,
+            work,
             inputs,
             fallback: None,
             domain_rows: DomainRows::Any,
@@ -126,27 +159,44 @@ impl EinFoldExec {
 
     /// This operator over `inputs`, with fresh metrics.
     fn copy(&self, inputs: Vec<Arc<dyn ExecutionPlan>>) -> EinFoldExec {
-        let mut exec = EinFoldExec::new(self.fold.clone(), inputs, self.schema());
+        let mut exec = EinFoldExec::computing(self.work.clone(), inputs, self.schema());
         exec.fallback = self.fallback.clone();
         exec.domain_rows = self.domain_rows;
         exec.null_when = self.null_when;
         exec
     }
 
-    /// The fold this operator computes.
+    /// The fold this operator computes, if it computes one.
     #[must_use]
-    pub fn fold(&self) -> &Fold {
-        &self.fold
+    pub fn fold(&self) -> Option<&Fold> {
+        match &self.work {
+            Work::Fold(fold) => Some(fold),
+            Work::Pipeline(_) => None,
+        }
+    }
+
+    /// The pipeline this operator computes, if it computes one.
+    #[must_use]
+    pub fn pipeline(&self) -> Option<&Pipeline> {
+        match &self.work {
+            Work::Pipeline(pipeline) => Some(pipeline),
+            Work::Fold(_) => None,
+        }
     }
 }
 
 impl DisplayAs for EinFoldExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "EinFoldExec: {}",
-            fold_node::describe(&self.fold, self.domain_rows)
-        )
+        match &self.work {
+            Work::Fold(fold) => {
+                write!(
+                    f,
+                    "EinFoldExec: {}",
+                    fold_node::describe(fold, self.domain_rows)
+                )
+            }
+            Work::Pipeline(p) => write!(f, "EinFoldExec: {}", pipeline_node::describe(p)),
+        }
     }
 }
 
@@ -277,11 +327,18 @@ impl ExecutionPlan for EinFoldExec {
         if partition != 0 {
             return internal_err!("EinFoldExec has one partition, asked for {partition}");
         }
-        let fold = self.fold.clone();
+        let work = self.work.clone();
         let inputs = self.inputs.clone();
         let schema = self.schema();
-        if inputs.len() != 2 + usize::from(fold.domain().is_some()) {
+        let expected = match &work {
+            Work::Fold(fold) => 2 + usize::from(fold.domain().is_some()),
+            Work::Pipeline(_) => 3,
+        };
+        if inputs.len() != expected {
             return internal_err!("EinFoldExec was given {} inputs", inputs.len());
+        }
+        if matches!(work, Work::Pipeline(_)) && self.fallback.is_none() {
+            return internal_err!("EinFoldExec computes a pipeline only with a fallback");
         }
         let batch_size = context.session_config().batch_size().max(1);
         let options = Options {
@@ -295,6 +352,9 @@ impl ExecutionPlan for EinFoldExec {
         let builder = || MetricBuilder::new(&self.metrics);
         let dense_folds = builder().global_counter("dense_folds");
         let discrimination_folds = builder().global_counter("discrimination_folds");
+        let fused_pipelines = builder().global_counter("fused_pipelines");
+        let tiles_visited = builder().global_counter("tiles_visited");
+        let tiles = builder().global_counter("tiles");
         let host_plans = builder().global_counter("host_plans");
         let fallback = self.fallback.clone();
         let null_when = self.null_when;
@@ -313,11 +373,12 @@ impl ExecutionPlan for EinFoldExec {
             let reads =
                 (inputs.into_iter()).map(|i| collect(i, Arc::clone(&context), &reservation));
             let mut read = future::try_join_all(reads).await?.into_iter();
-            // Two operands, then the domain if the fold has one, as checked
-            // above.
-            let (Some(a), Some(b), domain) = (read.next(), read.next(), read.next()) else {
+            // Two operands, then a fold's domain or a pipeline's values, as
+            // checked above.
+            let (Some(a), Some(b), third) = (read.next(), read.next(), read.next()) else {
                 return internal_err!("EinFoldExec read fewer than two inputs");
             };
+            let domain = third.clone().filter(|_| matches!(work, Work::Fold(_)));
             // Each domain batch's NULL mask: the kernels give one output batch
             // per domain batch, row for row.
             let masks: Option<Vec<ArrayRef>> = null_when
@@ -333,18 +394,37 @@ impl ExecutionPlan for EinFoldExec {
                     Relation::new(&schemas[0], &a),
                     Relation::new(&schemas[1], &b),
                 );
+                let fold = match &work {
+                    Work::Fold(fold) => fold,
+                    Work::Pipeline(pipeline) => {
+                        let values = third.as_deref().unwrap_or_default();
+                        let v = Relation::new(&schemas[2], values);
+                        let piped =
+                            einfold_kernels::pipeline(pipeline, [a, b, v], kernel_out, options)?;
+                        return Ok(piped.map(|p| {
+                            let counts = (p.tiles_visited, p.tiles);
+                            (
+                                Folded {
+                                    algorithm: Algorithm::Fused,
+                                    batches: p.batches,
+                                },
+                                Some(counts),
+                            )
+                        }));
+                    }
+                };
                 let domain = domain.as_deref().map(|d| Relation::new(&schemas[2], d));
+                let tiles = None;
                 match with_fallback {
-                    true => einfold_kernels::fold_dense(&fold, a, b, domain, kernel_out, options)
+                    true => einfold_kernels::fold_dense(fold, a, b, domain, kernel_out, options)
                         .map(|r| {
-                            r.map(|batches| Folded {
-                                algorithm: Algorithm::Dense,
-                                batches,
+                            r.map(|batches| {
+                                let algorithm = Algorithm::Dense;
+                                (Folded { algorithm, batches }, tiles)
                             })
                         }),
-                    false => {
-                        einfold_kernels::fold(&fold, a, b, domain, kernel_out, options).map(Some)
-                    }
+                    false => einfold_kernels::fold(fold, a, b, domain, kernel_out, options)
+                        .map(|folded| Some((folded, tiles))),
                 }
             };
             // On a blocking thread, off the async runtime; or, where there is
@@ -380,10 +460,15 @@ impl ExecutionPlan for EinFoldExec {
                     .collect()
             };
             let batches = match (ran, fallback) {
-                (Some(Folded { algorithm, batches }), _) => {
+                (Some((Folded { algorithm, batches }, counts)), _) => {
+                    if let Some((visited, all)) = counts {
+                        tiles_visited.add(visited);
+                        tiles.add(all);
+                    }
                     match algorithm {
                         Algorithm::Dense => dense_folds.add(1),
                         Algorithm::Discriminate => discrimination_folds.add(1),
+                        Algorithm::Fused => fused_pipelines.add(1),
                         // An algorithm added later, which no metric counts yet.
                         _ => {}
                     }

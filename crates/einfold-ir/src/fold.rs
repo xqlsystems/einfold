@@ -27,8 +27,9 @@
 //! copies it in a projection above the fold.
 //!
 //! **A fold names no columns.** Its inputs' columns are given by position
-//! ([`ColumnIndex`]), and so are its result's: the outputs' key columns in
-//! order, then the value. Naming them is the host's business, as it is for a
+//! ([`ColumnIndex`]), and so are its result's: without a domain, the
+//! outputs' key columns in order, then the value; with one, the domain's
+//! carried columns, then the value (see [`Domain`]). Naming them is the host's business, as it is for a
 //! Substrait relation, so two folds that compute the same thing are equal
 //! whatever the query called their columns.
 //!
@@ -358,7 +359,9 @@ impl Fold {
         &self.operands
     }
 
-    /// The result's key columns, in order.
+    /// The outputs, in order: without a domain, the result's key columns;
+    /// with one, the keys matched with the domain's columns, whose carried
+    /// columns are the result's (see [`Domain`]).
     pub fn outputs(&self) -> &[Output] {
         &self.outputs
     }

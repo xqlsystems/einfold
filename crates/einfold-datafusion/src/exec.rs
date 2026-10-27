@@ -290,6 +290,7 @@ impl ExecutionPlan for EinFoldExec {
             let kernel_out = Arc::clone(&out);
             let held = Arc::clone(&reservation);
             let ran = SpawnedTask::spawn_blocking(move || {
+                let _held = held;
                 let (a, b) = (
                     Relation::new(&schemas[0], &a),
                     Relation::new(&schemas[1], &b),

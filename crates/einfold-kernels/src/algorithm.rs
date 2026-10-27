@@ -28,6 +28,10 @@ pub enum Algorithm {
     /// keys ranked by discrimination, a radix sort of their bytes: no hashing
     /// and no comparisons of keys. Any keys, any density.
     Discriminate,
+    /// A fold pipeline's fused algorithm (see [`pipeline`]): the producer
+    /// computed one tile at a time and folded into the consumer, so its
+    /// results never exist in full.
+    Fused,
 }
 
 /// A fold's result, and the algorithm that computed it.

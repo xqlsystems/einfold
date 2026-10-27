@@ -18,6 +18,10 @@
 //! few things SQL leaves open, such as whether `-0.0` and `0.0` are one key.
 //! [`Host`] says which.
 //!
+//! [`pipeline`] computes a fold pipeline (see [`einfold_ir::pipeline`]), such
+//! as attention, one tile at a time, so that its producer's results never
+//! exist in full.
+//!
 //! Nothing here depends on a query engine, so any engine that holds its data
 //! as Arrow arrays can run these, from DataFusion to an extension of DuckDB.
 
@@ -26,15 +30,18 @@ use arrow::error::ArrowError;
 mod algorithm;
 mod dense;
 mod discriminate;
+mod fused;
+mod gemm;
 mod keys;
 mod options;
 mod relation;
 mod schema;
 
-pub use algorithm::{fold, fold_dense, Algorithm, Folded};
+pub use algorithm::{fold, fold_dense, pipeline, Algorithm, Folded};
+pub use fused::Piped;
 pub use options::{DomainRows, FloatKeys, Host, Options};
 pub use relation::Relation;
-pub use schema::schema;
+pub use schema::{pipeline_schema, schema};
 
 /// The result of a kernel.
 pub type Result<T> = std::result::Result<T, ArrowError>;

@@ -86,7 +86,7 @@ impl FoldNode {
 
     /// This node, keeping `plan` as the plan it replaced. When the dense
     /// algorithm doesn't apply, [`EinFoldExec`](crate::EinFoldExec) runs
-    /// `plan` instead of the hash algorithm, so the host's own plan is the
+    /// `plan` instead of the discrimination algorithm, so the host's own plan is the
     /// slowest the fold can be.
     #[must_use]
     pub fn with_fallback(mut self, plan: LogicalPlan) -> Self {

@@ -22,7 +22,8 @@
 //! position, where SQL has rows only where they exist:
 //!
 //! - Each operand must have one row per key tuple, so that a position holds
-//!   one row. Duplicate tuples, which SQL sums row by row, use the hash path.
+//!   one row. Duplicate tuples, which SQL sums row by row, use the
+//!   discrimination algorithm.
 //! - Keys must be non-NULL: a dense array has no position for NULL.
 //! - A missing or NULL row of `b` is held as 0. That is right for a sum,
 //!   until a NaN or an infinity in `a` meets it: `0·∞` is NaN, but SQL forms no
@@ -35,7 +36,7 @@
 //!   `a` has a row at `x`, and its sum is NULL exactly when every such row's
 //!   factor is NULL.
 //!
-//! Otherwise the caller falls back to the hash path.
+//! Otherwise the caller falls back to the discrimination algorithm.
 //!
 //! **Determinism.** Work is split into fixed blocks chosen from the shape
 //! alone: blocks of output rows and columns when the output is large, or
@@ -126,7 +127,11 @@ fn positions(
 /// Run `f(i)` for every task `i` in `0..tasks` on up to `threads` threads.
 /// Results come back in task order, so how tasks were assigned to threads
 /// never shows in them.
-fn par_tasks<T: Send>(tasks: usize, threads: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+pub(crate) fn par_tasks<T: Send>(
+    tasks: usize,
+    threads: usize,
+    f: impl Fn(usize) -> T + Sync,
+) -> Vec<T> {
     let threads = threads.clamp(1, tasks.max(1));
     let f = &f;
     let mut slots: Vec<Option<T>> = (0..tasks).map(|_| None).collect();
@@ -149,7 +154,7 @@ fn par_tasks<T: Send>(tasks: usize, threads: usize, f: impl Fn(usize) -> T + Syn
 
 /// The fold of `a` and `b`'s batches (and `domain`'s, if the fold has one)
 /// by the dense algorithm on `threads` threads, or `None` when its conditions
-/// don't hold and the hash path must be used instead. With a domain, there is
+/// don't hold and the discrimination algorithm must be used instead. With a domain, there is
 /// one output batch per domain batch. With [`DomainRows::UniqueKeys`], it is
 /// also `None` when two of the domain's rows locate the same cell of the
 /// output.

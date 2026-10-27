@@ -526,3 +526,50 @@ async fn movable_functions_never_fail() {
         );
     }
 }
+
+/// Text keys, so the dense algorithm declines and the host's plan runs.
+const TEXT_TABLES: [&str; 2] = [
+    "CREATE TABLE l (a VARCHAR, b VARCHAR, v DOUBLE) AS VALUES ('k0', 'j0', 1.0), ('k1', 'j0', 2.0)",
+    "CREATE TABLE r (a VARCHAR, b VARCHAR, v DOUBLE) AS VALUES ('j0', 'm0', 3.0), ('j0', 'm1', 4.0)",
+];
+
+/// A recursive query resets its recursive term's plan before each
+/// iteration, so the fallback, which runs here, must be reset with it.
+#[tokio::test]
+async fn folds_whose_fallback_runs_recur() {
+    let sql = "WITH RECURSIVE it(n, s) AS (\
+                 SELECT 0, 0.0 \
+                 UNION ALL \
+                 SELECT it.n + 1, it.s + f.v \
+                 FROM it JOIN (SELECT l.a AS g0, SUM(l.v * r.v) AS v \
+                               FROM l JOIN r ON l.b = r.a GROUP BY l.a) f ON f.g0 = 'k0' \
+                 WHERE it.n < 4) \
+               SELECT * FROM it";
+    assert!(same_answer(&TEXT_TABLES, sql).await > 0);
+}
+
+/// A plan whose fallback ran, reset and run again, gives the same rows.
+#[tokio::test]
+async fn reset_plans_whose_fallback_ran_rerun() {
+    let ctx = einfold(4, true);
+    for s in TEXT_TABLES {
+        ctx.sql(s).await.unwrap().collect().await.unwrap();
+    }
+    let sql = "SELECT l.a, r.b, SUM(l.v * r.v) AS v FROM l JOIN r ON l.b = r.a GROUP BY l.a, r.b";
+    let frame = ctx.sql(sql).await.unwrap();
+    let task = Arc::new(frame.task_ctx());
+    let plan = frame.create_physical_plan().await.unwrap();
+    let first = rows(
+        &datafusion::physical_plan::collect(Arc::clone(&plan), Arc::clone(&task))
+            .await
+            .unwrap(),
+    );
+    let reset = datafusion::physical_plan::execution_plan::reset_plan_states(plan).unwrap();
+    let again = rows(
+        &datafusion::physical_plan::collect(Arc::clone(&reset), task)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(first.len(), 4);
+    assert_eq!(first, again);
+}

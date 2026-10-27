@@ -59,7 +59,11 @@ use crate::HOST;
 /// Given the plan it replaced (see [`EinFoldExec::with_fallback`]), it runs
 /// that plan where the dense algorithm doesn't apply, and counts it in
 /// `host_plans`, so it is never slower than the host's own plan by more than
-/// reading its inputs once.
+/// reading its inputs once. The fallback is planned and optimized when the
+/// operator is, but isn't one of its children, so that the session's
+/// physical optimizer doesn't optimize it a second time each time a query
+/// is planned. Resetting the operator's state, as a recursive query does
+/// before each iteration, resets the fallback's too.
 #[derive(Debug)]
 pub struct EinFoldExec {
     fold: Fold,
@@ -95,6 +99,19 @@ impl EinFoldExec {
     pub fn with_fallback(mut self, plan: Arc<dyn ExecutionPlan>) -> Self {
         self.fallback = Some(plan);
         self
+    }
+
+    /// The host's plan this operator runs where the dense algorithm doesn't
+    /// apply, if it has one.
+    pub fn fallback(&self) -> Option<&Arc<dyn ExecutionPlan>> {
+        self.fallback.as_ref()
+    }
+
+    /// This operator over `inputs`, with fresh metrics.
+    fn copy(&self, inputs: Vec<Arc<dyn ExecutionPlan>>) -> EinFoldExec {
+        let mut exec = EinFoldExec::new(self.fold.clone(), inputs, self.schema());
+        exec.fallback = self.fallback.clone();
+        exec
     }
 
     /// The fold this operator computes.
@@ -163,11 +180,11 @@ impl ExecutionPlan for EinFoldExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::UnspecifiedDistribution; self.inputs.len()]
+        vec![Distribution::UnspecifiedDistribution; self.children().len()]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false; self.inputs.len()]
+        vec![false; self.children().len()]
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -178,15 +195,24 @@ impl ExecutionPlan for EinFoldExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.len() != self.inputs.len() {
+        let expected = self.children().len();
+        if children.len() != expected {
             return internal_err!(
-                "EinFoldExec has {} children, given {}",
-                self.inputs.len(),
+                "EinFoldExec has {expected} children, given {}",
                 children.len()
             );
         }
-        let mut exec = EinFoldExec::new(self.fold.clone(), children, self.schema());
-        exec.fallback = self.fallback.clone();
+        Ok(Arc::new(self.copy(children)))
+    }
+
+    /// This operator with its fallback's state reset too: the fallback isn't
+    /// a child, so `reset_plan_states` doesn't reach it otherwise, and its
+    /// operators, such as a hash repartition, would keep their first run's
+    /// state.
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::physical_plan::execution_plan::reset_plan_states;
+        let mut exec = self.copy(self.inputs.clone());
+        exec.fallback = exec.fallback.map(reset_plan_states).transpose()?;
         Ok(Arc::new(exec))
     }
 

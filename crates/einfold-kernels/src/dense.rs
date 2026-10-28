@@ -38,6 +38,11 @@
 //!
 //! Otherwise the caller falls back to the discrimination algorithm.
 //!
+//! **Masks.** A fold's conditions may compare two of its outputs, such as
+//! causal attention's scores' `q.t >= k.t`. Each decides an output group as
+//! a whole, so the groups a condition disallows are computed and dropped,
+//! and never shown. A condition on a summed dimension declines.
+//!
 //! **Determinism.** Work is split into fixed blocks chosen from the shape
 //! alone: blocks of output rows and columns when the output is large, or
 //! blocks along `z` when it is small, whose partial outputs are added in
@@ -49,7 +54,7 @@ use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
 use std::thread;
 
-use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch};
+use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch};
 use arrow::compute;
 use arrow::datatypes::{DataType, SchemaRef};
 use einfold_ir::{ColumnIndex, DimensionId, Domain, Fold, Operand};
@@ -167,7 +172,7 @@ pub(crate) fn fold(
     threads: usize,
     domain_rows: DomainRows,
 ) -> Result<Option<Vec<RecordBatch>>> {
-    let ([op_a, op_b], []) = (fold.operands(), fold.conditions()) else {
+    let [op_a, op_b] = fold.operands() else {
         return Ok(None);
     };
     // The roles: X and Y in output order, Z in dimension order. Here a
@@ -188,6 +193,15 @@ pub(crate) fn fold(
             }
             zs.push(d.0);
         }
+    }
+    // A condition between two outputs decides each output group as a whole:
+    // every joined pair of a group has the group's keys. So the groups it
+    // disallows are computed with the others, and dropped. A condition on a
+    // summed dimension would mask pairs within a group, which this
+    // algorithm doesn't do.
+    let is_output = |d: DimensionId| xs.contains(&d.0) || ys.contains(&d.0);
+    if !(fold.conditions().iter()).all(|c| is_output(c.left) && is_output(c.right)) {
+        return Ok(None);
     }
     // Each batch's key columns as non-negative i64, cast once, with their
     // extents, batches in parallel; then each dimension's extent, its largest
@@ -318,6 +332,26 @@ pub(crate) fn fold(
     // false.
 
     let out = accumulate(&a_matrix, &held, &b_matrix, (nx, nz, ny), threads);
+    // A dimension's key at an output cell (x, y): its place in x's or y's
+    // position, first dimension slowest. Keys are positions.
+    let key_at = |d: usize, x: usize, y: usize| -> usize {
+        let (role, p) = match xs.contains(&d) {
+            true => (&xs, x),
+            false => (&ys, y),
+        };
+        let slot = role.iter().position(|&e| e == d).expect("an output");
+        let stride: usize = role[slot + 1..].iter().map(|&e| extent[e]).product();
+        (p / stride) % extent[d]
+    };
+    // Whether the fold's conditions allow cell (x, y): a group they disallow
+    // doesn't exist.
+    let allowed = |x: usize, y: usize| -> bool {
+        (fold.conditions().iter()).all(|c| {
+            let (l, r) = (key_at(c.left.0, x, y), key_at(c.right.0, x, y));
+            c.comparison.holds(l, r)
+        })
+    };
+    let masked = !fold.conditions().is_empty();
     match (fold.domain(), domain) {
         (Some(spec), Some(domain)) => {
             // The dense output is laid out [x][y], X's and Y's dimensions each
@@ -346,6 +380,9 @@ pub(crate) fn fold(
                     .collect(),
             };
             let value = |c: usize| -> Option<f64> {
+                if masked && !allowed(c / ny, c % ny) {
+                    return spec.missing;
+                }
                 if zero_default || cell_valued[c] {
                     Some(out[c])
                 } else {
@@ -424,7 +461,15 @@ pub(crate) fn fold(
                     .collect()
             };
             columns.push(Arc::new(result));
-            Ok(Some(vec![RecordBatch::try_new(schema, columns)?]))
+            let batch = RecordBatch::try_new(schema, columns)?;
+            if !masked {
+                return Ok(Some(vec![batch]));
+            }
+            let keep: BooleanArray = (rows.iter())
+                .flat_map(|&x| (0..ny).map(move |y| (x, y)))
+                .map(|(x, y)| Some(allowed(x, y)))
+                .collect();
+            Ok(Some(vec![compute::filter_record_batch(&batch, &keep)?]))
         }
         _ => Ok(None),
     }

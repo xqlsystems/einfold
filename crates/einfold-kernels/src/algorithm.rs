@@ -44,7 +44,8 @@ pub struct Folded {
 }
 
 /// [`fold`] by the dense algorithm alone, or `None` when its requirements
-/// don't hold (as for a fold with [conditions](einfold_ir::Condition)), for a
+/// don't hold (as for a fold with [conditions](einfold_ir::Condition) on a
+/// dimension it sums away), for a
 /// caller that would rather run something else, such as the host's plan,
 /// than the discrimination algorithm.
 pub fn fold_dense(
@@ -77,8 +78,9 @@ pub fn fold_dense(
 /// batched or ordered, nor on the number of threads.
 ///
 /// Fails if `options` asks for [`DomainRows::UniqueKeys`], which only
-/// [`fold_dense`] can check, or if the fold has conditions, which neither
-/// algorithm supports yet.
+/// [`fold_dense`] can check, or if the fold has
+/// [conditions](einfold_ir::Condition) that the dense algorithm can't take:
+/// the discrimination algorithm computes no masks.
 pub fn fold(
     fold: &Fold,
     a: Relation,
@@ -89,9 +91,6 @@ pub fn fold(
 ) -> Result<Folded> {
     if options.domain_rows == DomainRows::UniqueKeys {
         return bad("only fold_dense checks that a domain's keys are unique".into());
-    }
-    if !fold.conditions().is_empty() {
-        return bad("the fold kernels don't support conditions".into());
     }
     let threads = options.threads.max(1);
     let domain = domain.map(|d| d.batches);
@@ -109,6 +108,9 @@ pub fn fold(
             algorithm: Algorithm::Dense,
             batches,
         });
+    }
+    if !fold.conditions().is_empty() {
+        return bad("the discrimination algorithm computes no masks".into());
     }
     // The discrimination algorithm reads each operand as one batch.
     let whole = |r: Relation| compute::concat_batches(r.schema, r.batches);

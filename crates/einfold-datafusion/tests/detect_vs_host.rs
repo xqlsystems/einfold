@@ -18,7 +18,9 @@
 //!   expressions, aliases), which the rule must replace;
 //! - **folds from a domain** (ddx's left join from `d` onto a fold, with its
 //!   `CASE`), which the rule must turn into a fold with `d` as its domain;
-//! - **look-alikes** it must leave alone: a mask (`AND l.a >= r.b`), no
+//! - **masked folds** (`AND l.a >= r.b`), a fold where both masked columns
+//!   are group keys and a look-alike otherwise;
+//! - **look-alikes** it must leave alone: no
 //!   `GROUP BY`, `AVG` rather than `SUM`, and a sum that isn't a product;
 //!   and look-alikes of a fold from a domain, in which it must find the fold
 //!   but give it no domain: a projection that reads the fold's keys, and
@@ -324,7 +326,13 @@ fn query(rng: &mut Rng, joined_back: bool) -> (String, Expect) {
             )
         }
         3..=4 | 8..=9 => (fold(&product, false), Expect::Fold),
-        5 => (fold(&product, true), Expect::Decline),
+        // A mask between two group keys is a masked fold; any other mask
+        // declines.
+        5 => {
+            let both = groups.contains(&"l.a") && groups.contains(&"r.b") && !two_keys;
+            let expect = if both { Expect::Fold } else { Expect::Decline };
+            (fold(&product, true), expect)
+        }
         6 => (
             [
                 format!(

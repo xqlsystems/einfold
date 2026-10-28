@@ -234,3 +234,30 @@ def test_decoding_a_deep_plan_overflows_another_threads_stack():
     this fails, and einfold's main-thread workaround can go."""
     done = _in_a_process(350, thread_stack=8 << 20)
     assert done.returncode < 0, (done.returncode, done.stdout)
+
+
+ATTENTION_INSIDE = (
+    "WITH scores AS (SELECT q.t AS i, k.t AS j, SUM(q.x * k.x) / 8.0 AS s "
+    "FROM q JOIN k ON q.d = k.d WHERE q.t >= k.t GROUP BY q.t, k.t), "
+    "weights AS (SELECT i, j, exp(s - MAX(s) OVER (PARTITION BY i)) AS w FROM scores), "
+    "norm AS (SELECT i, SUM(w) AS z FROM weights GROUP BY i) "
+    "SELECT weights.i AS t, v.d, SUM(weights.w / norm.z * v.x) AS x "
+    "FROM weights JOIN v ON weights.j = v.t JOIN norm ON weights.i = norm.i "
+    "GROUP BY weights.i, v.d")
+
+MASKED_SCORES = (
+    "SELECT q.t AS i, k.t AS j, SUM(q.x * k.x) / 8.0 AS s "
+    "FROM q JOIN k ON q.d = k.d WHERE q.t >= k.t GROUP BY q.t, k.t")
+
+
+def test_runs_attention_normalized_inside_the_sum():
+    off, on, found = _pair(_attention_tables)
+    want, got = off.sql(ATTENTION_INSIDE).to_arrow_table(), on.sql(ATTENTION_INSIDE).to_arrow_table()
+    _assert_same(want, got)
+    assert found.plans_with_pipelines() >= 1
+
+
+def test_runs_a_masked_fold():
+    off, on, found = _pair(_attention_tables)
+    _assert_same(off.sql(MASKED_SCORES).to_arrow_table(), on.sql(MASKED_SCORES).to_arrow_table())
+    assert found.plans_with_einfold() >= 1

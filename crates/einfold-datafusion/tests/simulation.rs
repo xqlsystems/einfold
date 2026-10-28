@@ -13,7 +13,7 @@
 //! factors that are expressions (some of which can fail on rows the join
 //! drops), keys of eight types (see `simulation/data.rs`), domains with
 //! duplicate keys, the regroup's `CASE` testing columns other than the keys,
-//! two folds under `UNION ALL`, and a fold of a fold.
+//! two folds under `UNION ALL`, a fold of a fold, and masked folds.
 //!
 //! # Properties
 //!
@@ -46,6 +46,11 @@
 //! - **`[threads]`** where einfold computed every sum itself (no host plan ran
 //!   and no other aggregate is in the plan), the same bits on another number
 //!   of partitions and another batch size.
+//! - **`[partition]`** a mask comparing two of a fold's outputs (`WHERE
+//!   l.a <= r.b`, with both grouped by) decides each group whole, so the
+//!   groups of the mask, of its negation and of its `IS NULL` case are,
+//!   between them, exactly the unmasked fold's, with the same values. An
+//!   exact check that needs no oracle.
 //! - **`[hash]`** a third session runs every fold detection finds through
 //!   einfold's own kernels (`DetectFolds::without_fallback`), so the hash
 //!   algorithm is checked on the plans detection finds, not only the dense
@@ -559,6 +564,34 @@ async fn run_case(case: &Case) -> Outcome {
     let r = out.routes;
     out.deterministic = r.folds > 0 && r.host == 0 && r.other_aggregates == 0;
     let bits_must_match = out.deterministic || case.values == Values::Exact;
+    // [partition]: a mask comparing two of a fold's outputs decides each
+    // group whole, so the groups of the mask, of its negation and of its NULL
+    // case are, between them, exactly the unmasked fold's, with the same
+    // values.
+    if let (Some(m), Values::Exact) = (&case.query.mask, case.values) {
+        if m.partitions {
+            trace("einfold, partition");
+            let with = |c: &str| m.template.replace("{MASK}", c);
+            let all = check::run(&host, &with("TRUE")).await.result;
+            let mut parts = Vec::new();
+            for c in [
+                m.condition.clone(),
+                format!("NOT {}", m.condition),
+                format!("({}) IS NULL", m.condition),
+            ] {
+                parts.push(check::run(&ours, &with(&c)).await.result);
+            }
+            if let (Ok(all), [Ok(a), Ok(b), Ok(c)]) = (all, parts.as_slice()) {
+                let mut union: Vec<String> =
+                    [a, b, c].iter().flat_map(|p| check::exact(p)).collect();
+                union.sort();
+                let all = check::exact(&all);
+                if union != all {
+                    fail("partition", diff(&union, &all), Some(&mine));
+                }
+            }
+        }
+    }
     // [rerun], on sessions of their own without dynamic filters: DataFusion's
     // `reset_plan_states` doesn't support plans with them, and a hash join's
     // can hang a plan run again. The host's own plan, run again, is the
@@ -815,6 +848,7 @@ fn check_coverage(tally: &Tally) {
             Shape::JoinedBack,
             Shape::Union,
             Shape::Nested,
+            Shape::Masked,
         ]
         .iter()
         .map(|&s| tally.get(s, slot))

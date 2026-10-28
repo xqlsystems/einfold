@@ -21,6 +21,9 @@
 //!   argument the fold's value or `CASE WHEN <test of d's row> THEN NULL ELSE
 //!   <value> END`, and `d` with or without duplicate keys;
 //!
+//! - a masked fold: a condition comparing two of the fold's outputs, or a
+//!   dimension it sums away, alone or left-joined from `d`;
+//!
 //! and compositions: two folds under `UNION ALL`, a fold of a fold's result,
 //! and `ORDER BY` with `LIMIT` above.
 
@@ -34,6 +37,8 @@ pub enum Shape {
     JoinedBack,
     Union,
     Nested,
+    /// A fold with a mask: a condition comparing two of its columns.
+    Masked,
 }
 
 /// How the fold's join compares keys.
@@ -132,6 +137,9 @@ struct Fold {
     /// Whether the aggregate is something other than a plain `SUM` of the
     /// product, which detection must leave alone.
     look_alike: bool,
+    /// A condition added to the join's, written as `{MASK}` in the SQL, so
+    /// that it can be replaced (see [`Mask`]).
+    mask: bool,
 }
 
 impl Fold {
@@ -219,6 +227,7 @@ impl Fold {
             filter,
             having,
             look_alike,
+            mask: false,
         }
     }
 
@@ -233,6 +242,9 @@ impl Fold {
             format!("{x} JOIN {y} ON {}", self.on.join(" AND "))
         };
         conditions.extend(self.filter.iter().cloned());
+        if self.mask {
+            conditions.push("{MASK}".to_string());
+        }
         let mut s = format!(
             "SELECT {}SUM({}) AS v FROM {from}",
             self.select
@@ -254,6 +266,19 @@ impl Fold {
     }
 }
 
+/// A mask's condition and the query it was put in, written with `{MASK}`
+/// where the condition goes, so that a test can put other conditions there:
+/// its negation, or whether it is NULL.
+#[derive(Clone, Debug)]
+pub struct Mask {
+    pub template: String,
+    pub condition: String,
+    /// Whether the query is the masked fold alone, and its condition
+    /// compares two of its outputs: then the condition, its negation and its
+    /// NULL case divide the fold's groups among them, each whole.
+    pub partitions: bool,
+}
+
 /// A random query and the shape it was built as.
 pub struct Query {
     pub sql: String,
@@ -264,17 +289,21 @@ pub struct Query {
     /// Whether some join has a condition beyond equalities, as a mask's
     /// `l.a >= r.b`: DataFusion keeps it as the join's filter.
     pub join_filter: bool,
+    /// For a masked fold, its mask.
+    pub mask: Option<Mask>,
 }
 
 pub fn query(rng: &mut Rng, options: Options) -> Query {
     let mut ctes = Vec::new();
-    let shape = match rng.below(20) {
+    let shape = match rng.below(26) {
         0..=6 => Shape::Fold,
         7..=10 => Shape::FromDomain,
         11..=16 => Shape::JoinedBack,
         17..=18 => Shape::Union,
-        _ => Shape::Nested,
+        19 => Shape::Nested,
+        _ => Shape::Masked,
     };
+    let mut mask = None;
     let (body, look_alike) = match shape {
         Shape::Fold => {
             let f = Fold::draw(rng, options, false, &mut ctes);
@@ -296,6 +325,15 @@ pub fn query(rng: &mut Rng, options: Options) -> Query {
                 false,
             )
         }
+        Shape::Masked => {
+            let (template, condition, partitions) = masked(rng, options, &mut ctes);
+            mask = Some(Mask {
+                template: template.clone(),
+                condition: condition.clone(),
+                partitions,
+            });
+            (template.replace("{MASK}", &condition), false)
+        }
         Shape::Nested => {
             // A fold whose first operand is a fold's result: g1 has K's
             // type, as d.b does.
@@ -312,14 +350,16 @@ pub fn query(rng: &mut Rng, options: Options) -> Query {
             )
         }
     };
-    let mut sql = String::new();
-    if !ctes.is_empty() {
-        sql += &format!("WITH {} ", ctes.join(", "));
-    }
-    sql += &body;
+    let prefix = match ctes.is_empty() {
+        true => String::new(),
+        false => format!("WITH {} ", ctes.join(", ")),
+    };
+    let with_ctes = |body: &str| format!("{prefix}{body}");
+    let mut sql = with_ctes(&body);
     // Sometimes ordered and limited above: the order is on every column, so
     // the rows kept don't depend on the plan.
-    if options.limit && shape != Shape::Fold && rng.chance(0.08) {
+    let limited = !matches!(shape, Shape::Fold | Shape::Masked);
+    if options.limit && limited && rng.chance(0.08) {
         sql = format!("SELECT * FROM ({sql}) q ORDER BY 1, 2, 3 LIMIT 5");
     }
     // DataFusion keeps as a join filter the mask (`l.a >= r.b`, the only
@@ -327,12 +367,16 @@ pub fn query(rng: &mut Rng, options: Options) -> Query {
     // than the first.
     let mixed = (sql.contains("l.b = r.a") && sql.contains("(l.a IS NOT DISTINCT FROM r.b)"))
         || (sql.contains("(l.b IS NOT DISTINCT FROM r.a)") && sql.contains("l.a = r.b"));
-    let join_filter = sql.contains(" >= ") || mixed;
+    let join_filter = sql.contains(" >= ") || mixed || mask.is_some();
     Query {
         sql,
         shape,
         look_alike,
         join_filter,
+        mask: mask.map(|m| Mask {
+            template: with_ctes(&m.template),
+            ..m
+        }),
     }
 }
 
@@ -442,4 +486,33 @@ fn joined_back(rng: &mut Rng, options: Options, ctes: &mut Vec<String>) -> (Stri
         ),
         look_alike,
     )
+}
+
+/// A masked fold: a keyed fold with `{MASK}` among its conditions, the mask's
+/// condition, and whether the query is the fold alone. The condition usually
+/// compares the fold's two outputs, which decides each group as a whole;
+/// sometimes it reads a dimension the fold sums away (`l.b`), which masks
+/// pairs within a group, and detection must leave it alone or get it right.
+/// Half the time the fold is left-joined from `d`, as its domain.
+fn masked(rng: &mut Rng, options: Options, ctes: &mut Vec<String>) -> (String, String, bool) {
+    let mut f = Fold::draw(rng, options, true, ctes);
+    f.mask = true;
+    let op = *rng.pick(&["<", "<=", ">", ">=", "<>", "="]);
+    let (x, y) = match rng.below(6) {
+        0 => ("l.b", "r.b"),
+        1 => ("r.b", "l.a"),
+        _ => ("l.a", "r.b"),
+    };
+    let condition = format!("({x} {op} {y})");
+    if rng.chance(0.5) {
+        return (f.sql(), condition, x != "l.b");
+    }
+    let eq = Eq::draw(rng);
+    let template = format!(
+        "SELECT d.a, d.b, COALESCE(s.v, 0.0) AS v FROM d LEFT JOIN ({}) s ON {} AND {}",
+        f.sql(),
+        eq.render("d.a", "s.g0"),
+        eq.render("d.b", "s.g1")
+    );
+    (template, condition, false)
 }

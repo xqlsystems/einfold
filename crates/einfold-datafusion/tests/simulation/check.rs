@@ -108,7 +108,10 @@ impl Ran {
             folds: shown.matches("EinFoldExec:").count(),
             domains: shown.matches("domain").count(),
             dense: shown.matches("dense_folds=1").count(),
-            hash: shown.matches("hash_folds=1").count(),
+            // The hash algorithm, or the discrimination algorithm that
+            // replaces it: einfold's own route for any keys.
+            hash: shown.matches("hash_folds=1").count()
+                + shown.matches("discrimination_folds=1").count(),
             host: shown.matches("host_plans=1").count(),
             other_aggregates: shown.matches("AggregateExec").count(),
         }

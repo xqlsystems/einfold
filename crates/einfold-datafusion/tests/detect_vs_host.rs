@@ -1112,3 +1112,53 @@ async fn einfold_runs_short_of_memory_only_where_the_host_does() {
         assert!(fell_back > 0, "einfold never ran short of memory");
     }
 }
+
+/// einfold's operator estimates its rows for the planner, which chooses by
+/// them which side of a join to hold: a fold from a domain emits exactly a
+/// row per domain row, and a fold alone about as many as its larger operand.
+#[tokio::test]
+async fn folds_estimate_their_rows() {
+    use datafusion::common::stats::Precision;
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+    use datafusion::physical_plan::ExecutionPlan;
+    fn find(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+        match plan.name() == "EinFoldExec" {
+            true => Some(Arc::clone(plan)),
+            false => plan.children().into_iter().find_map(find),
+        }
+    }
+    let ctx = einfold(4, false);
+    for s in [
+        "CREATE TABLE l (a BIGINT, b BIGINT, v DOUBLE) AS VALUES \
+         (0,0,1.0),(0,1,2.0),(1,0,3.0),(1,1,4.0),(2,0,5.0),(2,1,6.0)",
+        "CREATE TABLE r (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(1,0,2.0),(1,1,3.0)",
+        "CREATE TABLE d (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(1,1,1.0),(2,1,1.0),(5,5,1.0)",
+    ] {
+        ctx.sql(s).await.unwrap().collect().await.unwrap();
+    }
+    let fold = "SELECT l.a AS g0, r.b AS g1, SUM(l.v * r.v) AS v FROM l JOIN r ON l.b = r.a \
+                GROUP BY l.a, r.b";
+    let from_domain = format!(
+        "SELECT d.a, d.b, CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 \
+         ELSE s.v END AS v FROM d LEFT JOIN ({fold}) s ON d.a = s.g0 AND d.b = s.g1"
+    );
+    for (sql, rows) in [
+        (fold, Precision::Inexact(6)),
+        (&from_domain, Precision::Exact(4)),
+    ] {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let exec = find(&plan).expect("einfold finds the fold");
+        let args = StatisticsArgs::new();
+        let statistics = StatisticsContext::new()
+            .compute(exec.as_ref(), &args)
+            .unwrap();
+        assert_eq!(statistics.num_rows, rows, "{sql}");
+        assert!(statistics.total_byte_size.get_value().is_some(), "{sql}");
+    }
+}

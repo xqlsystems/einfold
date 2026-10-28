@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["maturin>=1.6,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "einfold"
+description = "einfold for Python: fast folds over joins in datafusion-python and xarray-sql sessions"
+requires-python = ">=3.10"
+version = "0.0.0"
+license = "Apache-2.0"
+# The FFI that the extension speaks is DataFusion 55's.
+dependencies = ["datafusion==55.0.0"]
+
+[project.optional-dependencies]
+test = ["pytest", "numpy", "pyarrow"]
+
+[tool.maturin]
+module-name = "einfold._native"
+features = ["pyo3/extension-module"]

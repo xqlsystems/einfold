@@ -16,7 +16,8 @@ use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{internal_err, DataFusionError, Result};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::execution::{SendableRecordBatchStream, SessionStateBuilder, TaskContext};
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
@@ -24,12 +25,13 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     self, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
 };
+use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use einfold_ir::{ColumnIndex, Fold, Pipeline};
 use einfold_kernels::{Algorithm, DomainRows, Folded, Options, Relation};
 use futures::{future, stream};
 
-use crate::HOST;
 use crate::{fold_node, pipeline_node};
+use crate::{EinFoldPlanner, HOST};
 
 /// What an [`EinFoldExec`] computes.
 #[derive(Clone, Debug)]
@@ -64,17 +66,19 @@ enum Work {
 /// Given the plan it replaced (see [`EinFoldExec::with_fallback`]), it runs
 /// that plan where the dense algorithm doesn't apply, and counts it in
 /// `host_plans`, so it is never slower than the host's own plan by more than
-/// reading its inputs once. The fallback is planned and optimized when the
-/// operator is, but isn't one of its children, so that the session's
-/// physical optimizer doesn't optimize it a second time each time a query
-/// is planned. Resetting the operator's state, as a recursive query does
-/// before each iteration, resets the fallback's too.
+/// reading its inputs once and planning that plan. The fallback is kept as a
+/// logical plan, and planned only when it runs: most never do, and planning
+/// each would plan its subtree, the operator's inputs included, a second
+/// time, which in a deep plan grows with the square of its depth. It is
+/// planned with DataFusion's default physical optimizer rules, under the
+/// configuration of the task that runs it.
 #[derive(Debug)]
 pub struct EinFoldExec {
     work: Work,
     inputs: Vec<Arc<dyn ExecutionPlan>>,
-    /// The host's plan for the same rows, run instead of the discrimination algorithm.
-    fallback: Option<Arc<dyn ExecutionPlan>>,
+    /// The host's plan for the same rows, run instead of the discrimination
+    /// algorithm, and planned only then.
+    fallback: Option<Arc<LogicalPlan>>,
     /// Whether to run the fallback unless no two domain rows reach one group.
     domain_rows: DomainRows,
     /// The domain's Boolean column that makes a row's value NULL where true.
@@ -124,10 +128,12 @@ impl EinFoldExec {
     }
 
     /// This operator, running `plan` when the dense algorithm doesn't apply,
-    /// instead of the discrimination algorithm. `plan` must produce the operator's
-    /// columns, in order, under any names.
-    pub fn with_fallback(mut self, plan: Arc<dyn ExecutionPlan>) -> Self {
-        self.fallback = Some(plan);
+    /// instead of the discrimination algorithm. `plan` must produce the
+    /// operator's columns, in order, under any names. It is planned only if
+    /// it runs.
+    #[must_use]
+    pub fn with_fallback(mut self, plan: LogicalPlan) -> Self {
+        self.fallback = Some(Arc::new(plan));
         self
     }
 
@@ -153,8 +159,8 @@ impl EinFoldExec {
     /// The host's plan this operator runs where the dense algorithm doesn't
     /// apply, if it has one.
     #[must_use]
-    pub fn fallback(&self) -> Option<&Arc<dyn ExecutionPlan>> {
-        self.fallback.as_ref()
+    pub fn fallback(&self) -> Option<&LogicalPlan> {
+        self.fallback.as_deref()
     }
 
     /// This operator over `inputs`, with fresh metrics.
@@ -231,13 +237,32 @@ async fn on_a_runtime<T: Send + 'static>(
         .map_err(|e| DataFusionError::External(Box::new(e)))?
 }
 
-/// Every batch of every partition of the host's plan `plan`, in partition
-/// order, on a runtime (see [`on_a_runtime`]).
+/// The host's plan `plan`, planned for the task `ctx`: with its
+/// configuration and runtime, and DataFusion's default physical optimizer
+/// rules. A fold node within it is planned as einfold's operator.
+async fn plan_host(plan: &LogicalPlan, ctx: &TaskContext) -> Result<Arc<dyn ExecutionPlan>> {
+    let state = SessionStateBuilder::new()
+        .with_config(ctx.session_config().clone())
+        .with_runtime_env(ctx.runtime_env())
+        .with_default_features()
+        .build();
+    DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(EinFoldPlanner)])
+        .create_physical_plan(plan, &state)
+        .await
+}
+
+/// Every batch of every partition of the host's plan `plan`, planned for the
+/// task `ctx` (see [`plan_host`]), in partition order, on a runtime (see
+/// [`on_a_runtime`]).
 async fn run_host_plan(
-    plan: Arc<dyn ExecutionPlan>,
+    plan: Arc<LogicalPlan>,
     ctx: Arc<TaskContext>,
 ) -> Result<Vec<Vec<RecordBatch>>> {
-    on_a_runtime(physical_plan::collect_partitioned(plan, ctx)).await
+    on_a_runtime(async move {
+        let physical = plan_host(&plan, &ctx).await?;
+        physical_plan::collect_partitioned(physical, ctx).await
+    })
+    .await
 }
 
 /// Every batch of every partition of `plan`, in partition order, each counted
@@ -305,17 +330,6 @@ impl ExecutionPlan for EinFoldExec {
             );
         }
         Ok(Arc::new(self.copy(children)))
-    }
-
-    /// This operator with its fallback's state reset too: the fallback isn't
-    /// a child, so `reset_plan_states` doesn't reach it otherwise, and its
-    /// operators, such as a hash repartition, would keep their first run's
-    /// state.
-    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
-        use datafusion::physical_plan::execution_plan::reset_plan_states;
-        let mut exec = self.copy(self.inputs.clone());
-        exec.fallback = exec.fallback.map(reset_plan_states).transpose()?;
-        Ok(Arc::new(exec))
     }
 
     fn execute(

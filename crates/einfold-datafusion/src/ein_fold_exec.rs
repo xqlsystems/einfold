@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use datafusion::arrow::compute::nullif;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::error::ArrowError;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{internal_err, DataFusionError, Result};
@@ -19,15 +20,18 @@ use datafusion::execution::{SendableRecordBatchStream, SessionStateBuilder, Task
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     self, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use einfold_ir::{ColumnIndex, Fold, Pipeline};
-use einfold_kernels::{Algorithm, DomainRows, Folded, Options, Relation};
-use futures::{future, stream};
+use einfold_kernels::{Algorithm, Budget, DomainRows, Folded, Options, Relation};
+use futures::stream::BoxStream;
+use futures::{future, stream, StreamExt};
 
 use crate::{fold_node, pipeline_node};
 use crate::{EinFoldPlanner, HOST};
@@ -54,9 +58,13 @@ enum Work {
 /// fused algorithm. No result depends on the number of threads or on the
 /// order rows arrive in.
 ///
-/// Like DataFusion's own operators, it reserves the memory its inputs take
-/// from the session's memory pool, and fails if the pool can't give it; it
-/// runs the kernels on a blocking thread, off the async runtime; and its
+/// Like DataFusion's own operators, it reserves the memory it takes from the
+/// session's memory pool: its inputs as it reads them, what the kernels
+/// allocate before they allocate it, and its output. Where the pool can't
+/// give it that, it runs its fallback, if it has one, as the host's spilling
+/// operators would have run, and counts it in `memory_fallbacks`; without
+/// one, it fails, as an operator that can't spill does. It runs the kernels
+/// on a blocking thread, off the async runtime; and its
 /// metrics, shown by `EXPLAIN ANALYZE`, count which algorithm ran
 /// (`dense_folds`, `discrimination_folds`, `fused_pipelines`), the pairs of
 /// tiles a pipeline visited of all it has (`tiles_visited`, `tiles`), its
@@ -76,8 +84,11 @@ pub struct EinFoldExec {
     work: Work,
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     /// The host's plan for the same rows, run instead of the discrimination
-    /// algorithm, and planned only then.
+    /// algorithm, or where memory runs short, and planned only then.
     fallback: Option<Arc<LogicalPlan>>,
+    /// Whether the fallback runs wherever the dense algorithm declines, and
+    /// not only where memory runs short.
+    host_on_decline: bool,
     /// Whether to run the fallback unless no two domain rows reach one group.
     domain_rows: DomainRows,
     /// The domain's Boolean column that makes a row's value NULL where true.
@@ -119,6 +130,7 @@ impl EinFoldExec {
             work,
             inputs,
             fallback: None,
+            host_on_decline: false,
             domain_rows: DomainRows::Any,
             null_when: None,
             properties: Arc::new(properties),
@@ -133,6 +145,18 @@ impl EinFoldExec {
     #[must_use]
     pub fn with_fallback(mut self, plan: LogicalPlan) -> Self {
         self.fallback = Some(Arc::new(plan));
+        self.host_on_decline = true;
+        self
+    }
+
+    /// This operator, running `plan` only where the session's memory pool
+    /// can't give it what it needs, and the discrimination algorithm where
+    /// the dense one declines. `plan` must produce the operator's columns, in
+    /// order, under any names. It is planned only if it runs.
+    #[must_use]
+    pub fn with_memory_fallback(mut self, plan: LogicalPlan) -> Self {
+        self.fallback = Some(Arc::new(plan));
+        self.host_on_decline = false;
         self
     }
 
@@ -166,6 +190,7 @@ impl EinFoldExec {
     fn copy(&self, inputs: Vec<Arc<dyn ExecutionPlan>>) -> EinFoldExec {
         let mut exec = EinFoldExec::computing(self.work.clone(), inputs, self.schema());
         exec.fallback = self.fallback.clone();
+        exec.host_on_decline = self.host_on_decline;
         exec.domain_rows = self.domain_rows;
         exec.null_when = self.null_when;
         exec
@@ -249,6 +274,86 @@ async fn run_host_plan(
         .spawn(run)
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?
+}
+
+/// The rows of the host's plan `plan`, planned for the task `ctx` (see
+/// [`plan_host`]), as one stream, its columns under this operator's names,
+/// `out`, and counted in `output_rows`. They stream through, as they would
+/// in the host's own plan, where a Tokio runtime is current; where none is,
+/// they are collected on this library's runtime (see [`run_host_plan`]).
+async fn host_stream(
+    plan: Arc<LogicalPlan>,
+    ctx: Arc<TaskContext>,
+    out: SchemaRef,
+    output_rows: metrics::Count,
+) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    let rename = move |b: Result<RecordBatch>| -> Result<RecordBatch> {
+        let b = RecordBatch::try_new(Arc::clone(&out), b?.columns().to_vec())?;
+        output_rows.add(b.num_rows());
+        Ok(b)
+    };
+    if tokio::runtime::Handle::try_current().is_err() {
+        let batches = run_host_plan(plan, ctx).await?.concat();
+        return Ok(stream::iter(batches.into_iter().map(Ok).map(rename)).boxed());
+    }
+    let physical = plan_host(&plan, &ctx).await?;
+    let one: Arc<dyn ExecutionPlan> = match physical.properties().partitioning.partition_count() {
+        1 => physical,
+        _ => Arc::new(CoalescePartitionsExec::new(physical)),
+    };
+    Ok(one.execute(0, ctx)?.map(rename).boxed())
+}
+
+/// Whether `e` says that memory ran short: that the session's memory pool
+/// refused a reservation, or that einfold's kernels found their budget too
+/// small.
+fn short_of_memory(e: &DataFusionError) -> bool {
+    match e.find_root() {
+        DataFusionError::ResourcesExhausted(_) => true,
+        DataFusionError::ArrowError(e, _) => matches!(**e, ArrowError::MemoryError(_)),
+        _ => false,
+    }
+}
+
+/// The session's memory pool, as a budget for einfold's kernels: what they
+/// ask for is reserved, as long as `0` is.
+#[derive(Debug)]
+struct Pool<'a>(&'a MemoryReservation);
+
+impl Budget for Pool<'_> {
+    fn grow(&self, bytes: usize) -> bool {
+        self.0.try_grow(bytes).is_ok()
+    }
+}
+
+/// `batches` as this operator's output stream: in batches of `batch_size`
+/// rows at most, counted in `output_rows`. `reservation` counts them, and
+/// gives back each slice's share as it is emitted: from then on, what reads
+/// it holds it, and counts it if it keeps it, as it would the host's.
+fn slices(
+    batches: Vec<RecordBatch>,
+    batch_size: usize,
+    output_rows: &metrics::Count,
+    reservation: Arc<MemoryReservation>,
+) -> BoxStream<'static, Result<RecordBatch>> {
+    let slices: Vec<(RecordBatch, usize)> = batches
+        .iter()
+        .inspect(|b| output_rows.add(b.num_rows()))
+        .flat_map(|batch| {
+            let (rows, bytes) = (batch.num_rows(), batch.get_array_memory_size());
+            (0..rows).step_by(batch_size).map(move |start| {
+                let n = batch_size.min(rows - start);
+                (batch.slice(start, n), bytes * n / rows)
+            })
+        })
+        .collect();
+    stream::iter(slices)
+        .map(move |(b, bytes)| {
+            reservation.shrink(bytes.min(reservation.size()));
+            Ok(b)
+        })
+        .boxed()
 }
 
 /// Every batch of every partition of `plan`, in partition order, each counted
@@ -335,7 +440,7 @@ impl ExecutionPlan for EinFoldExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        use futures::{StreamExt, TryStreamExt};
+        use futures::TryStreamExt;
         if partition != 0 {
             return internal_err!("EinFoldExec has one partition, asked for {partition}");
         }
@@ -357,6 +462,7 @@ impl ExecutionPlan for EinFoldExec {
             host: HOST,
             threads: context.session_config().target_partitions(),
             domain_rows: self.domain_rows,
+            budget: None,
         };
         if self.domain_rows == DomainRows::UniqueKeys && self.fallback.is_none() {
             return internal_err!("EinFoldExec requires a unique domain, but has no fallback");
@@ -368,7 +474,9 @@ impl ExecutionPlan for EinFoldExec {
         let tiles_visited = builder().global_counter("tiles_visited");
         let tiles = builder().global_counter("tiles");
         let host_plans = builder().global_counter("host_plans");
+        let memory_fallbacks = builder().global_counter("memory_fallbacks");
         let fallback = self.fallback.clone();
+        let host_on_decline = self.host_on_decline;
         let null_when = self.null_when;
         let compute = builder().elapsed_compute(0);
         let output_rows = builder().output_rows(0);
@@ -379,12 +487,29 @@ impl ExecutionPlan for EinFoldExec {
             Arc::new(MemoryConsumer::new("EinFoldExec").register(context.memory_pool()));
         let out = Arc::clone(&schema);
         let result = async move {
+            // The host's plan, where memory ran short: whatever this operator
+            // held is released first, and the plan's operators reserve their
+            // own.
+            let short = |e: DataFusionError| async {
+                let Some(plan) = fallback.clone().filter(|_| short_of_memory(&e)) else {
+                    return Err(e);
+                };
+                reservation.free();
+                memory_fallbacks.add(1);
+                host_plans.add(1);
+                let rows = output_rows.clone();
+                host_stream(plan, Arc::clone(&context), Arc::clone(&out), rows).await
+            };
             // Every input is read whole, and stays in the batches it arrived
             // in: the kernels read them batch by batch.
             let schemas: Vec<SchemaRef> = inputs.iter().map(|i| i.schema()).collect();
             let reads =
                 (inputs.into_iter()).map(|i| collect(i, Arc::clone(&context), &reservation));
-            let mut read = future::try_join_all(reads).await?.into_iter();
+            let read = match future::try_join_all(reads).await {
+                Ok(read) => read,
+                Err(e) => return short(e).await,
+            };
+            let mut read = read.into_iter();
             // Two operands, then a fold's domain or a pipeline's values, as
             // checked above.
             let (Some(a), Some(b), third) = (read.next(), read.next(), read.next()) else {
@@ -397,11 +522,14 @@ impl ExecutionPlan for EinFoldExec {
                 .zip(domain.as_ref())
                 .map(|(c, d)| d.iter().map(|b| Arc::clone(b.column(c.0))).collect());
             let timer = compute.timer();
-            let with_fallback = fallback.is_some();
             let kernel_out = Arc::clone(&out);
             let held = Arc::clone(&reservation);
             let kernel = move || {
-                let _held = held;
+                let pool = Pool(&held);
+                let options = Options {
+                    budget: Some(&pool),
+                    ..options
+                };
                 let (a, b) = (
                     Relation::new(&schemas[0], &a),
                     Relation::new(&schemas[1], &b),
@@ -427,7 +555,7 @@ impl ExecutionPlan for EinFoldExec {
                 };
                 let domain = domain.as_deref().map(|d| Relation::new(&schemas[2], d));
                 let tiles = None;
-                match with_fallback {
+                match host_on_decline {
                     true => einfold_kernels::fold_dense(fold, a, b, domain, kernel_out, options)
                         .map(|r| {
                             r.map(|batches| {
@@ -445,10 +573,14 @@ impl ExecutionPlan for EinFoldExec {
             let ran = match tokio::runtime::Handle::try_current() {
                 Ok(_) => SpawnedTask::spawn_blocking(kernel)
                     .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))??,
-                Err(_) => kernel()?,
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                Err(_) => kernel(),
             };
             timer.done();
+            let ran = match ran {
+                Ok(ran) => ran,
+                Err(e) => return short(DataFusionError::from(e)).await,
+            };
             // The kernel has dropped its inputs: release them, so that the
             // host's plan, if it runs, and the operators downstream have the
             // memory they would have had without einfold. The output, which
@@ -471,7 +603,7 @@ impl ExecutionPlan for EinFoldExec {
                     })
                     .collect()
             };
-            let batches = match (ran, fallback) {
+            let batches = match (ran, fallback.clone()) {
                 (Some((Folded { algorithm, batches }, counts)), _) => {
                     if let Some((visited, all)) = counts {
                         tiles_visited.add(visited);
@@ -487,34 +619,18 @@ impl ExecutionPlan for EinFoldExec {
                     masked(batches)?
                 }
                 (None, Some(plan)) => {
-                    // The host's plan, its columns under this operator's names.
                     host_plans.add(1);
-                    run_host_plan(plan, Arc::clone(&context))
-                        .await?
-                        .concat()
-                        .into_iter()
-                        .map(|b| RecordBatch::try_new(Arc::clone(&out), b.columns().to_vec()))
-                        .collect::<std::result::Result<Vec<_>, _>>()?
+                    let rows = output_rows.clone();
+                    return host_stream(plan, Arc::clone(&context), Arc::clone(&out), rows).await;
                 }
                 (None, None) => return internal_err!("EinFoldExec ran no algorithm"),
             };
-            for b in &batches {
-                output_rows.add(b.num_rows());
-                reservation.try_grow(b.get_array_memory_size())?;
+            let size: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+            if let Err(e) = reservation.try_grow(size) {
+                drop(batches);
+                return short(e).await;
             }
-            let slices: Vec<Result<RecordBatch>> = batches
-                .iter()
-                .flat_map(|batch| {
-                    (0..batch.num_rows()).step_by(batch_size).map(move |start| {
-                        Ok(batch.slice(start, batch_size.min(batch.num_rows() - start)))
-                    })
-                })
-                .collect();
-            // The reservation lives as long as the output does.
-            Ok::<_, DataFusionError>(stream::iter(slices).map(move |b| {
-                let _ = &reservation;
-                b
-            }))
+            Ok::<_, DataFusionError>(slices(batches, batch_size, &output_rows, reservation))
         };
         let stream = stream::once(result).try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(

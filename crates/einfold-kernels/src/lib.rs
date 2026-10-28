@@ -39,7 +39,7 @@ mod schema;
 
 pub use algorithm::{fold, fold_dense, pipeline, Algorithm, Folded};
 pub use fused::Piped;
-pub use options::{DomainRows, FloatKeys, Host, Options};
+pub use options::{Budget, DomainRows, FloatKeys, Host, Options};
 pub use relation::Relation;
 pub use schema::{pipeline_schema, schema};
 

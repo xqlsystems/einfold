@@ -50,9 +50,11 @@ impl ExtensionPlanner for EinFoldPlanner {
         };
         let schema = Arc::new(node.schema().as_arrow().clone());
         let mut exec = EinFoldExec::new(node.fold().clone(), physical_inputs.to_vec(), schema);
-        if let Some(plan) = node.fallback() {
-            exec = exec.with_fallback(plan.clone());
-        }
+        exec = match (node.fallback(), node.host_on_decline()) {
+            (Some(plan), true) => exec.with_fallback(plan.clone()),
+            (Some(plan), false) => exec.with_memory_fallback(plan.clone()),
+            (None, _) => exec,
+        };
         if node.domain_rows() == DomainRows::UniqueKeys {
             exec = exec.requiring_unique_domain();
         }

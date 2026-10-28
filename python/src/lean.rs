@@ -47,7 +47,7 @@ use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::registry::ExtensionTypeRegistryRef;
 use datafusion::logical_expr::{
     AggregateUDF, Expr, HigherOrderUDF, LogicalPlan, ScalarUDF, TableProviderFilterPushDown,
-    TableSource, WindowUDF,
+    TableScan, TableSource, WindowUDF, UNNAMED_TABLE,
 };
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -331,12 +331,35 @@ impl Session for LeanSession<'_> {
 /// the datasets it keeps as in-memory tables.
 const COPIED_BYTES: usize = 64 << 20;
 
+/// Which table a scan reads, as far as a plan says.
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum Table {
+    /// A table named in the session's catalogs: within one plan, every scan
+    /// of a name reads the same table.
+    Named(TableReference),
+    /// An unnamed table, such as a DataFrame's cached result
+    /// (`DataFrame.cache()`), whose scans are all called `?table?`: the scan's
+    /// own source, by its address, since another unnamed table may be
+    /// scanned in the same plan.
+    Unnamed(usize),
+}
+
+impl Table {
+    fn of(scan: &TableScan) -> Self {
+        match scan.table_name.table() == UNNAMED_TABLE && scan.table_name.schema().is_none() {
+            true => Table::Unnamed(Arc::as_ptr(&scan.source) as *const () as usize),
+            false => Table::Named(scan.table_name.clone()),
+        }
+    }
+}
+
 /// `plan` with each in-memory table it reads replaced by this library's own
 /// copy of it, which shares the table's buffers, so that no scan of it
 /// crosses the FFI: one scan of each crosses it, here, once.
 ///
 /// Within one plan, a table's name names one table, so every scan of a name
-/// reads the copy. A table is copied only when DataFusion's own data source
+/// reads the copy; each scan of an unnamed table reads a copy of its own. A
+/// table is copied only when DataFusion's own data source
 /// scans it, as it does an in-memory table, and the scan's statistics say
 /// it holds at most [`COPIED_BYTES`]. Another source, such as xarray-sql's
 /// lazily loaded datasets, would be read whole here, rather than streamed as
@@ -344,14 +367,14 @@ const COPIED_BYTES: usize = 64 << 20;
 /// scan. A table given filters to evaluate in its scan keeps its own scans,
 /// since the copy doesn't evaluate them.
 pub(crate) async fn localize(plan: LogicalPlan, session: &dyn Session) -> Result<LogicalPlan> {
-    // Each table by name, unless one of its scans has filters.
-    let mut tables: HashMap<TableReference, Option<Arc<dyn TableProvider>>> = HashMap::new();
+    // Each table, unless one of its scans has filters.
+    let mut tables: HashMap<Table, Option<Arc<dyn TableProvider>>> = HashMap::new();
     plan.apply_with_subqueries(|node| {
         if let LogicalPlan::TableScan(scan) = node {
             let provider = source_as_provider(&scan.source)?;
             let lean = provider.downcast_ref::<Lean>().is_some() && scan.filters.is_empty();
             let entry = tables
-                .entry(scan.table_name.clone())
+                .entry(Table::of(scan))
                 .or_insert(Some(provider));
             if !lean {
                 *entry = None;
@@ -359,7 +382,7 @@ pub(crate) async fn localize(plan: LogicalPlan, session: &dyn Session) -> Result
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
-    let mut copies: HashMap<TableReference, Arc<dyn TableSource>> = HashMap::new();
+    let mut copies: HashMap<Table, Arc<dyn TableSource>> = HashMap::new();
     let mut context = None;
     for (name, provider) in tables {
         let Some(lean) = provider.as_deref().and_then(|p| p.downcast_ref::<Lean>()) else {
@@ -393,7 +416,7 @@ pub(crate) async fn localize(plan: LogicalPlan, session: &dyn Session) -> Result
         return Ok(plan);
     }
     let copied = plan.transform_up_with_subqueries(|node| match node {
-        LogicalPlan::TableScan(mut scan) => match copies.get(&scan.table_name) {
+        LogicalPlan::TableScan(mut scan) => match copies.get(&Table::of(&scan)) {
             Some(copy) => {
                 scan.source = Arc::clone(copy);
                 Ok(Transformed::yes(LogicalPlan::TableScan(scan)))

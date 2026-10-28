@@ -975,3 +975,42 @@ fn host_rerun_hang() {
         }
     }
 }
+
+/// Writes generated cases for other hosts to run, such as einfold's Python
+/// package through datafusion-python: `EINFOLD_SIM_EXPORT` (a directory)
+/// gets one directory per seed, from `EINFOLD_SEED` (default 0) for
+/// `EINFOLD_CASES` cases (default 200), each with `query.sql`, `values`
+/// (`exact` or `inexact`), `threads`, and each table's partitions as Arrow
+/// IPC files `<table>.<partition>.arrow`.
+#[test]
+#[ignore]
+fn export() {
+    use datafusion::arrow::ipc::writer::FileWriter;
+    let dir = std::env::var("EINFOLD_SIM_EXPORT").expect("EINFOLD_SIM_EXPORT, a directory");
+    let base = env_u64("EINFOLD_SEED").unwrap_or(0);
+    let cases = env_u64("EINFOLD_CASES").unwrap_or(200);
+    for i in 0..cases {
+        let seed = base.wrapping_add(i);
+        let case = case(seed);
+        let at = std::path::Path::new(&dir).join(seed.to_string());
+        std::fs::create_dir_all(&at).expect("a case directory");
+        std::fs::write(at.join("query.sql"), &case.query.sql).expect("the query");
+        let values = match case.values {
+            Values::Exact => "exact",
+            Values::Inexact => "inexact",
+        };
+        std::fs::write(at.join("values"), values).expect("the values");
+        std::fs::write(at.join("threads"), case.threads[1].to_string()).expect("the threads");
+        for t in &case.tables {
+            for (p, batches) in t.partitions.iter().enumerate() {
+                let file = std::fs::File::create(at.join(format!("{}.{p}.arrow", t.name)))
+                    .expect("a table file");
+                let mut w = FileWriter::try_new(file, &t.schema).expect("a writer");
+                for b in batches {
+                    w.write(b).expect("a batch");
+                }
+                w.finish().expect("a finished file");
+            }
+        }
+    }
+}

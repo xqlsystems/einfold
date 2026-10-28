@@ -5,13 +5,14 @@
 
 # Runs M2's gate: each measurement in its own process, under GNU time, so
 # that the peak resident memory reported is that measurement's alone.
-# Usage, from this directory, after `cargo build --release`:
-#   nix-shell -p duckdb time --run ./run.sh
-# or with TIME and DUCKDB pointing at those binaries.
+# Usage, from this directory, after `cargo build --release`, with GNU time
+# on the PATH (or in TIME) and a Python with the `duckdb` package (PYTHON):
+#   PYTHON=python3 ./run.sh
 set -u
 BIN=${BIN:-${CARGO_TARGET_DIR:-target}/release/m2-gate}
 TIME=${TIME:-$(type -P time)}
-DUCKDB=${DUCKDB:-$(type -P duckdb)}
+PYTHON=${PYTHON:-python3}
+HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -32,7 +33,7 @@ for form in window groupby; do
   done
   for l in 1024 4096 8192 16384; do
     "$BIN" duck-sql "$form" "$l" > "$WORK/q.sql"
-    run "duckdb $form L=$l" "$DUCKDB" -csv -c ".read $WORK/q.sql"
+    run "duckdb $form L=$l" "$PYTHON" "$HERE/duckdb_run.py" "$WORK/q.sql"
   done
 done
 for scale in 1 10 40; do

@@ -8,15 +8,17 @@ build-backend = "maturin"
 
 [project]
 name = "einfold"
-description = "einfold for Python: fast folds over joins in datafusion-python and xarray-sql sessions"
+description = "Array algorithms for tensor computations written in SQL: matrix products, contractions and attention, run fast inside your SQL engine"
 requires-python = ">=3.10"
 version = "0.0.0"
 license = "Apache-2.0"
-# The FFI that the extension speaks is DataFusion 55's.
-dependencies = ["datafusion==55.0.0"]
+readme = "README.md"
+dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest", "numpy", "pyarrow"]
+# The FFI that einfold's DataFusion extension speaks is DataFusion 55's.
+datafusion = ["datafusion==55.0.0"]
+test = ["datafusion==55.0.0", "pytest", "numpy", "pyarrow"]
 
 [tool.maturin]
 module-name = "einfold._native"

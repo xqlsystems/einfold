@@ -15,7 +15,7 @@
 //!   which finds folds and fold pipelines in each plan, as einfold does in
 //!   DataFusion, and plans them as `EinFoldExec`.
 //!
-//! The Python package `einfold` wraps [`EinFold`] in `einfold.install`.
+//! The Python package exports [`EinFold`] as `einfold.datafusion.EinFold`.
 
 use std::ffi::CStr;
 use std::ptr::NonNull;
@@ -125,8 +125,8 @@ impl PhysicalCodec {
     }
 }
 
-/// einfold, as an extension for `SessionContext.with_extensions`. It counts
-/// the plans it was given and those it found folds or pipelines in.
+/// einfold, as an extension for DataFusion's `SessionContext.with_extensions`.
+/// It counts the plans it was given and those it ran folds or pipelines in.
 #[pyclass(name = "EinFold", module = "einfold._native", frozen)]
 #[derive(Default)]
 struct EinFold {

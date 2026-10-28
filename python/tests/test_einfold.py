@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""einfold in datafusion-python sessions: each query gives the same rows
+"""einfold in DataFusion sessions: each query gives the same rows
 with einfold installed as without, and einfold runs the folds and pipelines
 it claims to. The algorithms' semantics are tested in einfold's Rust crates;
 these test the extension around them: installation, the codecs that pass
@@ -17,7 +17,7 @@ import pyarrow as pa
 import pytest
 from datafusion import SessionContext
 
-import einfold
+from einfold.datafusion import EinFold
 
 
 def _tables(ctx, n=300, d=16, h=8):
@@ -63,10 +63,17 @@ def _assert_same(want: pa.Table, got: pa.Table):
         assert math.isclose(w[-1], g[-1], rel_tol=1e-12, abs_tol=1e-12), (w, g)
 
 
+def _install(ctx) -> EinFold:
+    """Installs einfold in `ctx`'s session, and returns the extension."""
+    found = EinFold()
+    ctx.with_extensions(found)
+    return found
+
+
 def _pair(load):
     """A session without einfold and one with it, both with `load`'s tables."""
     off, on = SessionContext(), SessionContext()
-    found = einfold.install(on)
+    found = _install(on)
     load(off)
     load(on)
     return off, on, found
@@ -94,7 +101,7 @@ def test_leaves_other_queries_alone():
 
 def test_shares_the_session_it_was_installed_in():
     ctx = SessionContext()
-    found = einfold.install(ctx)
+    found = _install(ctx)
     _tables(ctx)
     ctx.sql(MATMUL).to_arrow_table()
     assert found.plans_with_einfold() >= 1
@@ -126,7 +133,7 @@ def test_in_xarray_sql():
         ctx.from_dataset("w", w)
 
     off, on = xql.Context(), xql.Context()
-    found = einfold.install(on)
+    found = _install(on)
     load(off)
     load(on)
     _assert_same(off.sql(MATMUL).to_arrow_table(), on.sql(MATMUL).to_arrow_table())
@@ -139,7 +146,7 @@ def test_gradients_through_ddxdb():
             "GROUP BY a.s, w.o), loss AS (SELECT SUM(tanh(z) * tanh(z)) AS l FROM c) ")
     sql = loss + "SELECT s, k, grad(loss, val) AS g FROM a ORDER BY s, k"
     off, on = ddxdb.Context(), ddxdb.Context()
-    found = einfold.install(on)
+    found = _install(on)
     _tables(off)
     _tables(on)
     _assert_same(off.sql(sql).to_arrow_table(), on.sql(sql).to_arrow_table())

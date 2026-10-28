@@ -309,7 +309,7 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
         }
         _ => None,
     };
-    let Ok(with_domain) = Fold::try_new(
+    let with_domain = Fold::try_new(
         fold.dimensions().to_vec(),
         fold.operands().to_vec(),
         outputs,
@@ -319,7 +319,10 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
             carry: (0..width).map(ColumnIndex).collect(),
             missing: None,
         }),
-    ) else {
+    )
+    // The inner fold's conditions, such as a causal mask, hold here too.
+    .and_then(|f| f.with_conditions(fold.conditions().to_vec()));
+    let Ok(with_domain) = with_domain else {
         return Ok(None);
     };
     // The plan it replaces: the left join, as d's columns and the sum.

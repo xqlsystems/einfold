@@ -19,7 +19,8 @@
 //! - **folds from a domain** (ddx's left join from `d` onto a fold, with its
 //!   `CASE`), which the rule must turn into a fold with `d` as its domain;
 //! - **masked folds** (`AND l.a >= r.b`), a fold where both masked columns
-//!   are group keys and a look-alike otherwise;
+//!   are group keys and a look-alike otherwise, alone, from a domain and
+//!   joined back;
 //! - **look-alikes** it must leave alone: no
 //!   `GROUP BY`, `AVG` rather than `SUM`, and a sum that isn't a product;
 //!   and look-alikes of a fold from a domain, in which it must find the fold
@@ -283,7 +284,9 @@ fn query(rng: &mut Rng, joined_back: bool) -> (String, Expect) {
             let regroup = format!(
                 "SELECT d2.a AS a, d2.{col} AS b, {sum} AS v FROM {d2} d2 JOIN ({}) f ON {inner_keys} \
                  GROUP BY {group}",
-                fold(&product, false)
+                // Both of the fold's outputs are group keys, so a mask
+                // between them keeps it a fold.
+                fold(&product, rng.chance(0.3))
             );
             // The value as ddx reads it, masked by d's own row, or plainly;
             // d.v is read either way, so that the test's column is d's.
@@ -320,7 +323,7 @@ fn query(rng: &mut Rng, joined_back: bool) -> (String, Expect) {
                 format!(
                     "SELECT d.a, {reads}, CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 \
                      ELSE s.v END AS v FROM d {join} ({}) s ON {keys}",
-                    fold(&product, false)
+                    fold(&product, rng.chance(0.3))
                 ),
                 expect,
             )
@@ -891,4 +894,52 @@ fn host_plan_runs_where_there_is_no_tokio_runtime() {
         .indent(true)
         .to_string();
     assert!(shown.contains("host_plans=1"), "{shown}");
+}
+
+/// A masked fold under ddx's left join from a domain, and joined back to its
+/// domain: the fold the rule makes keeps the mask, so the pairs it disallows
+/// add nothing, by einfold's kernels and with the host's plan as fallback.
+#[tokio::test]
+async fn masked_folds_keep_their_mask_under_a_domain() {
+    let setup = [
+        "CREATE TABLE l (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,2.0),(1,0,3.0),(1,1,4.0)",
+        "CREATE TABLE r (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,10.0),(1,0,100.0),(1,1,1000.0)",
+        "CREATE TABLE d (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,NULL),(1,0,1.0),(1,1,1.0)",
+    ];
+    let masked = "SELECT l.a AS g0, r.b AS g1, SUM(l.v * r.v) AS v FROM l JOIN r \
+                  ON l.b = r.a AND l.a >= r.b GROUP BY l.a, r.b";
+    let from_domain = format!(
+        "SELECT d.a, d.b, CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 \
+         ELSE s.v END AS v FROM d LEFT JOIN ({masked}) s ON d.a = s.g0 AND d.b = s.g1"
+    );
+    let joined_back = format!(
+        "SELECT d.a, d.b, d.v AS w, COALESCE(s.v, 0.0) AS v FROM d LEFT JOIN ( \
+           SELECT d2.a AS a, d2.b AS b, SUM(f.v) AS v \
+           FROM d d2 JOIN ({masked}) f ON d2.a = f.g0 AND d2.b = f.g1 \
+           GROUP BY d2.a, d2.b) s \
+         ON d.a = s.a AND d.b = s.b"
+    );
+    for sql in [&from_domain, &joined_back] {
+        for fallback in [false, true] {
+            let (plain, with) = (host(4), einfold(4, fallback));
+            for ctx in [&plain, &with] {
+                for s in setup {
+                    ctx.sql(s).await.unwrap().collect().await.unwrap();
+                }
+            }
+            let expected = rows(&plain.sql(sql).await.unwrap().collect().await.unwrap());
+            let frame = with.sql(sql).await.unwrap();
+            let state = Arc::new(frame.task_ctx());
+            let plan = frame.create_physical_plan().await.unwrap();
+            let (found, domains) = exec_folds(&plan);
+            assert!(
+                found > 0 && domains > 0,
+                "einfold finds the fold from d\n{sql}"
+            );
+            let got = datafusion::physical_plan::collect(plan, state)
+                .await
+                .unwrap();
+            assert_eq!(rows(&got), expected, "fallback {fallback}\n{sql}");
+        }
+    }
 }

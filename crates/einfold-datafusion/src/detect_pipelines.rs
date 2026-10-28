@@ -29,9 +29,12 @@
 //!   joined back on `i`; or `exp(s)`, with no shift;
 //! - **the average:** an aggregate grouped by the weights' kept key and the
 //!   values' other columns, of `SUM(w * v.x)`, over the weights joined with a
-//!   values relation on the summed key. It is divided either by `norm.z`, a
-//!   `SUM(w) … GROUP BY i` of the same weights joined on `i` and grouped by
-//!   too, or by a second aggregate of the same `GROUP BY`, `SUM(w)`.
+//!   values relation on the summed key. It is divided by `norm.z`, a
+//!   `SUM(w) … GROUP BY i` of the same weights joined on `i`: either the sum
+//!   (`SUM(w * v.x) / norm.z`, with `norm.z` grouped by too), or each term
+//!   (`SUM(w / norm.z * v.x)`, the spelling ddx can differentiate, since it
+//!   groups by no key that depends on a differentiated column). Or it is
+//!   divided by a second aggregate of the same `GROUP BY`, `SUM(w)`.
 //!
 //! Every copy of the scores and weights must be the same fold with the same
 //! scale and shift; otherwise the shift wouldn't cancel, and the rule
@@ -428,32 +431,37 @@ pub(crate) fn pipeline(p: &Projection) -> Result<Option<LogicalPlan>> {
     }
     let groups = agg.group_expr.len();
     let sum_col = |a: usize| column_at(&p.input, groups + a);
-    // The projection: group keys, then the average, `sum / norm` last.
+    // The projection: group keys, then the average last: `sum / norm`, or
+    // the sum itself when the normalizer divides inside it.
     let Some((value, keys)) = p.expr.split_last() else {
         return Ok(None);
     };
-    let Expr::BinaryExpr(BinaryExpr {
-        left: numerator,
-        op: Operator::Divide,
-        right: denominator,
-    }) = value.clone().unalias()
-    else {
-        return Ok(None);
-    };
-    let (Some(numerator), Some(denominator)) = (column(&numerator), column(&denominator)) else {
-        return Ok(None);
-    };
     let group_of = |c: &Column| (0..groups).find(|&g| column_at(&p.input, g) == *c);
-    let (normalizer, weighted, z_group) = match sums.len() {
-        1 if *numerator == sum_col(0) => match group_of(denominator) {
-            Some(g) => (Normalizer::KeptGroups, 0, Some(g)),
-            None => return Ok(None),
-        },
-        2 if *numerator == sum_col(0) && *denominator == sum_col(1) => {
-            (Normalizer::JoinedRows, 0, None)
+    let (normalizer, weighted, z_group, inside) = match value.clone().unalias() {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Divide,
+            right,
+        }) => {
+            let (Some(numerator), Some(denominator)) = (column(&left), column(&right)) else {
+                return Ok(None);
+            };
+            match sums.len() {
+                1 if *numerator == sum_col(0) => match group_of(denominator) {
+                    Some(g) => (Normalizer::KeptGroups, 0, Some(g), false),
+                    None => return Ok(None),
+                },
+                2 if *numerator == sum_col(0) && *denominator == sum_col(1) => {
+                    (Normalizer::JoinedRows, 0, None, false)
+                }
+                2 if *numerator == sum_col(1) && *denominator == sum_col(0) => {
+                    (Normalizer::JoinedRows, 1, None, false)
+                }
+                _ => return Ok(None),
+            }
         }
-        2 if *numerator == sum_col(1) && *denominator == sum_col(0) => {
-            (Normalizer::JoinedRows, 1, None)
+        Expr::Column(c) if sums.len() == 1 && c == sum_col(0) => {
+            (Normalizer::KeptGroups, 0, None, true)
         }
         _ => return Ok(None),
     };
@@ -463,7 +471,16 @@ pub(crate) fn pipeline(p: &Projection) -> Result<Option<LogicalPlan>> {
     if !leaves(&agg.input, &mut relations, &mut on)? {
         return Ok(None);
     }
-    let product = trace(&agg.input, &sums[weighted])?;
+    let traced = trace(&agg.input, &sums[weighted])?;
+    // With the normalizer inside the sum, `w / z * x` or `w * x / z`: the
+    // product of the weight and the value, and `z`.
+    let (product, z_inside) = match inside {
+        false => (traced, None),
+        true => match divided(traced) {
+            Some((product, z)) => (product, Some(z)),
+            None => return Ok(None),
+        },
+    };
     let Expr::BinaryExpr(BinaryExpr {
         left,
         op: Operator::Multiply,
@@ -541,7 +558,11 @@ pub(crate) fn pipeline(p: &Projection) -> Result<Option<LogicalPlan>> {
             return Ok(None);
         }
         let nl = leaf_of(&n_key, &relations).expect("a leaf");
-        let z = trace(&agg.input, &agg.group_expr[z_group.expect("a group")])?;
+        let z = match (z_group, z_inside) {
+            (Some(g), _) => trace(&agg.input, &agg.group_expr[g])?,
+            (None, Some(z)) => z,
+            (None, None) => return Ok(None),
+        };
         if !normalizes(relations[nl], &weights, kept, column(&n_key), column(&z))? {
             return Ok(None);
         }
@@ -627,6 +648,46 @@ pub(crate) fn pipeline(p: &Projection) -> Result<Option<LogicalPlan>> {
         return Ok(None);
     };
     detect_folds::restore(node.into_plan(), &names, &p.schema)
+}
+
+/// `e` as a product divided by a column: `a / z * b`, `b * (a / z)` or
+/// `a * b / z`, as `(a * b, z)`. Dividing each term by `z` and dividing their
+/// sum by it give the same average, up to one rounding per term, which the
+/// summation bound covers.
+fn divided(e: Expr) -> Option<(Expr, Expr)> {
+    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = e else {
+        return None;
+    };
+    let quotient = |e: &Expr| -> Option<(Expr, Expr)> {
+        match e {
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Divide,
+                right,
+            }) if column(right).is_some() => Some(((**left).clone(), (**right).clone())),
+            _ => None,
+        }
+    };
+    match op {
+        // `a * b / z`.
+        Operator::Divide if column(&right).is_some() => matches!(
+            left.as_ref(),
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Multiply,
+                ..
+            })
+        )
+        .then(|| (*left, *right)),
+        // `a / z * b` or `b * (a / z)`.
+        Operator::Multiply => {
+            if let Some((a, z)) = quotient(&left) {
+                return Some((a * *right, z));
+            }
+            let (a, z) = quotient(&right)?;
+            Some((*left * a, z))
+        }
+        _ => None,
+    }
 }
 
 /// Whether `plan` is `SUM(w) … GROUP BY i` of weights the same as `weights`,

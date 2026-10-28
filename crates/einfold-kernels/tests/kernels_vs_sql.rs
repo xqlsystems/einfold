@@ -155,7 +155,12 @@ impl KeyType {
         match self {
             KeyType::Int => ScalarValue::Int64(Some(i as i64 - 1)),
             KeyType::Pos => ScalarValue::Int64(Some(i as i64)),
-            KeyType::Wide => ScalarValue::UInt64(Some(if i == 0 { 1 << 63 } else { i as u64 })),
+            // 2⁶³ doesn't fit BIGINT, and 2⁶³ - 1 is BIGINT's largest.
+            KeyType::Wide => ScalarValue::UInt64(Some(match i {
+                0 => 1 << 63,
+                1 => (1 << 63) - 1,
+                i => i as u64,
+            })),
             KeyType::Text | KeyType::Dict => ScalarValue::Utf8(Some(format!("k{i}"))),
             KeyType::Float => ScalarValue::Float64(Some([0.0, -0.0, f64::NAN, 2.5, -1.0][i % 5])),
         }

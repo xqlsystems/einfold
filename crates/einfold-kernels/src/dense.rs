@@ -74,7 +74,8 @@ fn worth(cells: usize, rows: usize) -> bool {
 
 /// `column` as non-negative `i64` keys, with their extent (the largest key
 /// plus one), or `None` if it isn't an integer column, or holds a NULL, a
-/// negative key, or one too large for `i64` (an unsigned key of 2⁶³ or more).
+/// negative key, or one too large for `i64` (an unsigned key of 2⁶³ or more),
+/// or whose extent doesn't fit (a key of `i64::MAX`).
 fn keys(column: &ArrayRef) -> Option<(Int64Array, usize)> {
     if !column.data_type().is_integer() || column.null_count() > 0 {
         return None;
@@ -84,7 +85,11 @@ fn keys(column: &ArrayRef) -> Option<(Int64Array, usize)> {
     let keys = keys.as_any().downcast_ref::<Int64Array>()?.clone();
     // One pass for both bounds, which the compiler vectorizes.
     let (lo, hi) = (keys.values().iter()).fold((0, -1), |(lo, hi), &k| (k.min(lo), k.max(hi)));
-    (keys.null_count() == 0 && lo >= 0).then(|| (keys, (hi + 1) as usize))
+    if keys.null_count() > 0 || lo < 0 {
+        return None;
+    }
+    let extent = usize::try_from(hi.checked_add(1)?).ok()?;
+    Some((keys, extent))
 }
 
 /// A row's position over some dimensions, flattened with the first

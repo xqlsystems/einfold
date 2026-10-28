@@ -38,6 +38,8 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use einfold_datafusion::{DetectFolds, EinFoldPlanner};
+
+use crate::lean;
 use futures::Stream;
 
 /// The Tokio runtime einfold's operators run on. This library holds its own
@@ -146,7 +148,8 @@ impl QueryPlanner for Bridge {
         session: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.counts.plans.fetch_add(1, Ordering::Relaxed);
-        let detected = DetectFolds::default().detect(relink(plan.clone())?)?;
+        let plan = lean::localize(relink(plan.clone())?, session).await?;
+        let detected = DetectFolds::default().detect(plan)?;
         let (folds, pipelines) = einfold_nodes(&detected)?;
         if folds + pipelines > 0 {
             self.counts.with_einfold.fetch_add(1, Ordering::Relaxed);

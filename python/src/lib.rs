@@ -32,6 +32,7 @@ use pyo3::types::{PyCapsule, PyDict};
 
 mod bridge;
 mod codec;
+mod lean;
 mod stack;
 
 use bridge::{Bridge, Counts};

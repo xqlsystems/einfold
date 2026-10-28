@@ -128,9 +128,9 @@ enum Known {
     /// (apache/datafusion#24414, fixed after 55.2): no sort-merge joins with
     /// a join filter.
     SortMergeFilterProjection,
-    /// DataFusion's plan, reset with `reset_plan_states` and run again under
-    /// a small memory pool, can hang: no `[rerun]` with a pool
-    /// (einfold#71, upstream).
+    /// DataFusion's plans can hang under a small memory pool when they
+    /// repartition, on a first run as on a rerun: no repartitioning, and no
+    /// `[rerun]`, with a pool (einfold#71, upstream).
     ResetRerunUnderPool,
 }
 
@@ -141,6 +141,17 @@ const KNOWN: &[Known] = &[
     Known::SortMergeFilterProjection,
     Known::ResetRerunUnderPool,
 ];
+
+impl check::Settings {
+    /// These settings, without repartitioning where a memory pool would
+    /// otherwise make DataFusion's plans hang (einfold#71).
+    fn avoiding_pool_hang(mut self) -> Self {
+        if self.pool.is_some() && avoids(Known::ResetRerunUnderPool) {
+            self.no_repartition = true;
+        }
+        self
+    }
+}
 
 /// Whether the simulation steps around `bug`.
 fn avoids(bug: Known) -> bool {
@@ -245,7 +256,8 @@ fn case(seed: u64) -> Case {
             pool: rng
                 .chance(0.15)
                 .then(|| *rng.pick(&[8 << 10, 32 << 10, 256 << 10])),
-        },
+        }
+        .avoiding_pool_hang(),
     }
 }
 
@@ -448,7 +460,10 @@ async fn run_case(case: &Case) -> Outcome {
     );
     register(&host, &case.tables);
     register(&ours, &case.tables);
-    trace("host");
+    trace(&format!(
+        "host, seed {} threads {:?} batch sizes {:?} {:?}",
+        case.seed, case.threads, case.batch_sizes, case.settings
+    ));
     let theirs = check::run(&host, sql).await;
     trace("einfold");
     let mine = check::run(&ours, sql).await;
@@ -1011,6 +1026,64 @@ fn export() {
                 }
                 w.finish().expect("a finished file");
             }
+        }
+    }
+}
+
+/// Plain DataFusion's run of `EINFOLD_SEED`'s query, with the case's own
+/// settings and with variations of them, 20 times each, reporting runs that
+/// didn't finish in 5 s. A reproduction for einfold#71, a hang under a
+/// memory pool, not a property.
+#[test]
+#[ignore]
+fn host_hang() {
+    let seed = env_u64("EINFOLD_SEED").unwrap_or(95007199);
+    let rt = runtime();
+    let case = case(seed);
+    eprintln!(
+        "threads={:?} batch_sizes={:?} settings={:?}",
+        case.threads, case.batch_sizes, case.settings
+    );
+    // Repartitioning back on: the case's settings step around the hang.
+    let base = check::Settings {
+        no_repartition: false,
+        ..case.settings
+    };
+    let variants = [
+        ("the case's", base),
+        ("no pool", check::Settings { pool: None, ..base }),
+        (
+            "no dynamic filters",
+            check::Settings {
+                no_dynamic_filters: true,
+                ..base
+            },
+        ),
+        (
+            "no repartition",
+            check::Settings {
+                no_repartition: true,
+                ..base
+            },
+        ),
+    ];
+    for (name, settings) in variants {
+        for (threads, batch) in [(case.threads[0], case.batch_sizes[0]), (1, 8192), (4, 1)] {
+            let mut hangs = 0;
+            for _ in 0..20 {
+                let host = check::session(threads, None, batch, settings);
+                register(&host, &case.tables);
+                let sql = case.query.sql.clone();
+                let done = rt.block_on(async move {
+                    let run =
+                        tokio::spawn(async move { check::run(&host, &sql).await.result.is_ok() });
+                    tokio::time::timeout(std::time::Duration::from_secs(5), run)
+                        .await
+                        .is_ok()
+                });
+                hangs += usize::from(!done);
+            }
+            eprintln!("{name} settings, threads={threads} batch={batch}: {hangs} of 20 hung");
         }
     }
 }

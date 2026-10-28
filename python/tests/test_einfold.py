@@ -357,3 +357,18 @@ def test_tells_a_table_registered_again_apart():
     off, on = SessionContext(), SessionContext()
     _install(on)
     assert joined(on) == joined(off) == [(0, 1.0, 10.0), (1, 2.0, 20.0)]
+
+
+def test_explains_the_plan_einfold_runs():
+    """EXPLAIN shows the plan that runs, with einfold's fold and its
+    operator; EXPLAIN VERBOSE shows the steps too; and EXPLAIN ANALYZE runs
+    it, and shows which algorithm ran."""
+    off, on, _ = _pair(_tables)
+    explain = on.sql("EXPLAIN " + MATMUL).to_pydict()
+    assert explain["plan_type"] == off.sql("EXPLAIN " + MATMUL).to_pydict()["plan_type"]
+    logical, physical = explain["plan"]
+    assert "Fold: " in logical and "EinFoldExec" in physical
+    verbose = on.sql("EXPLAIN VERBOSE " + MATMUL).to_pydict()["plan_type"]
+    assert len(verbose) > 2 and "physical_plan" in verbose
+    analyzed = "\n".join(on.sql("EXPLAIN ANALYZE " + MATMUL).to_pydict()["plan"])
+    assert "dense_folds=1" in analyzed

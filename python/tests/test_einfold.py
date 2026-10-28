@@ -296,3 +296,26 @@ def test_runs_a_masked_fold():
     off, on, found = _pair(_attention_tables)
     _assert_same(off.sql(MASKED_SCORES).to_arrow_table(), on.sql(MASKED_SCORES).to_arrow_table())
     assert found.plans_with_einfold() >= 1
+
+
+def test_sees_values_changed_in_place():
+    """xarray-sql keeps a dataset already in memory as an in-memory table over
+    its arrays, so a value changed in place changes what the next query
+    returns. einfold reads such a table through its own copy, made for each
+    query, which must see the change too."""
+    xr = pytest.importorskip("xarray")
+    xql = pytest.importorskip("xarray_sql")
+    rng = np.random.default_rng(1)
+    a = xr.Dataset({"val": (("s", "k"), rng.standard_normal((50, 16)))},
+                   coords={"s": np.arange(50), "k": np.arange(16)})
+    w = xr.Dataset({"val": (("k", "o"), rng.standard_normal((16, 8)))},
+                   coords={"k": np.arange(16), "o": np.arange(8)})
+    off, on = xql.Context(), xql.Context()
+    found = _install(on)
+    for ctx in (off, on):
+        ctx.from_dataset("a", a)
+        ctx.from_dataset("w", w)
+    _assert_same(off.sql(MATMUL).to_arrow_table(), on.sql(MATMUL).to_arrow_table())
+    w["val"].values *= -2.0
+    _assert_same(off.sql(MATMUL).to_arrow_table(), on.sql(MATMUL).to_arrow_table())
+    assert found.plans_with_einfold() >= 2

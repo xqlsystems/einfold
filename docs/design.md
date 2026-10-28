@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # einfold: Fast Folds over Joins, for Tensors and the XQL Model
 
-Status: draft v17. Author: Alex Merose. Last updated: 2026-10-26. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
+Status: draft v18. Author: Alex Merose. Last updated: 2026-10-28. Repository: [xqlsystems/einfold](https://github.com/xqlsystems/einfold). License: Apache-2.0.
 
 This doc gives the design and the reasons for it. Its companion, the [supplement](supplement.md), holds the details: algorithms, rule tables, correctness arguments, and the evidence from spikes. The supplement's sections are numbered to match this doc's.
 
@@ -129,6 +129,7 @@ Three more problems come from the XQL setting:
 6. **A chunk is a partition.** Storage tiles are the natural unit of reading, pruning, parallelism, and partial aggregation (section 8.2).
 7. **Composable by default.** Readers, writers, fact providers, and planners are plugins behind narrow interfaces. Nothing in the core knows which engine or device is downstream.
 8. **Users declare semantics; einfold proves optimizations.** Anything that changes results (a filter on values, a mask, a top-k selection, an approximation such as sampling) is written by the user in SQL, and einfold keeps its meaning. Assertions that do not change results (constraints, statistics, layout metadata) are facts that einfold may exploit. einfold infers an optimization on its own only when it can prove it exact (section 9.2).
+9. **Never more memory than the host.** For models trained in SQL, memory limits size as much as time does. einfold's operators take memory as the host's do: they reserve what they read and what their kernels allocate from the host's memory pool, before allocating it. Where the pool can't give it, they run the host's own plan for the same rows, whose operators can spill to disk. Every benchmark measures peak memory next to time (sections 10.2 and 15).
 
 ## 5. Goals and non-goals
 
@@ -485,6 +486,7 @@ EinFold fuses the aggregate into the join, so join rows never exist: each joined
   - otherwise compute the producer's tile with a GEMM, map it, and fold it into the consumer's state in the accumulator, skipping masked pairs in a partial tile.
 
   Tile sizes are chosen from the shape alone, and each consumer tile is owned by one thread, so the bits don't depend on the thread count (section 8.6). Memory is a few tiles per thread.
+- **Memory.** `EinFoldExec` reads its inputs whole and holds them while its kernel runs, where the host's hash join holds only its smaller side and streams the other. So it reserves each input as it reads it, and its kernels ask before they allocate their working arrays, through a budget the host's memory pool answers. Where the pool says no, it runs the plan it replaced, which every detected fold keeps, unplanned until then. It also reports how many rows it emits, so that the host plans the operators above it as it would its own: a hash join above holds the smaller side. Next, the positional fold above should stream its larger operand in row blocks, so that its peak stays below the host's without a pool to enforce it. That needs each dimension's extent before reading it: a dictionary-encoded dimension's dictionary length, when the dictionary is the whole axis, or Exact statistics, or else a first pass over the keys.
 
 Two spikes measured them on CPU:
 
@@ -552,6 +554,7 @@ The spike index, [`docs/spikes/README.md`](spikes/README.md), lists each spike w
 - **The tile-size proposer.** Extraction can only choose sizes the proposer offers (spike S20). Which sizes to propose for general folds, beyond storage sizes, their least common multiples and halvings, is open.
 - **Upstream reports.** Bugs found by the spikes, not yet filed: DataFusion's `Unparser` drops predicates of a decorrelated subquery (TPC-H Q22) and refers to tables outside unaliased subqueries (S7); zarr-datafusion pairs a lower-dimensional data variable with its dimension wrongly (S1), and its pushed-down aggregates accumulate integers in `f64` (S12). Each needs the maintainers, and the author's go-ahead.
 - **Gaps found by the demos** ([`demos.md`](demos.md)): demo 1's gaps (fusion across folds, the online softmax and softmax detection) are designed in v16 (sections 8.6 and 9.6). Open: semi-join reduction through plans many layers deep (demo 3), and fusing pipelines of more than two folds, such as a transformer block (demo 2).
+- **Dense chains of folds.** In a training step, one contraction's output is usually the next one's input. Each `EinFoldExec` writes its output as rows, and the next reads them back and makes them dense again. Handing the dense form from one einfold operator to the next would keep the joined intermediates from ever existing as rows, which is most of what remains of a GPT step's memory. Open: the form handed on (an array with its dimensions' extents and coordinate maps), how a host operator between two folds, such as a projection or a join to a domain, reads it, and when a chain is worth keeping dense.
 - **The fusion search.** Demo 1 needs one fusion, which a hand-written rule can make. Pipelines of many folds, where fusing one pair rules out fusing another, may need a search. That is the case for egglog (section 7.6), with EqiForge as the precedent (section 9.6).
 - **Explicit API.** Offer an `einsum(...)` table function next to automatic detection? Useful for users and tests.
 - **Extension governance.** Where does the `Fold` relation's spec live, and is it proposed upstream to Substrait?
@@ -571,7 +574,7 @@ The spike index, [`docs/spikes/README.md`](spikes/README.md), lists each spike w
 
 Three end-to-end demos, rediscovering FlashAttention, NanoGPT in SQL with its sparsity record as a diff, and GraphCast with pushdown, are described in [`demos.md`](demos.md).
 
-Each benchmark runs with einfold off and on, on the same host. That is the measure of einfold's worth: speedup on someone else's engine. Each milestone in section 16 names the benchmark it must win before the next milestone starts.
+Each benchmark runs with einfold off and on, on the same host, and reports time and peak memory. That is the measure of einfold's worth: speedup on someone else's engine, in no more memory than it takes (principle 9). Each milestone in section 16 names the benchmark it must win before the next milestone starts.
 
 ## 16. Roadmap
 

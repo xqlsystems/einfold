@@ -24,6 +24,13 @@ From the adversarial review of the kernel (#14) and operator (#16):
 - **Use positions, not hashes, for small extents.** Dictionary-encode each dimension to dense positions once; the group is then `i · n_j + j`, and the state is a flat array. Fall back to hashing only when the output's extents are too large.
 - **Behave like a DataFusion operator:** reserve memory from the `MemoryPool`, run CPU-bound work off the async runtime, use every core, emit batches of `batch_size`, and report metrics for `EXPLAIN ANALYZE`. For repeatable bits in parallel, split work into fixed blocks chosen from the shape, never from the thread count, add partial results in block order, and visit rows in position order rather than arrival order. Partitioning the output keys alone serializes long sums, and "input order" isn't fixed by hosts (spike S24).
 
+From running einfold under xarray-sql's GPT, a model written and trained in SQL (#77, #79, #81):
+
+- **Profile through the real bridge.** Each cost that dominated was outside the kernels: every scan crossed DataFusion's FFI and converted the whole session; the Python layer kept its last 1,024 plans and their hash tables alive; each fallback was planned with its whole subtree, which grows with the square of a plan's depth; and starting threads cost more than the GPT's small folds. None showed in benchmarks of single queries.
+- **Report statistics.** DataFusion's planner chooses which side of a hash join to hold by its inputs' row counts. An operator that reports none makes the join above it hold the side it happens to be given, which cost the GPT's loss half its execution time and made einfold run short of memory where the host doesn't. Cache them: the planner asks at every join, and each question walks the plan below.
+- **Plan a fallback only if it runs.** A fallback kept as a logical plan costs nothing, and makes it cheap for every fold to keep one, for memory as well as for declines.
+- **Batch dimensions are common.** A multi-head model's scores are grouped by batch and head, which both operands hold. Without a role for them, the dense algorithm declined on every one of the GPT's attention folds.
+
 ## The algebra and the IR
 
 From the maintainer's review of the IR (#6):

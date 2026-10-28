@@ -13,7 +13,7 @@
 //! encoded as an index into a registry here, and decoded back to the same
 //! object.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use datafusion::arrow::datatypes::SchemaRef;
@@ -28,31 +28,56 @@ use datafusion_proto::physical_plan::{PhysicalExtensionCodec, PhysicalProtoConve
 /// Marks a buffer [`ByReference`] wrote.
 const MAGIC: &[u8] = b"einfold-ref:";
 
-/// How many encoded plans are kept. A plan is decoded right after it is
-/// encoded, when the planner hands it back to the session, so only the
-/// latest few are ever needed.
-const PLANS_KEPT: usize = 1024;
-
-/// The tables encoded and not yet decoded, by id. A plan is encoded on the
-/// session's side and decoded on einfold's within one planning call, so a
-/// table is held from its encoding until its decoding, and no longer: a
-/// table the session replaces is freed with it.
-#[derive(Default)]
-struct Tables {
+/// What was encoded and not yet decoded, by id. A plan is encoded on one
+/// side of the FFI and decoded on the other within one planning call, so
+/// each table or plan is held from its encoding until its decoding, and no
+/// longer: a table the session replaces is freed with it, and so is a plan
+/// once the session drops it, with what its operators keep, such as a hash
+/// join's table.
+struct Pending<T: ?Sized> {
     next: u64,
-    pending: HashMap<u64, Arc<dyn TableProvider>>,
+    held: HashMap<u64, Arc<T>>,
 }
 
-static TABLES: Mutex<Option<Tables>> = Mutex::new(None);
-
-/// The plans encoded so far: the last [`PLANS_KEPT`], from id `first` on.
-#[derive(Default)]
-struct Plans {
-    first: u64,
-    kept: VecDeque<Arc<dyn ExecutionPlan>>,
+impl<T: ?Sized> Pending<T> {
+    fn new() -> Self {
+        Pending {
+            next: 0,
+            held: HashMap::new(),
+        }
+    }
 }
 
-static PLANS: Mutex<Option<Plans>> = Mutex::new(None);
+static TABLES: Mutex<Option<Pending<dyn TableProvider>>> = Mutex::new(None);
+static PLANS: Mutex<Option<Pending<dyn ExecutionPlan>>> = Mutex::new(None);
+
+/// Holds `item` until it is taken, and returns its id.
+fn hold<T: ?Sized>(pending: &Mutex<Option<Pending<T>>>, item: Arc<T>) -> u64 {
+    let mut pending = pending
+        .lock()
+        .expect("no panic while holding encoded objects");
+    let pending = pending.get_or_insert_with(Pending::new);
+    let id = pending.next;
+    pending.next += 1;
+    pending.held.insert(id, item);
+    id
+}
+
+/// The item held as `id`, no longer held.
+fn take<T: ?Sized>(pending: &Mutex<Option<Pending<T>>>, id: u64) -> Option<Arc<T>> {
+    let mut pending = pending
+        .lock()
+        .expect("no panic while holding encoded objects");
+    pending.as_mut().and_then(|p| p.held.remove(&id))
+}
+
+/// How many items are held.
+fn held<T: ?Sized>(pending: &Mutex<Option<Pending<T>>>) -> usize {
+    let pending = pending
+        .lock()
+        .expect("no panic while holding encoded objects");
+    pending.as_ref().map_or(0, |p| p.held.len())
+}
 
 fn write(buf: &mut Vec<u8>, id: u64) {
     buf.extend_from_slice(MAGIC);
@@ -66,8 +91,12 @@ fn read(buf: &[u8]) -> Option<u64> {
 
 /// How many encoded tables are waiting to be decoded.
 pub(crate) fn tables_pending() -> usize {
-    let tables = TABLES.lock().expect("no panic while holding the tables");
-    tables.as_ref().map_or(0, |t| t.pending.len())
+    held(&TABLES)
+}
+
+/// How many encoded plans are waiting to be decoded.
+pub(crate) fn plans_pending() -> usize {
+    held(&PLANS)
 }
 
 /// Codecs that pass tables and plans by reference within this process.
@@ -93,9 +122,7 @@ impl LogicalExtensionCodec for ByReference {
         let Some(id) = read(buf) else {
             return plan_err!("not a table einfold's codec encoded");
         };
-        let mut tables = TABLES.lock().expect("no panic while holding the tables");
-        let table = tables.as_mut().and_then(|t| t.pending.remove(&id));
-        match table {
+        match take(&TABLES, id) {
             Some(table) => Ok(table),
             None => plan_err!("einfold's codec holds no table {id}"),
         }
@@ -107,12 +134,7 @@ impl LogicalExtensionCodec for ByReference {
         node: Arc<dyn TableProvider>,
         buf: &mut Vec<u8>,
     ) -> Result<()> {
-        let mut tables = TABLES.lock().expect("no panic while holding the tables");
-        let tables = tables.get_or_insert_with(Tables::default);
-        let id = tables.next;
-        tables.next += 1;
-        tables.pending.insert(id, node);
-        write(buf, id);
+        write(buf, hold(&TABLES, node));
         Ok(())
     }
 }
@@ -128,16 +150,8 @@ impl PhysicalExtensionCodec for ByReference {
         let Some(id) = read(buf) else {
             return plan_err!("not a plan einfold's codec encoded");
         };
-        let plan = {
-            let plans = PLANS.lock().expect("no panic while holding the plans");
-            let plan = plans.as_ref().and_then(|p| {
-                let at = id.checked_sub(p.first)?;
-                p.kept.get(at as usize).cloned()
-            });
-            match plan {
-                Some(plan) => plan,
-                None => return plan_err!("einfold's codec no longer holds plan {id}"),
-            }
+        let Some(plan) = take(&PLANS, id) else {
+            return plan_err!("einfold's codec holds no plan {id}");
         };
         match inputs.is_empty() {
             true => Ok(plan),
@@ -153,15 +167,7 @@ impl PhysicalExtensionCodec for ByReference {
         buf: &mut Vec<u8>,
         _proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<()> {
-        let mut plans = PLANS.lock().expect("no panic while holding the plans");
-        let plans = plans.get_or_insert_with(Plans::default);
-        let id = plans.first + plans.kept.len() as u64;
-        plans.kept.push_back(node);
-        if plans.kept.len() > PLANS_KEPT {
-            plans.kept.pop_front();
-            plans.first += 1;
-        }
-        write(buf, id);
+        write(buf, hold(&PLANS, node));
         Ok(())
     }
 }

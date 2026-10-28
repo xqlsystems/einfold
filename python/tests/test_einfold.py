@@ -11,6 +11,10 @@ tables and plans by reference, and the planner across the FFI."""
 from __future__ import annotations
 
 import math
+import resource
+import subprocess
+import sys
+import textwrap
 
 import numpy as np
 import pyarrow as pa
@@ -174,3 +178,59 @@ def test_plans_deep_queries(depth):
             {"i": [0, 1, 2], "x": [1.0, 2.0, 3.0]})]])
     sql = _deep(depth)
     assert on.sql(sql).to_pydict() == off.sql(sql).to_pydict()
+
+
+def _in_a_process(depth, thread_stack=None):
+    """Plans and runs `_deep(depth)` in a process of its own, einfold off and
+    then on, from the main thread or from a thread with a stack of
+    `thread_stack` bytes, and returns the process, so that a crash fails the
+    test rather than the test run. It prints whether the two answers agree."""
+    script = textwrap.dedent(f"""
+        import threading
+        import pyarrow as pa
+        from datafusion import SessionContext
+        from einfold.datafusion import EinFold
+
+        def run():
+            answers = []
+            for on in (False, True):
+                ctx = SessionContext()
+                if on:
+                    ctx.with_extensions(EinFold())
+                ctx.register_record_batches("base", [[pa.record_batch(
+                    {{"i": [0, 1, 2], "x": [1.0, 2.0, 3.0]}})]])
+                answers.append(ctx.sql({_deep(depth)!r}).to_pydict())
+            print(answers[0] == answers[1])
+
+        if {thread_stack!r} is None:
+            run()
+        else:
+            threading.stack_size({thread_stack!r})
+            thread = threading.Thread(target=run)
+            thread.start()
+            thread.join()
+        """)
+    # A crash writes no core file, which would take most of the test's time.
+    no_core = lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                          preexec_fn=no_core)
+
+
+def test_plans_deeper_than_the_default_stack():
+    """DataFusion's FFI decodes each plan, on the thread that asks for it,
+    with about 8 KB of stack per node. A chain of 350 joins needs more than
+    Linux's default 8 MB stack, which DataFusion alone plans: einfold makes
+    room on the main thread's stack."""
+    done = _in_a_process(350)
+    assert done.returncode == 0 and done.stdout.strip() == "True", done.stderr[-2000:]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux's default thread stack")
+def test_decoding_a_deep_plan_overflows_another_threads_stack():
+    """Pins a limit that isn't einfold's: datafusion-proto decodes a plan by
+    recursing without growing its stack, unlike DataFusion's other walks of
+    a plan, so a plan of 350 joins asked for on a thread with an 8 MB stack
+    overflows it, and the process dies. Once the decoding grows its stack,
+    this fails, and einfold's main-thread workaround can go."""
+    done = _in_a_process(350, thread_stack=8 << 20)
+    assert done.returncode < 0, (done.returncode, done.stdout)

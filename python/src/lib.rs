@@ -32,6 +32,7 @@ use pyo3::types::{PyCapsule, PyDict};
 
 mod bridge;
 mod codec;
+mod stack;
 
 use bridge::{Bridge, Counts};
 use codec::ByReference;
@@ -206,6 +207,9 @@ impl EinFold {
         ctx: Bound<'py, PyAny>,
         fallback: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
+        // Plans reach einfold as protobuf, decoded on the thread that asks
+        // for them: see `stack`.
+        stack::deepen();
         let planner = capsule(&fallback, "__datafusion_query_planner__")?;
         // SAFETY: capsules of this name hold an FFI_QueryPlanner.
         let session_planner: FFI_QueryPlanner =

@@ -772,9 +772,7 @@ async fn fallbacks_hold_only_the_hosts_plan() {
         .unwrap()
         .fallback()
         .expect("a fallback");
-    let mut inner = Vec::new();
-    execs(fallback, &mut inner);
-    assert!(inner.is_empty(), "the fallback runs einfold again");
+    assert_eq!(folds(fallback), (0, 0), "the fallback runs einfold again");
 }
 
 /// A domain whose duplicate rows disagree on the regroup's test: the uniqueness
@@ -848,10 +846,12 @@ async fn joined_back_fallbacks_hold_only_the_hosts_plan() {
     execs(&plan, &mut found);
     assert_eq!(found.len(), 1, "one fold joined back");
     let any: &dyn std::any::Any = found[0].as_ref();
-    let fallback = (any.downcast_ref::<EinFoldExec>().unwrap().fallback()).expect("a fallback");
-    let mut inner = Vec::new();
-    execs(fallback, &mut inner);
-    assert!(inner.is_empty(), "the fallback runs einfold again");
+    let fallback = any
+        .downcast_ref::<EinFoldExec>()
+        .unwrap()
+        .fallback()
+        .expect("a fallback");
+    assert_eq!(folds(fallback), (0, 0), "the fallback runs einfold again");
 }
 
 #[test]

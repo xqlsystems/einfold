@@ -27,6 +27,10 @@
 //!    to check that the domain's keys are unique declines whenever two domain
 //!    rows have the keys of one group, and otherwise, when it accepts, gives
 //!    the same rows, bit for bit.
+//! 5. **Budgets.** Given a memory budget of exactly the bytes the kernels
+//!    asked for with none, they give the same rows by the same algorithm, bit
+//!    for bit; given one byte fewer, they stop with a memory error. So a
+//!    kernel asks before it allocates, and asks the same for the same rows.
 //!
 //! Half the cases are drawn from a *dense family*, shaped so that the dense
 //! algorithm may apply: non-negative integer keys with no NULLs in the
@@ -40,6 +44,7 @@
 //! `EINFOLD_CASES=<n>` (and a starting `EINFOLD_SEED`).
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -47,6 +52,7 @@ use datafusion::arrow::array::{
     StringArray, UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::error::ArrowError;
 use datafusion::common::ScalarValue;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -54,7 +60,7 @@ use einfold_ir::{
     Aggregate, ColumnIndex, Dimension, DimensionId, Domain, DomainKey, Fold, Key, KeyEquality,
     Operand, Output, RowValue,
 };
-use einfold_kernels::{Algorithm, DomainRows, FloatKeys, Host, Options, Relation};
+use einfold_kernels::{Algorithm, Budget, DomainRows, FloatKeys, Folded, Host, Options, Relation};
 
 struct Rng(u64);
 
@@ -657,9 +663,80 @@ fn run_fold(case: &Case, rng: &mut Rng) -> (Vec<RecordBatch>, Algorithm) {
     };
     let (a, b) = (batches(&case.a, rng), batches(&case.b, rng));
     let domain = case.domain.as_ref().map(|t| batches(t, rng));
+    let threads = 1 + rng.below(8);
+    let folded = fold_within(case, [&a, &b], domain.as_deref(), threads, None).unwrap();
+    (folded.batches, folded.algorithm)
+}
 
+/// A budget that counts what it gives, up to a limit.
+#[derive(Debug)]
+struct Limit {
+    given: AtomicUsize,
+    limit: usize,
+}
+
+impl Budget for Limit {
+    fn grow(&self, bytes: usize) -> bool {
+        let given = self.given.load(Ordering::Relaxed);
+        let ok = given.saturating_add(bytes) <= self.limit;
+        if ok {
+            self.given.fetch_add(bytes, Ordering::Relaxed);
+        }
+        ok
+    }
+}
+
+/// Checks invariant 5 for a case, on one batching of its tables: the bytes
+/// the kernels ask for, and the result given exactly those and one fewer.
+fn check_budget(case: &Case, rng: &mut Rng, fail: impl Fn(String)) {
+    let batches = |t: &Table, rng: &mut Rng| -> Vec<RecordBatch> {
+        t.partitions(rng).into_iter().flatten().collect()
+    };
+    let (a, b) = (batches(&case.a, rng), batches(&case.b, rng));
+    let domain = case.domain.as_ref().map(|t| batches(t, rng));
+    let threads = 1 + rng.below(8);
+    let run = |limit: usize| {
+        let budget = Limit {
+            given: AtomicUsize::new(0),
+            limit,
+        };
+        let folded = fold_within(case, [&a, &b], domain.as_deref(), threads, Some(&budget));
+        (folded, budget.given.into_inner())
+    };
+    let (free, asked) = run(usize::MAX);
+    let free = free.unwrap();
+    let (exact, _) = run(asked);
+    match exact {
+        Ok(f) if f.algorithm == free.algorithm && same_bits(&f.batches, &free.batches) => {}
+        other => fail(format!("given the {asked} bytes it asked for: {other:?}")),
+    }
+    if asked > 0 {
+        match run(asked - 1).0 {
+            Err(ArrowError::MemoryError(_)) => {}
+            other => fail(format!(
+                "given {} of the {asked} bytes it asked for: {other:?}",
+                asked - 1
+            )),
+        }
+    }
+}
+
+/// Whether two results have the same rows, in the same order, bit for bit.
+fn same_bits(x: &[RecordBatch], y: &[RecordBatch]) -> bool {
+    x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p == q)
+}
+
+/// `case`'s fold over operand batches `a` and `b`, and `domain`'s, on
+/// `threads` threads, within `budget`.
+fn fold_within(
+    case: &Case,
+    [a, b]: [&[RecordBatch]; 2],
+    domain: Option<&[RecordBatch]>,
+    threads: usize,
+    budget: Option<&dyn Budget>,
+) -> Result<Folded, ArrowError> {
     let domain = (case.domain.as_ref())
-        .zip(domain.as_deref())
+        .zip(domain)
         .map(|(t, d)| Relation::new(&t.schema, d));
     let schema = einfold_kernels::schema(
         &case.fold,
@@ -669,19 +746,18 @@ fn run_fold(case: &Case, rng: &mut Rng) -> (Vec<RecordBatch>, Algorithm) {
     .unwrap();
     let options = Options {
         host: HOST,
-        threads: 1 + rng.below(8),
+        threads,
+        budget,
         ..Options::default()
     };
-    let folded = einfold_kernels::fold(
+    einfold_kernels::fold(
         &case.fold,
-        Relation::new(&case.a.schema, &a),
-        Relation::new(&case.b.schema, &b),
+        Relation::new(&case.a.schema, a),
+        Relation::new(&case.b.schema, b),
         domain,
         schema,
         options,
     )
-    .unwrap();
-    (folded.batches, folded.algorithm)
 }
 
 /// Checks invariant 4 for a case with a domain that the dense path computes,
@@ -705,6 +781,7 @@ fn check_unique_domain(case: &Case, rng: &mut Rng, fail: impl Fn(String)) -> boo
             host: HOST,
             threads: 1 + rng.below(8),
             domain_rows,
+            budget: None,
         };
         let d = d.map(|batches| Relation::new(&domain.schema, batches));
         einfold_kernels::fold_dense(fold, a, b, d, schema.unwrap(), options).unwrap()
@@ -789,6 +866,7 @@ async fn fold_matches_sql() {
 
         let (ours, ran) = run_fold(&case, &mut rng);
         let (again, _) = run_fold(&case, &mut rng);
+        check_budget(&case, &mut rng, fail);
         dense_family += usize::from(dense);
         dense_ran += usize::from(ran == Algorithm::Dense);
         let [op_a, op_b] = case.fold.operands() else {

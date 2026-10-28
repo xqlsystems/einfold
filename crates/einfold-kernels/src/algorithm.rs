@@ -56,17 +56,8 @@ pub fn fold_dense(
     schema: SchemaRef,
     options: Options,
 ) -> Result<Option<Vec<RecordBatch>>> {
-    let threads = options.threads.max(1);
     let domain = domain.map(|d| d.batches);
-    dense::fold(
-        fold,
-        a.batches,
-        b.batches,
-        domain,
-        schema,
-        threads,
-        options.domain_rows,
-    )
+    dense::fold(fold, a.batches, b.batches, domain, schema, &options)
 }
 
 /// `fold` over operands `a` and `b`, and its domain if it has one, as
@@ -92,17 +83,8 @@ pub fn fold(
     if options.domain_rows == DomainRows::UniqueKeys {
         return bad("only fold_dense checks that a domain's keys are unique".into());
     }
-    let threads = options.threads.max(1);
     let domain = domain.map(|d| d.batches);
-    let dense = dense::fold(
-        fold,
-        a.batches,
-        b.batches,
-        domain,
-        schema.clone(),
-        threads,
-        DomainRows::Any,
-    )?;
+    let dense = dense::fold(fold, a.batches, b.batches, domain, schema.clone(), &options)?;
     if let Some(batches) = dense {
         return Ok(Folded {
             algorithm: Algorithm::Dense,
@@ -112,10 +94,16 @@ pub fn fold(
     if !fold.conditions().is_empty() {
         return bad("the discrimination algorithm computes no masks".into());
     }
-    // The discrimination algorithm reads each operand as one batch.
+    // The discrimination algorithm reads each operand as one batch, a copy.
+    let size = |r: &Relation| -> usize {
+        (r.batches.iter())
+            .map(RecordBatch::get_array_memory_size)
+            .sum()
+    };
+    options.reserve(size(&a) + size(&b), "the operands as one batch each")?;
     let whole = |r: Relation| compute::concat_batches(r.schema, r.batches);
     let (a, b) = (whole(a)?, whole(b)?);
-    let batches = discriminate::fold(fold, &a, &b, domain, schema, options.host, threads)?;
+    let batches = discriminate::fold(fold, &a, &b, domain, schema, &options)?;
     Ok(Folded {
         algorithm: Algorithm::Discriminate,
         batches,

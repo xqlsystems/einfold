@@ -51,7 +51,8 @@ use arrow::error::ArrowError;
 use einfold_ir::{DimensionId, Fold, KeyEquality};
 
 use crate::keys::{self, Keys};
-use crate::{dense, Host, Result};
+use crate::options::Options;
+use crate::{dense, Result};
 
 /// Output keys of `a` per block of the product, each block on one thread.
 const XB: usize = 256;
@@ -371,9 +372,9 @@ pub(crate) fn fold(
     b: &RecordBatch,
     domain: Option<&[RecordBatch]>,
     schema: SchemaRef,
-    host: Host,
-    threads: usize,
+    options: &Options,
 ) -> Result<Vec<RecordBatch>> {
+    let (host, threads) = (options.host, options.threads.max(1));
     // Rows are ranked as u32s: the operands' together, and each operand's
     // with the domain's.
     let (na, nb) = (a.num_rows(), b.num_rows());
@@ -410,6 +411,30 @@ pub(crate) fn fold(
         f.ok_or_else(|| ArrowError::InvalidArgumentError("factors must be Float64".into()))
     };
     let (a_factors, b_factors) = (factors(0, a)?, factors(1, b)?);
+    // What ranking and ordering the rows allocate, per row ranked: its keys
+    // in the row format, which take about what the key columns do; the
+    // radix sort's words and pairs, 24 bytes; its rank, 4; and the orders of
+    // each operand's rows, with b's laid out by z, about 40 more. The join's
+    // keys rank a's and b's rows, and the outputs' rank them again, with the
+    // domain's.
+    let nd: usize = domain.map_or(0, |d| d.iter().map(RecordBatch::num_rows).sum());
+    let key_bytes = |batch: &RecordBatch, op: usize| -> usize {
+        (ops[op].keys.iter())
+            .map(|k| batch.column(k.column.0).get_array_memory_size())
+            .sum()
+    };
+    let ranked = (na + nb)
+        .saturating_mul(2)
+        .saturating_add(nd.saturating_mul(2));
+    let working = ranked
+        .saturating_mul(28)
+        .saturating_add((na + nb).saturating_mul(40))
+        .saturating_add(
+            key_bytes(a, 0)
+                .saturating_add(key_bytes(b, 1))
+                .saturating_mul(2),
+        );
+    options.reserve(working, "the discrimination algorithm's ranks")?;
 
     // The join's keys, over both operands at once; rows with a NULL in a key
     // compared with `=` join nothing.
@@ -502,6 +527,22 @@ pub(crate) fn fold(
         })
         .collect();
 
+    // The groups the product makes: no more than the joined pairs, nor than
+    // every (x, y). Each takes 24 bytes, and then, without a domain, a row of
+    // the output, 8 bytes a column; with one, the output is a column of 8
+    // bytes per domain row, beside the domain's own columns.
+    let pairs: usize = (a_rows.iter())
+        .map(|&r| b_start[a_z(r) + 1] - b_start[a_z(r)])
+        .fold(0, usize::saturating_add);
+    let groups = pairs.min(nx.saturating_mul(ny));
+    let output = match fold.domain() {
+        None => groups.saturating_mul(8 * (fold.outputs().len() + 1)),
+        Some(_) => nd.saturating_mul(8),
+    };
+    options.reserve(
+        groups.saturating_mul(24).saturating_add(output),
+        "the discrimination algorithm's groups",
+    )?;
     // Gustavson's product, blocks of x on the threads in turn, each block's
     // groups in (x, y) order.
     let blocks = dense::par_tasks(nx.div_ceil(XB), threads, |t| {

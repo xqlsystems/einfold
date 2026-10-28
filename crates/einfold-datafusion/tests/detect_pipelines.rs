@@ -13,7 +13,8 @@
 //! - **demo 1's causal attention**, the maximum as a window (`MAX(s) OVER
 //!   (PARTITION BY i)`) or as `MAX(s) … GROUP BY i` joined back, the scores
 //!   divided or multiplied by a constant or neither, with the causal mask
-//!   either way round or none, normalized by `norm.z`;
+//!   either way round or none, normalized by `norm.z`, either the sum or,
+//!   as ddx writes it, each term (`SUM(w / norm.z * v.x)`);
 //! - **a weighted average over joined rows**, `SUM(exp(s) * v.x) / SUM(exp(s))`
 //!   with no shift, as a recommender or kernel smoother writes it;
 //! - **look-alikes** it must leave alone: a maximum partitioned by the summed
@@ -89,7 +90,19 @@ fn query(rng: &mut Rng) -> (String, Expect) {
                     weights AS (SELECT scores.i, scores.j, exp(scores.s - m.m) AS w \
                     FROM scores JOIN m ON scores.i = m.i)";
     let norm = "SELECT i, SUM(w) AS z FROM weights GROUP BY i";
-    match rng.below(8) {
+    // The normalizer inside the sum, as ddx writes it: no GROUP BY key
+    // depends on the weights.
+    let inside = |weights: &str| {
+        format!(
+            "WITH {scores}, {weights}, norm AS ({norm}) \
+             SELECT weights.i AS t, v.c, SUM(weights.w / norm.z * v.x) AS x \
+             FROM weights JOIN v ON weights.j = v.t JOIN norm ON weights.i = norm.i \
+             GROUP BY weights.i, v.c"
+        )
+    };
+    match rng.below(10) {
+        8 => (inside(window), Expect::Pipeline),
+        9 => (inside(group_by), Expect::Pipeline),
         0 | 1 => (average(window, norm), Expect::Pipeline),
         2 | 3 => (average(group_by, norm), Expect::Pipeline),
         4 => (

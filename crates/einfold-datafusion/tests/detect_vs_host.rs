@@ -20,13 +20,20 @@
 //!   `CASE`), which the rule must turn into a fold with `d` as its domain;
 //! - **look-alikes** it must leave alone: a mask (`AND l.a >= r.b`), no
 //!   `GROUP BY`, `AVG` rather than `SUM`, and a sum that isn't a product;
-//!   and look-alikes of a fold from a domain, in which it must find the fold but give it no
-//!   domain: a projection that reads the fold's keys, and inner and right
-//!   joins.
+//!   and look-alikes of a fold from a domain, in which it must find the fold
+//!   but give it no domain: a projection that reads the fold's keys, and
+//!   inner and right joins;
+//! - **folds joined back to their domain** (ddx's gradient step: the fold
+//!   joined to `d`, grouped again by `d`'s keys, and left-joined from `d`),
+//!   which the rule must turn into a fold from `d` that checks `d`'s keys are
+//!   unique when it runs, and their look-alikes, which keep the fold alone.
 //!
 //! Invariants: the same rows, as a multiset, bit for bit (every NaN alike), as
-//! without einfold; the rule fires on every fold and fold from a domain, and never on a
-//! look-alike. Half the cases run every fold the rule finds through einfold's
+//! without einfold; the rule fires on every fold, fold from a domain and fold
+//! joined back, and never on a look-alike. A second test draws only folds
+//! joined back, over operands the dense algorithm takes and a domain whose
+//! keys are duplicated half the time, so that both outcomes of the
+//! uniqueness check are exercised. Half the cases run every fold the rule finds through einfold's
 //! own kernels (`DetectFolds::without_fallback`), so that the folds the rule
 //! describes are checked even where the dense algorithm doesn't apply.
 //!
@@ -164,12 +171,17 @@ enum Expect {
     FromDomain,
     /// A look-alike of a fold from a domain: the fold is found, but it gets no domain.
     FoldOnly,
+    /// A fold joined back to its domain and grouped again, as ddx writes a
+    /// gradient: with the host's plan as a fallback, a fold from a domain
+    /// whose keys must be unique; without one, the fold alone.
+    JoinedBack,
     /// No fold at all.
     Decline,
 }
 
-/// A random query over `l`, `r` and `d`, and whether the rule must fire.
-fn query(rng: &mut Rng) -> (String, Expect) {
+/// A random query over `l`, `r` and `d`, and whether the rule must fire;
+/// with `joined_back`, always a fold joined back to `d` or a look-alike.
+fn query(rng: &mut Rng, joined_back: bool) -> (String, Expect) {
     let eq = |x: &str, y: &str, safe: bool| match safe {
         true => format!("({x} IS NOT DISTINCT FROM {y})"),
         false => format!("{x} = {y}"),
@@ -177,7 +189,7 @@ fn query(rng: &mut Rng) -> (String, Expect) {
     let safe = rng.chance(0.5);
     // Join on l.b = r.a, sometimes also l.a = r.b.
     let mut on = vec![eq("l.b", "r.a", safe)];
-    let two_keys = rng.chance(0.3);
+    let two_keys = rng.chance(0.3) && !joined_back;
     if two_keys {
         on.push(eq("l.a", "r.b", safe));
     }
@@ -189,6 +201,7 @@ fn query(rng: &mut Rng) -> (String, Expect) {
     let (fl, fr) = (factor("l", rng), factor("r", rng));
     // Group keys: l.a and r.b, or one of them, or the join key.
     let groups: Vec<&str> = match rng.below(4) {
+        0 | 1 | 3 if joined_back => vec!["l.a", "r.b"],
         0 => vec!["l.a", "r.b"],
         1 => vec!["l.a"],
         2 => vec!["r.b", "l.a"],
@@ -215,8 +228,73 @@ fn query(rng: &mut Rng) -> (String, Expect) {
         )
     };
     let product = format!("SUM({fl} * {fr})");
-    match rng.below(8) {
+    let shape = rng.below(10);
+    match if joined_back { 8 } else { shape } {
         0..=2 => (fold(&product, false), Expect::Fold),
+        8..=9 if groups.len() == 2 => {
+            // ddx's gradient step: the fold joined back to d, grouped again by
+            // d's keys, then left-joined from d. Its look-alikes keep the fold
+            // alone: a second GROUP BY by other columns, a sum that isn't NULL where
+            // the fold's value is, a filtered d, a projection reading the
+            // second GROUP BY's keys, and `=` outside `IS NOT DISTINCT FROM`.
+            let (inner, outer) = match rng.below(8) {
+                0 => (true, false),
+                _ => {
+                    let s = rng.chance(0.7);
+                    (s, s)
+                }
+            };
+            let look = rng.below(11);
+            // The second GROUP BY's second column: the join's, or d's value.
+            let col = if look == 10 { "v" } else { "b" };
+            let inner_keys = [eq("d2.a", "f.g0", inner), eq("d2.b", "f.g1", inner)].join(" AND ");
+            let outer_keys = [
+                eq("d.a", "s.a", outer),
+                eq(&format!("d.{col}"), "s.b", outer),
+            ];
+            let outer_keys = outer_keys.join(" AND ");
+            // The regroup's test: ddx's, or one of another column, which
+            // duplicate rows of d may disagree on.
+            let test = ["d2.v IS NULL", "d2.v < 0.0", "d2.v IS NULL OR d2.v > 2.0"][rng.below(3)];
+            let masked = format!("SUM(CASE WHEN {test} THEN NULL ELSE f.v END)");
+            let (group, sum, d2, reads) = match look {
+                0 => ("d2.a, d2.b", "SUM(f.v * 2.0)", "d", "d.b"),
+                1 => ("d2.a, d2.b", "SUM(COALESCE(f.v, 1.0))", "d", "d.b"),
+                2 => (
+                    "d2.a, d2.b",
+                    "SUM(f.v)",
+                    "(SELECT * FROM d WHERE d.v IS NOT NULL)",
+                    "d.b",
+                ),
+                3 => ("d2.a, d2.b", "SUM(f.v)", "d", "s.b"),
+                4 => ("d2.b, d2.a", "SUM(f.v)", "d", "d.b"),
+                5 => ("d2.a, d2.b", "SUM(f.v)", "(SELECT a, b, v FROM d)", "d.b"),
+                10 => ("d2.a, d2.v", "SUM(f.v)", "d", "d.b"),
+                _ => ("d2.a, d2.b", masked.as_str(), "d", "d.b"),
+            };
+            let expect = match (look, inner, outer) {
+                (0..=3 | 10, _, _) | (_, true, false) => Expect::FoldOnly,
+                _ => Expect::JoinedBack,
+            };
+            let regroup = format!(
+                "SELECT d2.a AS a, d2.{col} AS b, {sum} AS v FROM {d2} d2 JOIN ({}) f ON {inner_keys} \
+                 GROUP BY {group}",
+                fold(&product, false)
+            );
+            // The value as ddx reads it, masked by d's own row, or plainly;
+            // d.v is read either way, so that the test's column is d's.
+            let value = [
+                "CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 ELSE s.v END",
+                "s.v",
+                "COALESCE(s.v, 0.0)",
+            ][rng.below(3)];
+            (
+                format!(
+                    "SELECT d.a, {reads}, d.v AS w, {value} AS v FROM d LEFT JOIN ({regroup}) s ON {outer_keys}"
+                ),
+                expect,
+            )
+        }
         3..=4 if groups.len() == 2 => {
             // A fold from a domain, as ddx writes it: every row of d gets its group's sum, 0 where none.
             // Its look-alikes, which keep the fold but must not become a
@@ -243,7 +321,7 @@ fn query(rng: &mut Rng) -> (String, Expect) {
                 expect,
             )
         }
-        3..=4 => (fold(&product, false), Expect::Fold),
+        3..=4 | 8..=9 => (fold(&product, false), Expect::Fold),
         5 => (fold(&product, true), Expect::Decline),
         6 => (
             [
@@ -341,16 +419,50 @@ fn rows(batches: &[RecordBatch]) -> Vec<String> {
 
 #[tokio::test]
 async fn einfold_changes_no_answer() {
+    let (cases, dense, host_plans, joined) = sweep(0xde7e_c7ed, false).await;
+    // Most spellings rule the dense path out (a group key that is a join key,
+    // a summed key held by one side, keys that can't be positions), and the
+    // kernels' own test covers it. Here both it and the host's plan must run.
+    if cases >= 100 {
+        let some = |n: usize| n * 50 >= cases;
+        assert!(some(dense), "the dense path ran in only {dense} cases");
+        assert!(
+            some(host_plans),
+            "the host's plan ran in only {host_plans} cases"
+        );
+        assert!(joined.0 + joined.1 > 0, "no fold joined back ran");
+    }
+}
+
+#[tokio::test]
+async fn folds_joined_back_check_their_domain() {
+    let (cases, _, _, (dense, host)) = sweep(0x10_1ced, true).await;
+    if cases >= 100 {
+        let some = |n: usize| n * 10 >= cases;
+        assert!(
+            some(dense) && some(host),
+            "folds joined back ran dense in {dense} cases and on the host in {host}"
+        );
+    }
+}
+
+/// Runs the cases from `default_seed`, or as `EINFOLD_SEED` and
+/// `EINFOLD_CASES` say, panicking at the first that fails; with
+/// `joined_back`, only folds joined back to their domain. Returns how many
+/// cases ran, how many ran the dense path and the host's plan, and how many
+/// folds joined back ran each.
+async fn sweep(default_seed: u64, joined_back: bool) -> (usize, usize, usize, (usize, usize)) {
     let seed: u64 = std::env::var("EINFOLD_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0xde7e_c7ed);
+        .unwrap_or(default_seed);
     let cases: u64 = match std::env::var("EINFOLD_CASES") {
         Ok(n) => n.parse().unwrap(),
         Err(_) if std::env::var("EINFOLD_SEED").is_ok() => 1,
         Err(_) => 300,
     };
     let (mut fired, mut dense, mut host_plans) = (0, 0, 0);
+    let (mut joined_dense, mut joined_host) = (0, 0);
     for i in 0..cases {
         let seed = seed.wrapping_add(i);
         let mut rng = Rng::new(seed);
@@ -358,14 +470,21 @@ async fn einfold_changes_no_answer() {
         // Dense keys are sometimes clean enough for the dense algorithm.
         let messy = !matches!(keys, Keys::Dense) || rng.chance(0.4);
         let fallback = rng.chance(0.5);
+        let (keys, messy, fallback) = match joined_back {
+            true => (Keys::Dense, false, true),
+            false => (keys, messy, fallback),
+        };
         let (ours, theirs) = (einfold(1 + rng.below(6), fallback), host(1 + rng.below(6)));
         let ctxs = [&ours, &theirs];
         let ext = |rng: &mut Rng| 1 + rng.below(5);
         let (ea, eb, ec) = (ext(&mut rng), ext(&mut rng), ext(&mut rng));
         table(&mut rng, &ctxs, "l", [ea, eb], keys, messy);
         table(&mut rng, &ctxs, "r", [eb, ec], keys, messy);
-        table(&mut rng, &ctxs, "d", [ea + 1, ec + 1], keys, messy);
-        let (sql, expect) = query(&mut rng);
+        // d is messy on its own sometimes, so that a domain with duplicate
+        // keys meets operands the dense algorithm can take.
+        let d_messy = messy || rng.chance(if joined_back { 0.5 } else { 0.3 });
+        table(&mut rng, &ctxs, "d", [ea + 1, ec + 1], keys, d_messy);
+        let (sql, expect) = query(&mut rng, joined_back);
         let fail = |what: String| panic!("seed {seed}: {what}\nSQL: {sql}");
 
         let df = ours.sql(&sql).await.unwrap();
@@ -382,6 +501,7 @@ async fn einfold_changes_no_answer() {
         let ok = match expect {
             Expect::Fold | Expect::FoldOnly => found == 1 && domains == 0,
             Expect::FromDomain => found == 1 && domains == 1,
+            Expect::JoinedBack => found == 1 && domains == usize::from(fallback),
             Expect::Decline => found == 0,
         };
         if !ok {
@@ -401,6 +521,10 @@ async fn einfold_changes_no_answer() {
         .to_string();
         dense += usize::from(shown.contains("dense_folds=1"));
         host_plans += usize::from(shown.contains("host_plans=1"));
+        if expect == Expect::JoinedBack && fallback {
+            joined_dense += usize::from(shown.contains("dense_folds=1"));
+            joined_host += usize::from(shown.contains("host_plans=1"));
+        }
         let want = theirs.sql(&sql).await.unwrap().collect().await.unwrap();
         let (got, want) = (rows(&got), rows(&want));
         if got != want {
@@ -410,17 +534,15 @@ async fn einfold_changes_no_answer() {
     eprintln!(
         "the rule fired in {fired} of {cases} cases; the dense path ran in {dense}, the host's plan in {host_plans}"
     );
-    // Most spellings rule the dense path out (a group key that is a join key,
-    // a summed key held by one side, keys that can't be positions), and the
-    // kernels' own test covers it. Here both it and the host's plan must run.
-    if cases >= 100 {
-        let some = |n: usize| n * 50 >= cases as usize;
-        assert!(some(dense), "the dense path ran in only {dense} cases");
-        assert!(
-            some(host_plans),
-            "the host's plan ran in only {host_plans} cases"
-        );
-    }
+    eprintln!(
+        "folds joined back to their domain: the dense path ran in {joined_dense}, the host's plan in {joined_host}"
+    );
+    (
+        cases as usize,
+        dense,
+        host_plans,
+        (joined_dense, joined_host),
+    )
 }
 
 /// Runs `setup`'s statements, then `sql` with and without einfold, and
@@ -620,6 +742,83 @@ async fn fallbacks_hold_only_the_hosts_plan() {
         .unwrap()
         .fallback()
         .expect("a fallback");
+    let mut inner = Vec::new();
+    execs(fallback, &mut inner);
+    assert!(inner.is_empty(), "the fallback runs einfold again");
+}
+
+/// A domain whose duplicate rows disagree on the regroup's test: the uniqueness
+/// check declines, and the host's plan gives every row of a group the same
+/// sum, which the node mustn't mask a second time (#60).
+#[tokio::test]
+async fn joined_back_tests_apply_once() {
+    let setup = [
+        "CREATE TABLE l (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,2.0),(1,0,3.0),(1,1,4.0)",
+        "CREATE TABLE r (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,10.0),(1,0,100.0),(1,1,1000.0)",
+        "CREATE TABLE d (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,NULL),(0,0,5.0),(1,1,7.0)",
+        "CREATE TABLE e (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,NULL),(0,1,5.0),(1,1,-7.0)",
+    ];
+    for (table, test) in [
+        ("d", "d2.v IS NULL"),
+        ("d", "d2.v > 6.0"),
+        ("e", "d2.v < 0.0"),
+    ] {
+        let sql = format!(
+            "SELECT d.a, d.b, d.v AS w, COALESCE(s.v, 0.0) AS v FROM {table} d LEFT JOIN ( \
+               SELECT d2.a AS a, d2.b AS b, SUM(CASE WHEN {test} THEN NULL ELSE f.v END) AS v \
+               FROM {table} d2 JOIN (SELECT l.a AS g0, r.b AS g1, SUM(l.v * r.v) AS v \
+                                     FROM l JOIN r ON l.b = r.a GROUP BY l.a, r.b) f \
+                 ON d2.a = f.g0 AND d2.b = f.g1 \
+               GROUP BY d2.a, d2.b) s \
+             ON d.a = s.a AND d.b = s.b"
+        );
+        // Table e's keys are unique, so there the dense path runs.
+        assert!(same_answer(&setup, &sql).await > 0, "{sql}");
+    }
+}
+
+/// A fold joined back to its domain falls back to the host's own plan too.
+#[tokio::test]
+async fn joined_back_fallbacks_hold_only_the_hosts_plan() {
+    let ctx = einfold(4, true);
+    for s in [
+        "CREATE TABLE l (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,2.0),(1,0,3.0),(1,1,4.0)",
+        "CREATE TABLE r (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,10.0),(1,0,100.0),(1,1,1000.0)",
+        "CREATE TABLE d (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,NULL),(0,0,5.0),(1,1,7.0)",
+    ] {
+        ctx.sql(s).await.unwrap().collect().await.unwrap();
+    }
+    let sql = "SELECT d.a, d.b, d.v AS w, COALESCE(s.v, 0.0) AS v FROM d LEFT JOIN ( \
+               SELECT d2.a AS a, d2.b AS b, SUM(CASE WHEN d2.v IS NULL THEN NULL ELSE f.v END) AS v \
+               FROM d d2 JOIN (SELECT l.a AS g0, r.b AS g1, SUM(l.v * r.v) AS v \
+                               FROM l JOIN r ON l.b = r.a GROUP BY l.a, r.b) f \
+                 ON d2.a = f.g0 AND d2.b = f.g1 \
+               GROUP BY d2.a, d2.b) s \
+             ON d.a = s.a AND d.b = s.b";
+    let plan = ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    fn execs(
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        out: &mut Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+    ) {
+        let any: &dyn std::any::Any = plan.as_ref();
+        if any.is::<EinFoldExec>() {
+            out.push(Arc::clone(plan));
+        }
+        for c in plan.children() {
+            execs(c, out);
+        }
+    }
+    let mut found = Vec::new();
+    execs(&plan, &mut found);
+    assert_eq!(found.len(), 1, "one fold joined back");
+    let any: &dyn std::any::Any = found[0].as_ref();
+    let fallback = (any.downcast_ref::<EinFoldExec>().unwrap().fallback()).expect("a fallback");
     let mut inner = Vec::new();
     execs(fallback, &mut inner);
     assert!(inner.is_empty(), "the fallback runs einfold again");

@@ -136,7 +136,8 @@ fn par_tasks<T: Send>(tasks: usize, threads: usize, f: impl Fn(usize) -> T + Syn
 /// The fold of `a` and `b` (and the batches of `domain`, if the fold has one)
 /// by the dense algorithm on `threads` threads, or `None` when its conditions
 /// don't hold and the hash path must be used instead. With a domain, there is
-/// one output batch per domain batch.
+/// one output batch per domain batch. With `unique_domain`, it is also `None`
+/// when two of the domain's rows locate the same cell of the output.
 pub(crate) fn fold(
     fold: &Fold,
     a: &RecordBatch,
@@ -144,6 +145,7 @@ pub(crate) fn fold(
     domain: Option<&[RecordBatch]>,
     schema: SchemaRef,
     threads: usize,
+    unique_domain: bool,
 ) -> Result<Option<Vec<RecordBatch>>> {
     let [op_a, op_b] = fold.operands() else {
         return Ok(None);
@@ -292,10 +294,18 @@ pub(crate) fn fold(
                 strides: &strides,
                 extent: &extent,
             };
-            let batches = domain
-                .iter()
-                .map(|f| domain_batch(f, spec, &cells, &value, &schema))
-                .collect::<Result<_>>()?;
+            let mut seen = vec![false; if unique_domain { nx * ny } else { 0 }];
+            let mut batches = Vec::with_capacity(domain.len());
+            for f in domain {
+                let cell = locate(f, &cells)?;
+                if unique_domain
+                    && (cell.iter())
+                        .any(|&c| c != NO_GROUP && std::mem::replace(&mut seen[c], true))
+                {
+                    return Ok(None);
+                }
+                batches.push(domain_batch(f, &cell, spec, &value, &schema)?);
+            }
             Ok(Some(batches))
         }
         (None, None) => {
@@ -346,18 +356,13 @@ struct Cells<'a> {
     extent: &'a [usize],
 }
 
-/// The output rows for one batch of the domain: its carried columns, and the
-/// value of the cell its keys locate. A NULL key, or one outside every
-/// operand's range, matches no group (the operands have no NULL keys), so its
-/// row gets the default, under either key equality.
-fn domain_batch(
-    batch: &RecordBatch,
-    spec: &Domain,
-    cells: &Cells,
-    value: &impl Fn(usize) -> Option<f64>,
-    schema: &SchemaRef,
-) -> Result<RecordBatch> {
-    const NO_GROUP: usize = usize::MAX;
+/// A domain row whose keys locate no cell of the output.
+const NO_GROUP: usize = usize::MAX;
+
+/// The cell of the output that each row of a domain batch's keys locate, or
+/// [`NO_GROUP`]. A NULL key, or one outside every operand's range, matches no
+/// group (the operands have no NULL keys), under either key equality.
+fn locate(batch: &RecordBatch, cells: &Cells) -> Result<Vec<usize>> {
     let mut cell = vec![0usize; batch.num_rows()];
     for ((&d, &stride), &ColumnIndex(col)) in cells.dims.iter().zip(cells.strides).zip(cells.keys) {
         // Out-of-range unsigned keys become NULL here, so match no group.
@@ -375,6 +380,19 @@ fn domain_batch(
             };
         }
     }
+    Ok(cell)
+}
+
+/// The output rows for one batch of the domain: its carried columns, and the
+/// value of the cell each row locates (see [`locate`]), or the default where
+/// it locates none.
+fn domain_batch(
+    batch: &RecordBatch,
+    cell: &[usize],
+    spec: &Domain,
+    value: &impl Fn(usize) -> Option<f64>,
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
     let at = |c: usize| {
         if c == NO_GROUP {
             spec.missing

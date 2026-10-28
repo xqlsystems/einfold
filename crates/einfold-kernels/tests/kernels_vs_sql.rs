@@ -23,6 +23,10 @@
 //!    that of the exact sum, and so is the host's.
 //! 3. **Deterministic.** The same rows, in another order and other batches,
 //!    on another number of threads, give the same rows, bit for bit.
+//! 4. **Unique domains.** Where the dense path runs with a domain, asking it
+//!    to check that the domain's keys are unique declines whenever two domain
+//!    rows have the keys of one group, and otherwise, when it accepts, gives
+//!    the same rows, bit for bit.
 //!
 //! Half the cases are drawn from a *dense family*, shaped so that the dense
 //! algorithm may apply: non-negative integer keys with no NULLs in the
@@ -635,10 +639,82 @@ fn run_fold(case: &Case, rng: &mut Rng) -> (Vec<RecordBatch>, Algorithm) {
     let options = Options {
         host: HOST,
         threads: 1 + rng.below(8),
+        unique_domain: false,
     };
     let (algorithm, out) =
         einfold_kernels::fold(&case.fold, &a, &b, domain.as_deref(), schema, options).unwrap();
     (out, algorithm)
+}
+
+/// Checks invariant 4 for a case with a domain that the dense path computes,
+/// and says whether the checked path accepted.
+fn check_unique_domain(case: &Case, rng: &mut Rng, fail: impl Fn(String)) -> bool {
+    let fold = &case.fold;
+    let domain = case.domain.as_ref().expect("a case with a domain");
+    let whole = |t: &Table, rng: &mut Rng| {
+        let batches: Vec<RecordBatch> = t.partitions(rng).into_iter().flatten().collect();
+        concat_batches(&t.schema, &batches).unwrap()
+    };
+    let (a, b) = (whole(&case.a, rng), whole(&case.b, rng));
+    let d: Vec<RecordBatch> = domain.partitions(rng).into_iter().flatten().collect();
+    let operands = [case.a.schema.as_ref(), case.b.schema.as_ref()];
+    let mut dense = |fold: &Fold, d: Option<&[RecordBatch]>, unique_domain| {
+        let schema = einfold_kernels::schema(fold, &operands, d.map(|_| domain.schema.as_ref()));
+        let options = Options {
+            host: HOST,
+            threads: 1 + rng.below(8),
+            unique_domain,
+        };
+        einfold_kernels::fold_dense(fold, &a, &b, d, schema.unwrap(), options).unwrap()
+    };
+    let keys = fold.outputs().len();
+    let unchecked = dense(fold, Some(&d), false).expect("the dense path applies");
+    // The groups, from the same fold without its domain.
+    let outputs = fold
+        .outputs()
+        .iter()
+        .map(|o| Output {
+            domain_key: None,
+            ..*o
+        })
+        .collect();
+    let bare = Fold::try_new(
+        fold.dimensions().to_vec(),
+        fold.operands().to_vec(),
+        outputs,
+        fold.row(),
+        fold.aggregate().clone(),
+        None,
+    )
+    .unwrap();
+    let groups: std::collections::HashSet<String> = match dense(&bare, None, false) {
+        Some(out) => rows(&out, keys).into_iter().map(|(k, _)| k).collect(),
+        None => return false,
+    };
+    let mut seen = std::collections::HashSet::new();
+    let repeated = rows(&unchecked, keys)
+        .into_iter()
+        .any(|(k, _)| groups.contains(&k) && !seen.insert(k));
+    match dense(fold, Some(&d), true) {
+        Some(_) if repeated => {
+            fail("the checked dense path accepted two domain rows with one group's keys".into());
+            true
+        }
+        Some(checked) => {
+            let bits = |out: &[RecordBatch]| {
+                let mut r: Vec<_> = (rows(out, keys).into_iter())
+                    .map(|(k, v)| (k, v.map(f64::to_bits)))
+                    .collect();
+                r.sort();
+                r
+            };
+            if bits(&checked) != bits(&unchecked) {
+                fail("the checked dense path changed the output".into());
+            }
+            true
+        }
+        None => false,
+    }
 }
 
 #[tokio::test]
@@ -653,6 +729,7 @@ async fn fold_matches_sql() {
         Err(_) => 400,
     };
     let (mut dense_family, mut dense_ran) = (0, 0);
+    let (mut unique_checked, mut unique_accepted) = (0, 0);
     for i in 0..cases {
         let seed = seed.wrapping_add(i);
         let mut rng = Rng::new(seed);
@@ -667,6 +744,10 @@ async fn fold_matches_sql() {
         let (again, _) = run_fold(&case, &mut rng);
         dense_family += usize::from(dense);
         dense_ran += usize::from(ran == Algorithm::Dense);
+        if ran == Algorithm::Dense && case.domain.is_some() {
+            unique_checked += 1;
+            unique_accepted += usize::from(check_unique_domain(&case, &mut rng, fail));
+        }
         let (ours, again) = (rows(&ours, keys), rows(&again, keys));
         // SQL doesn't order rows, so the outputs are compared as multisets.
         let bits = |r: &[Row]| -> Vec<(String, Option<u64>)> {
@@ -705,6 +786,7 @@ async fn fold_matches_sql() {
         }
     }
     eprintln!("dense path: {dense_ran} of {cases} cases; dense family: {dense_family}");
+    eprintln!("unique-domain check: accepted {unique_accepted} of {unique_checked}");
     // About a third of the dense family qualifies (the rest has duplicate
     // tuples, keys too large for BIGINT, or holes where existence matters);
     // if far fewer did, the dense path would go untested.

@@ -48,11 +48,12 @@ use einfold_ir::{
     Operand, Output, RowValue,
 };
 
+use crate::join_back::joined_back;
 use crate::node::FoldNode;
 
 /// The prefix of the names this rule gives the columns of the nodes it makes,
 /// chosen not to clash with a domain's own columns.
-const PREFIX: &str = "__einfold_";
+pub(crate) const PREFIX: &str = "__einfold_";
 
 /// Finds folds over joins in DataFusion's optimized plans (see the module's
 /// documentation). [`EinFoldQueryPlanner::detecting`](crate::EinFoldQueryPlanner::detecting)
@@ -96,7 +97,12 @@ impl OptimizerRule for DetectFolds {
     ) -> Result<Transformed<LogicalPlan>> {
         let found = match &plan {
             LogicalPlan::Aggregate(agg) => fold(agg, self.fallback)?,
-            LogicalPlan::Projection(p) => from_domain(p, self.fallback)?,
+            LogicalPlan::Projection(p) => match from_domain(p, self.fallback)? {
+                // A fold joined back to its domain needs the host's plan
+                // for when the domain's keys aren't unique.
+                None if self.fallback => joined_back(p)?,
+                found => found,
+            },
             _ => None,
         };
         Ok(match found {
@@ -110,7 +116,7 @@ impl OptimizerRule for DetectFolds {
 
 /// `e` with each column a projection in `projections` (outermost first)
 /// produced replaced by the expression that produced it, aliases removed.
-fn resolve(e: &Expr, projections: &[&Projection]) -> Result<Expr> {
+pub(crate) fn resolve(e: &Expr, projections: &[&Projection]) -> Result<Expr> {
     let mut e = e.clone().unalias();
     for p in projections {
         e = e
@@ -151,7 +157,7 @@ pub const MOVABLE_FUNCTIONS: &[&str] = &["abs", "exp", "ln", "tanh", "signum"];
 /// only deterministic, row-wise expressions that can't raise an error move;
 /// a volatile one, such as `random()`, would also be drawn once per input
 /// row rather than once per joined pair.
-fn movable(e: &Expr, schema: &DFSchema) -> bool {
+pub(crate) fn movable(e: &Expr, schema: &DFSchema) -> bool {
     let ty = |e: &Expr| e.get_type(schema).ok();
     let arithmetic = |e: &Expr| ty(e).is_some_and(|t| t.is_integer() || t.is_floating());
     let fails = |e: &Expr| {
@@ -225,7 +231,7 @@ fn widens(from: &DataType, to: &DataType) -> bool {
 }
 
 /// The sum's argument, if `agg` computes exactly one plain `SUM`.
-fn sum_argument(agg: &Aggregate) -> Option<Expr> {
+pub(crate) fn sum_argument(agg: &Aggregate) -> Option<Expr> {
     let [aggregate] = agg.aggr_expr.as_slice() else {
         return None;
     };
@@ -423,7 +429,7 @@ pub(crate) fn host_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
 
 /// `node`, whose columns are `names`, renamed to `schema`'s columns, or
 /// `None` if the result's schema wouldn't be exactly `schema`.
-fn restore(
+pub(crate) fn restore(
     node: LogicalPlan,
     names: &[String],
     schema: &DFSchemaRef,
@@ -441,7 +447,7 @@ fn restore(
 
 /// Whether two schemas have the same columns, qualifiers, types and
 /// nullability, which an optimizer rule must keep.
-fn same_schema(a: &DFSchemaRef, b: &DFSchemaRef) -> bool {
+pub(crate) fn same_schema(a: &DFSchemaRef, b: &DFSchemaRef) -> bool {
     a.fields().len() == b.fields().len()
         && a.iter().zip(b.iter()).all(|((qa, fa), (qb, fb))| {
             qa == qb
@@ -457,7 +463,7 @@ fn same_schema(a: &DFSchemaRef, b: &DFSchemaRef) -> bool {
 /// that only rename or reorder columns, with, for each column of `plan`, its
 /// column in the fold's output: an output's index, or the number of outputs
 /// for the sum.
-fn found_fold(plan: &LogicalPlan) -> Option<(&FoldNode, Vec<usize>)> {
+pub(crate) fn found_fold(plan: &LogicalPlan) -> Option<(&FoldNode, Vec<usize>)> {
     match plan {
         LogicalPlan::Extension(e) => {
             let node = e.node.as_any().downcast_ref::<FoldNode>()?;

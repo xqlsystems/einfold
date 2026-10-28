@@ -100,7 +100,7 @@ fn gradient(
 async fn run(n: usize) -> Result<()> {
     let state = SessionStateBuilder::new()
         .with_default_features()
-        .with_query_planner(Arc::new(EinFoldQueryPlanner))
+        .with_query_planner(Arc::new(EinFoldQueryPlanner::default()))
         .build();
     let ctx = SessionContext::new_with_state(state);
     let table = |name: &str, k0: &str, k1: &str, rows: usize, width: usize, scale: f64| {

@@ -52,7 +52,7 @@ fn context(threads: usize, batch_size: usize, pool: Option<usize>) -> SessionCon
         .with_default_features()
         .with_config(config)
         .with_runtime_env(runtime.build_arc().unwrap())
-        .with_query_planner(Arc::new(EinFoldQueryPlanner))
+        .with_query_planner(Arc::new(EinFoldQueryPlanner::default()))
         .build();
     SessionContext::new_with_state(state)
 }

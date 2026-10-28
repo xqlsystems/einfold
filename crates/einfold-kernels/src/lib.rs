@@ -184,6 +184,20 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
     Ok(Arc::new(Schema::new(fields)))
 }
 
+/// [`fold`] by the dense algorithm alone, or `None` when its conditions don't
+/// hold, for a caller that would rather run something else than the hash
+/// algorithm.
+pub fn fold_dense(
+    fold: &Fold,
+    a: &RecordBatch,
+    b: &RecordBatch,
+    domain: Option<&[RecordBatch]>,
+    schema: SchemaRef,
+    options: Options,
+) -> Result<Option<Vec<RecordBatch>>> {
+    dense::fold(fold, a, b, domain, schema, options.threads.max(1))
+}
+
 /// `fold` over operands `a` and `b`, and the batches of its domain if it has
 /// one, as batches of `schema` (which [`schema`] gives): one batch per domain
 /// batch, or one in all without a domain. Also says which algorithm ran: the

@@ -35,6 +35,10 @@ mod codec;
 mod lean;
 mod stack;
 
+/// mimalloc, the allocator datafusion-python uses (see `Cargo.toml`).
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use bridge::{Bridge, Counts};
 use codec::ByReference;
 

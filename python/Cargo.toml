@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# einfold for Python: an extension for datafusion-python sessions, and so
+# for xarray-sql's `Context`.
+[package]
+name = "einfold-python"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+# Not a member of einfold's workspace: it needs `unsafe` to read the FFI
+# capsules datafusion-python hands it, which the workspace forbids, and
+# pyo3 and DataFusion's FFI crates, which nothing else needs.
+[workspace]
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+async-trait = "0.1"
+datafusion = "=55.2.0"
+datafusion-ffi = "=55.2.0"
+datafusion-proto = "=55.2.0"
+einfold-datafusion = { path = "../crates/einfold-datafusion" }
+futures = "0.3"
+pyo3 = { version = "0.29", features = ["extension-module", "abi3", "abi3-py310"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[profile.release]
+debug = false

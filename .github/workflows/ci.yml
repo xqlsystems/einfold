@@ -68,3 +68,32 @@ jobs:
       # tests carry #[ignore] and run elsewhere.
       - name: tests
         run: cargo test --workspace --no-fail-fast
+
+  python:
+    name: python (einfold for datafusion-python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: python
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      # The extension crate isn't in the workspace, so its lints run here.
+      - name: clippy (warnings are errors)
+        run: cargo clippy --manifest-path python/Cargo.toml --all-targets -- -D warnings
+      - name: build and install the wheel
+        run: |
+          python -m pip install maturin
+          maturin build --release -m python/Cargo.toml -o dist
+          python -m pip install dist/*.whl "datafusion==55.0.0" pytest numpy pyarrow
+      # Run from outside python/, so that the installed package is imported
+      # rather than its source directory.
+      - name: tests
+        working-directory: dist
+        run: python -m pytest -q ../python/tests

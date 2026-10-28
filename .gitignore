@@ -10,3 +10,6 @@ docs/spikes/*/fixture/
 
 # Python bytecode
 __pycache__/
+
+# Python wheels
+/dist/

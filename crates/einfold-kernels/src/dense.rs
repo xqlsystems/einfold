@@ -14,9 +14,9 @@
 //! That is a matrix product `out[x, y] = Σ_z a[x, z]·b[z, y]`, with each role's
 //! dimensions flattened into one position. Keys are used as positions
 //! directly: key `k` of a dimension is position `k`, and a dimension's extent
-//! is its largest key plus one. `b` is held as a dense matrix, and each row of
-//! `a` adds its factor times a row of `b` into a row of the output, so only `b`
-//! and the output are dense: `a` is read row by row, as SQL would read it.
+//! is its largest key plus one. Both operands are placed in dense matrices,
+//! batch by batch, as they arrive, and each position of `a` adds its factor
+//! times a row of `b` into a row of the output.
 //!
 //! **When SQL and dense arrays agree.** A dense array has a value at every
 //! position, where SQL has rows only where they exist:
@@ -58,28 +58,38 @@ const XB: usize = 256;
 /// Positions of `z` per block, when the output is smaller.
 const ZB: usize = 4096;
 const FEW_CELLS: usize = 4096;
-/// A row of `a` that isn't there.
-const NONE: u32 = u32::MAX;
+/// What a position of `a` holds: no row, a row with a NULL factor, or a row
+/// with a value.
+const ABSENT: u8 = 0;
+const NULL: u8 = 1;
+const VALUED: u8 = 2;
 
 /// Whether a dense array of `cells` is worth building for `rows` rows: no
 /// more than four cells per row, plus some slack for small inputs. Measured
 /// on CPU, a dense product beats a hash-based one once about a fifth of its
 /// cells hold rows, and one row in four cells is past that.
 fn worth(cells: usize, rows: usize) -> bool {
-    cells <= rows.saturating_mul(4).saturating_add(FEW_CELLS) && cells < NONE as usize
+    cells <= rows.saturating_mul(4).saturating_add(FEW_CELLS) && cells < u32::MAX as usize
 }
 
-/// `column` as non-negative `i64` keys, or `None` if it isn't an integer
-/// column, or holds a NULL, a negative key, or one too large for `i64` (an
-/// unsigned key of 2⁶³ or more).
-fn keys(column: &ArrayRef) -> Option<Int64Array> {
+/// `column` as non-negative `i64` keys, with their extent (the largest key
+/// plus one), or `None` if it isn't an integer column, or holds a NULL, a
+/// negative key, or one too large for `i64` (an unsigned key of 2⁶³ or more),
+/// or whose extent doesn't fit (a key of `i64::MAX`).
+fn keys(column: &ArrayRef) -> Option<(Int64Array, usize)> {
     if !column.data_type().is_integer() || column.null_count() > 0 {
         return None;
     }
     // The cast turns a key too large for i64 into NULL, which reads as 0.
     let keys = cast(column, &DataType::Int64).ok()?;
     let keys = keys.as_any().downcast_ref::<Int64Array>()?.clone();
-    (keys.null_count() == 0 && keys.values().iter().all(|&k| k >= 0)).then_some(keys)
+    // One pass for both bounds, which the compiler vectorizes.
+    let (lo, hi) = (keys.values().iter()).fold((0, -1), |(lo, hi), &k| (k.min(lo), k.max(hi)));
+    if keys.null_count() > 0 || lo < 0 {
+        return None;
+    }
+    let extent = usize::try_from(hi.checked_add(1)?).ok()?;
+    Some((keys, extent))
 }
 
 /// A row's position over some dimensions, flattened with the first
@@ -133,15 +143,15 @@ fn par_tasks<T: Send>(tasks: usize, threads: usize, f: impl Fn(usize) -> T + Syn
         .collect()
 }
 
-/// The fold of `a` and `b` (and the batches of `domain`, if the fold has one)
+/// The fold of `a` and `b`'s batches (and `domain`'s, if the fold has one)
 /// by the dense algorithm on `threads` threads, or `None` when its conditions
 /// don't hold and the hash path must be used instead. With a domain, there is
 /// one output batch per domain batch. With `unique_domain`, it is also `None`
 /// when two of the domain's rows locate the same cell of the output.
 pub(crate) fn fold(
     fold: &Fold,
-    a: &RecordBatch,
-    b: &RecordBatch,
+    a: &[RecordBatch],
+    b: &[RecordBatch],
     domain: Option<&[RecordBatch]>,
     schema: SchemaRef,
     threads: usize,
@@ -168,23 +178,26 @@ pub(crate) fn fold(
             zs.push(d.0);
         }
     }
-    // Each operand's key columns as non-negative i64, cast once; and each
+    // Each batch's key columns as non-negative i64, cast once; and each
     // dimension's extent, its largest key in either operand, plus one.
     let mut extent = vec![0usize; fold.dimensions().len()];
-    let mut cast_keys = |op: &einfold_ir::Operand, batch: &RecordBatch| {
-        op.keys
-            .iter()
-            .map(|&(DimensionId(d), ColumnIndex(c))| {
-                let k = keys(batch.column(c))?;
-                let max = k.values().iter().max().map_or(0, |&m| m as usize + 1);
-                extent[d] = extent[d].max(max);
-                Some((d, k))
+    let mut cast_keys = |op: &einfold_ir::Operand, batches: &[RecordBatch]| {
+        (batches.iter())
+            .map(|batch| {
+                (op.keys.iter())
+                    .map(|&(DimensionId(d), ColumnIndex(c))| {
+                        let (k, n) = keys(batch.column(c))?;
+                        extent[d] = extent[d].max(n);
+                        Some((d, k))
+                    })
+                    .collect::<Option<Vec<_>>>()
             })
             .collect::<Option<Vec<_>>>()
     };
     let (Some(a_keys), Some(b_keys)) = (cast_keys(op_a, a), cast_keys(op_b, b)) else {
         return Ok(None);
     };
+    let rows = |batches: &[RecordBatch]| batches.iter().map(|b| b.num_rows()).sum::<usize>();
     let size = |dims: &[usize]| {
         dims.iter()
             .try_fold(1usize, |n, &d| n.checked_mul(extent[d]))
@@ -195,71 +208,89 @@ pub(crate) fn fold(
     let out_rows = domain.map_or(nx.saturating_mul(ny), |f| {
         f.iter().map(|b| b.num_rows()).sum()
     });
-    if !worth(nx.saturating_mul(nz), a.num_rows())
-        || !worth(nz.saturating_mul(ny), b.num_rows())
+    if !worth(nx.saturating_mul(nz), rows(a))
+        || !worth(nz.saturating_mul(ny), rows(b))
         || !worth(nx.saturating_mul(ny), out_rows)
     {
         return Ok(None);
     }
-    let (ax, az) = (
-        Position::new(&a_keys, &xs, &extent),
-        Position::new(&a_keys, &zs, &extent),
-    );
-    let (bz, by) = (
-        Position::new(&b_keys, &zs, &extent),
-        Position::new(&b_keys, &ys, &extent),
-    );
     let factors = |op: &einfold_ir::Operand, batch: &'_ RecordBatch| {
         op.factor
             .and_then(|c| batch.column(c.0).as_any().downcast_ref::<Float64Array>())
             .cloned()
     };
-    let (Some(av), Some(bv)) = (factors(op_a, a), factors(op_b, b)) else {
-        return Ok(None);
-    };
-    let (av, bv) = (&av, &bv);
 
-    // a's rows by position; a repeated position means duplicate tuples.
-    let mut at = vec![NONE; nx * nz];
-    for r in 0..a.num_rows() {
-        if std::mem::replace(&mut at[ax.of(r) * nz + az.of(r)], r as u32) != NONE {
+    // Whether existence can be ignored: a domain whose default is +0.0.
+    let zero_default = fold
+        .domain()
+        .is_some_and(|d| d.missing.map(f64::to_bits) == Some(0.0f64.to_bits()));
+    // In one pass over a: a dense matrix [x][z] of its factors, and what each
+    // position holds, where a repeated position means duplicate tuples; which
+    // x positions it reaches; whether each has a non-NULL factor,
+    // `valued[x]`, which existence needs only without the 0.0 default; and
+    // whether every non-NULL factor is finite.
+    let mut am = vec![0.0; nx * nz];
+    let mut held = vec![ABSENT; nx * nz];
+    let mut reached = vec![false; nx];
+    let mut valued = vec![false; if zero_default { 0 } else { nx }];
+    let mut finite = true;
+    for (batch, keys) in a.iter().zip(&a_keys) {
+        let (ax, az) = (
+            Position::new(keys, &xs, &extent),
+            Position::new(keys, &zs, &extent),
+        );
+        let Some(av) = factors(op_a, batch) else {
             return Ok(None);
+        };
+        for r in 0..batch.num_rows() {
+            let x = ax.of(r);
+            let p = x * nz + az.of(r);
+            let valid = av.is_valid(r);
+            if std::mem::replace(&mut held[p], if valid { VALUED } else { NULL }) != ABSENT {
+                return Ok(None);
+            }
+            reached[x] = true;
+            if valid {
+                am[p] = av.value(r);
+                finite &= am[p].is_finite();
+            }
+            if !zero_default {
+                valued[x] |= valid;
+            }
         }
     }
     // b as a dense matrix [z][y], with holes (missing or NULL rows) as 0.
     let mut bm = vec![0.0; nz * ny];
     let mut present = vec![false; nz * ny];
-    for r in 0..b.num_rows() {
-        let p = bz.of(r) * ny + by.of(r);
-        if std::mem::replace(&mut present[p], true) {
+    let mut b_nulls = false;
+    for (batch, keys) in b.iter().zip(&b_keys) {
+        let (bz, by) = (
+            Position::new(keys, &zs, &extent),
+            Position::new(keys, &ys, &extent),
+        );
+        let Some(bv) = factors(op_b, batch) else {
             return Ok(None);
-        }
-        if bv.is_valid(r) {
-            bm[p] = bv.value(r);
+        };
+        b_nulls |= bv.null_count() > 0;
+        for r in 0..batch.num_rows() {
+            let p = bz.of(r) * ny + by.of(r);
+            if std::mem::replace(&mut present[p], true) {
+                return Ok(None);
+            }
+            if bv.is_valid(r) {
+                bm[p] = bv.value(r);
+            }
         }
     }
-    // Whether existence can be ignored: a domain whose default is +0.0.
-    let zero_default = fold
-        .domain()
-        .is_some_and(|d| d.missing.map(f64::to_bits) == Some(0.0f64.to_bits()));
-    let holes = bv.null_count() > 0 || present.iter().any(|&p| !p);
-    if holes {
-        let finite = (0..av.len()).all(|r| av.is_null(r) || av.value(r).is_finite());
-        if !zero_default || !finite {
-            return Ok(None);
-        }
+    let holes = b_nulls || present.iter().any(|&p| !p);
+    if holes && (!zero_default || !finite) {
+        return Ok(None);
     }
     // Otherwise b is complete, so group (x, y) exists when a has a row at x,
-    // and is NULL when all of that row's factors are: whether it has a value
-    // is `valued[x]`, which existence needs only without the 0.0 default.
-    let mut valued = vec![false; if zero_default { 0 } else { nx }];
-    if !zero_default {
-        for r in 0..a.num_rows() {
-            valued[ax.of(r)] |= av.is_valid(r);
-        }
-    }
+    // and is NULL when all of that row's factors are: when `valued[x]` is
+    // false.
 
-    let out = accumulate(&at, av, &bm, (nx, nz, ny), threads);
+    let out = accumulate(&am, &held, &bm, (nx, nz, ny), threads);
     match (fold.domain(), domain) {
         (Some(spec), Some(domain)) => {
             // The dense output is laid out [x][y], X's and Y's dimensions each
@@ -280,9 +311,17 @@ pub(crate) fn fold(
                 })
                 .collect();
             // A cell's value as the left join gives it: its sum where the
-            // group exists with a value, else the default.
+            // group exists with a value, else the default. Whether it has one
+            // is spread from x to its cells, so that a lookup needs no
+            // division.
+            let cell_valued: Vec<bool> = match zero_default {
+                true => Vec::new(),
+                false => (valued.iter())
+                    .flat_map(|&v| std::iter::repeat_n(v, ny))
+                    .collect(),
+            };
             let value = |c: usize| -> Option<f64> {
-                if zero_default || valued[c / ny] {
+                if zero_default || cell_valued[c] {
                     Some(out[c])
                 } else {
                     spec.missing
@@ -294,30 +333,29 @@ pub(crate) fn fold(
                 strides: &strides,
                 extent: &extent,
             };
-            let mut seen = vec![false; if unique_domain { nx * ny } else { 0 }];
-            let mut batches = Vec::with_capacity(domain.len());
-            for f in domain {
-                let cell = locate(f, &cells)?;
-                if unique_domain
-                    && (cell.iter())
-                        .any(|&c| c != NO_GROUP && std::mem::replace(&mut seen[c], true))
-                {
-                    return Ok(None);
+            // Each batch's cells, then its rows, on the threads in turn: the
+            // batches are independent, and each comes back in its place.
+            let located = par_tasks(domain.len(), threads, |i| locate(&domain[i], &cells))
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            if unique_domain {
+                let mut seen = vec![false; nx * ny];
+                for &c in located.iter().flatten() {
+                    if c != NO_GROUP && std::mem::replace(&mut seen[c], true) {
+                        return Ok(None);
+                    }
                 }
-                batches.push(domain_batch(f, &cell, spec, &value, &schema)?);
             }
-            Ok(Some(batches))
+            let batches = par_tasks(domain.len(), threads, |i| {
+                domain_batch(&domain[i], &located[i], spec, &value, &schema)
+            });
+            Ok(Some(batches.into_iter().collect::<Result<_>>()?))
         }
         (None, None) => {
-            // Without a domain, the groups are those some row of a reaches.
-            let mut reached = vec![false; nx];
-            for r in 0..a.num_rows() {
-                reached[ax.of(r)] = true;
-            }
-            let groups: Vec<(usize, usize)> = (0..nx)
-                .filter(|&x| reached[x])
-                .flat_map(|x| (0..ny).map(move |y| (x, y)))
-                .collect();
+            // Without a domain, the groups are (x, y) for each x some row of a
+            // reaches, in position order, and every y.
+            let rows: Vec<usize> = (0..nx).filter(|&x| reached[x]).collect();
+            let n = rows.len() * ny;
             let mut columns: Vec<ArrayRef> = Vec::with_capacity(fold.outputs().len() + 1);
             for d in fold.outputs().iter().map(|o| o.dimension.0) {
                 // The key's place in x's or y's position, first dimension
@@ -328,17 +366,39 @@ pub(crate) fn fold(
                 };
                 let slot = role.iter().position(|&e| e == d).unwrap();
                 let stride: usize = role[slot + 1..].iter().map(|&e| extent[e]).product();
-                let key = Int64Array::from_iter_values(groups.iter().map(|&(x, y)| {
-                    let p = if in_x { x } else { y };
-                    ((p / stride) % extent[d]) as i64
-                }));
+                let key_at = |p: usize| ((p / stride) % extent[d]) as i64;
+                let mut key = Vec::with_capacity(n);
+                if in_x {
+                    for &x in &rows {
+                        key.extend(std::iter::repeat_n(key_at(x), ny));
+                    }
+                } else {
+                    let along: Vec<i64> = (0..ny).map(key_at).collect();
+                    for _ in &rows {
+                        key.extend_from_slice(&along);
+                    }
+                }
+                let key = Int64Array::from(key);
                 let ty = schema.field(columns.len()).data_type();
                 columns.push(cast(&(Arc::new(key) as ArrayRef), ty)?);
             }
-            let result: Float64Array = groups
-                .iter()
-                .map(|&(x, y)| valued[x].then(|| out[x * ny + y]))
-                .collect();
+            let result = if rows.iter().all(|&x| valued[x]) {
+                // No NULLs: the output's rows as they are, copied only when
+                // some x is missing.
+                match rows.len() == nx {
+                    true => Float64Array::from(out),
+                    false => Float64Array::from(
+                        (rows.iter())
+                            .flat_map(|&x| out[x * ny..(x + 1) * ny].iter().copied())
+                            .collect::<Vec<f64>>(),
+                    ),
+                }
+            } else {
+                (rows.iter())
+                    .flat_map(|&x| (0..ny).map(move |y| (x, y)))
+                    .map(|(x, y)| valued[x].then(|| out[x * ny + y]))
+                    .collect()
+            };
             columns.push(Arc::new(result));
             Ok(Some(vec![RecordBatch::try_new(schema, columns)?]))
         }
@@ -418,19 +478,19 @@ fn domain_batch(
     RecordBatch::try_new(Arc::clone(schema), columns)
 }
 
-/// `out[x][y] = Σ_z a[x, z]·b[z][y]` over the rows of `a` (`at` gives each
-/// position's row), skipping NULL factors of `a`, in fixed blocks.
+/// `out[x][y] = Σ_z a[x, z]·b[z][y]` over the positions of `a` that hold a
+/// value (`held` says which), skipping missing rows and NULL factors, in
+/// fixed blocks.
 fn accumulate(
-    at: &[u32],
-    av: &Float64Array,
+    am: &[f64],
+    held: &[u8],
     bm: &[f64],
     (nx, nz, ny): (usize, usize, usize),
     threads: usize,
 ) -> Vec<f64> {
     let add = |row: &mut [f64], x: usize, z: usize| {
-        let r = at[x * nz + z];
-        if r != NONE && av.is_valid(r as usize) {
-            let v = av.value(r as usize);
+        if held[x * nz + z] == VALUED {
+            let v = am[x * nz + z];
             for (o, b) in row.iter_mut().zip(&bm[z * ny..(z + 1) * ny]) {
                 *o += v * b;
             }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
-use datafusion::arrow::compute::{concat_batches, nullif};
+use datafusion::arrow::compute::nullif;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::runtime::SpawnedTask;
@@ -32,7 +32,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use einfold_ir::{ColumnIndex, Fold};
-use einfold_kernels::{Algorithm, Options};
+use einfold_kernels::{Algorithm, Options, Relation};
 use futures::future::try_join_all;
 use futures::{stream, StreamExt, TryStreamExt};
 
@@ -171,21 +171,6 @@ async fn collect(
     Ok(batches)
 }
 
-/// `batches` as one batch, its memory counted against `reservation`, and the
-/// parts' released.
-fn concat(
-    schema: &SchemaRef,
-    batches: Vec<RecordBatch>,
-    reservation: &MemoryReservation,
-) -> Result<RecordBatch> {
-    let parts: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-    let whole = concat_batches(schema, &batches)?;
-    reservation.try_grow(whole.get_array_memory_size())?;
-    drop(batches);
-    reservation.shrink(parts);
-    Ok(whole)
-}
-
 impl ExecutionPlan for EinFoldExec {
     fn name(&self) -> &'static str {
         "EinFoldExec"
@@ -283,8 +268,8 @@ impl ExecutionPlan for EinFoldExec {
             Arc::new(MemoryConsumer::new("EinFoldExec").register(context.memory_pool()));
         let out = Arc::clone(&schema);
         let result = async move {
-            // The operands are read whole; the domain, whose rows the output
-            // has one for one, stays in its batches.
+            // Every input is read whole, and stays in the batches it arrived
+            // in: the kernels read them batch by batch.
             let schemas: Vec<SchemaRef> = inputs.iter().map(|i| i.schema()).collect();
             let mut batches = try_join_all(
                 inputs
@@ -298,20 +283,24 @@ impl ExecutionPlan for EinFoldExec {
             let masks: Option<Vec<ArrayRef>> = null_when
                 .zip(domain.as_ref())
                 .map(|(c, d)| d.iter().map(|b| Arc::clone(b.column(c.0))).collect());
-            let b = concat(&schemas[1], batches.pop().unwrap(), &reservation)?;
-            let a = concat(&schemas[0], batches.pop().unwrap(), &reservation)?;
+            let b = batches.pop().unwrap();
+            let a = batches.pop().unwrap();
             let timer = compute.timer();
             let with_fallback = fallback.is_some();
             let kernel_out = Arc::clone(&out);
             let held = Arc::clone(&reservation);
             let ran = SpawnedTask::spawn_blocking(move || {
                 let _held = held;
-                let domain = domain.as_deref();
+                let (a, b) = (
+                    Relation::new(&schemas[0], &a),
+                    Relation::new(&schemas[1], &b),
+                );
+                let domain = domain.as_deref().map(|d| Relation::new(&schemas[2], d));
                 match with_fallback {
-                    true => einfold_kernels::fold_dense(&fold, &a, &b, domain, kernel_out, options)
+                    true => einfold_kernels::fold_dense(&fold, a, b, domain, kernel_out, options)
                         .map(|r| r.map(|batches| (Algorithm::Dense, batches))),
                     false => {
-                        einfold_kernels::fold(&fold, &a, &b, domain, kernel_out, options).map(Some)
+                        einfold_kernels::fold(&fold, a, b, domain, kernel_out, options).map(Some)
                     }
                 }
             })

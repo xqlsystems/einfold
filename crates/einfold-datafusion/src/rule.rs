@@ -394,6 +394,33 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
     restore(node, &names, &agg.schema)
 }
 
+/// `plan` with each [`FoldNode`] that keeps the plan it replaced swapped
+/// back for that plan, under the node's column names, so that whatever reads
+/// the node still resolves. A node's fallback is the host's own plan, which
+/// must not run einfold again: an operator that falls back to a plan
+/// holding another of its kind would read the same operands once more.
+pub(crate) fn host_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
+    let swapped = plan.transform_up(|plan| {
+        let LogicalPlan::Extension(e) = &plan else {
+            return Ok(Transformed::no(plan));
+        };
+        let Some(node) = e.node.as_any().downcast_ref::<FoldNode>() else {
+            return Ok(Transformed::no(plan));
+        };
+        let Some(fallback) = node.fallback() else {
+            return Ok(Transformed::no(plan));
+        };
+        let names = (e.node.schema().fields().iter()).map(|f| f.name().clone());
+        let exprs: Vec<Expr> = (fallback.schema().columns().into_iter())
+            .zip(names)
+            .map(|(c, name)| Expr::Column(c).alias(name))
+            .collect();
+        let projection = Projection::try_new(exprs, Arc::new(fallback.clone()))?;
+        Ok(Transformed::yes(LogicalPlan::Projection(projection)))
+    })?;
+    Ok(swapped.data)
+}
+
 /// `node`, whose columns are `names`, renamed to `schema`'s columns, or
 /// `None` if the result's schema wouldn't be exactly `schema`.
 fn restore(
@@ -550,7 +577,8 @@ fn from_domain(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
         .map(Expr::Column)
         .collect();
     kept.push(Expr::Column(value.clone()));
-    let original = LogicalPlan::Projection(Projection::try_new(kept, Arc::clone(&p.input))?);
+    let input = host_plan(p.input.as_ref().clone())?;
+    let original = LogicalPlan::Projection(Projection::try_new(kept, Arc::new(input))?);
     let inputs = node.inputs_owned();
     // The domain's columns keep their names, and the value takes one that
     // can't clash with theirs.

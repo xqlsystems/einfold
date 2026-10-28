@@ -573,3 +573,54 @@ async fn reset_plans_whose_fallback_ran_rerun() {
     assert_eq!(first.len(), 4);
     assert_eq!(first, again);
 }
+
+/// A fold from a domain falls back to the host's own plan, which holds no
+/// `EinFoldExec`: one there would read the operands again.
+#[tokio::test]
+async fn fallbacks_hold_only_the_hosts_plan() {
+    let ctx = einfold(4, true);
+    for s in TEXT_TABLES {
+        ctx.sql(s).await.unwrap().collect().await.unwrap();
+    }
+    ctx.sql("CREATE TABLE d (a VARCHAR, b VARCHAR, v DOUBLE) AS VALUES ('k0', 'm0', 1.0)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let sql = "SELECT d.a, d.b, CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 \
+               ELSE s.v END AS v FROM d LEFT JOIN (SELECT l.a AS g0, r.b AS g1, \
+               SUM(l.v * r.v) AS v FROM l JOIN r ON l.b = r.a GROUP BY l.a, r.b) s \
+               ON (d.a IS NOT DISTINCT FROM s.g0) AND (d.b IS NOT DISTINCT FROM s.g1)";
+    let plan = ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    fn execs(
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        out: &mut Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+    ) {
+        let any: &dyn std::any::Any = plan.as_ref();
+        if any.is::<EinFoldExec>() {
+            out.push(Arc::clone(plan));
+        }
+        for c in plan.children() {
+            execs(c, out);
+        }
+    }
+    let mut found = Vec::new();
+    execs(&plan, &mut found);
+    assert_eq!(found.len(), 1, "one fold from a domain");
+    let any: &dyn std::any::Any = found[0].as_ref();
+    let fallback = any
+        .downcast_ref::<EinFoldExec>()
+        .unwrap()
+        .fallback()
+        .expect("a fallback");
+    let mut inner = Vec::new();
+    execs(fallback, &mut inner);
+    assert!(inner.is_empty(), "the fallback runs einfold again");
+}

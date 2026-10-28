@@ -34,6 +34,10 @@ pyo3 = { version = "0.29", features = ["extension-module", "abi3", "abi3-py310"]
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
+# To give the main thread room to decode deep plans (see `src/stack.rs`).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"

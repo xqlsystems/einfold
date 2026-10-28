@@ -40,7 +40,9 @@ use datafusion::logical_expr::{lit, Expr, Join, JoinType, LogicalPlan, Projectio
 use einfold_ir::{ColumnIndex, Domain, Fold, KeyEquality, Output};
 
 use crate::node::FoldNode;
-use crate::rule::{found_fold, movable, resolve, restore, same_schema, sum_argument, PREFIX};
+use crate::rule::{
+    found_fold, host_plan, movable, resolve, restore, same_schema, sum_argument, PREFIX,
+};
 
 /// `plan` without the aliases and column-only projections over it, with, for
 /// each of `plan`'s columns, its column in what is left. A table scan's
@@ -322,7 +324,10 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
     // The plan it replaces: the left join, as d's columns and the sum.
     let mut kept: Vec<Expr> = d.schema().columns().into_iter().map(Expr::Column).collect();
     kept.push(Expr::Column(sum.clone()));
-    let original = LogicalPlan::Projection(Projection::try_new(kept, Arc::clone(&p.input))?);
+    // The host's own plan, with the inner fold swapped back for the plan it
+    // replaced, so that falling back doesn't run einfold again.
+    let input = host_plan(p.input.as_ref().clone())?;
+    let original = LogicalPlan::Projection(Projection::try_new(kept, Arc::new(input))?);
     let names: Vec<String> = (d.schema().fields().iter())
         .map(|f| f.name().clone())
         .chain([format!("{PREFIX}v")])

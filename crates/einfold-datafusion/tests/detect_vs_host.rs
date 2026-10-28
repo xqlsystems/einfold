@@ -776,3 +776,50 @@ async fn joined_back_tests_apply_once() {
         assert!(same_answer(&setup, &sql).await > 0, "{sql}");
     }
 }
+
+/// A fold joined back to its domain falls back to the host's own plan too.
+#[tokio::test]
+async fn joined_back_fallbacks_hold_only_the_hosts_plan() {
+    let ctx = einfold(4, true);
+    for s in [
+        "CREATE TABLE l (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,2.0),(1,0,3.0),(1,1,4.0)",
+        "CREATE TABLE r (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,10.0),(1,0,100.0),(1,1,1000.0)",
+        "CREATE TABLE d (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,NULL),(0,0,5.0),(1,1,7.0)",
+    ] {
+        ctx.sql(s).await.unwrap().collect().await.unwrap();
+    }
+    let sql = "SELECT d.a, d.b, d.v AS w, COALESCE(s.v, 0.0) AS v FROM d LEFT JOIN ( \
+               SELECT d2.a AS a, d2.b AS b, SUM(CASE WHEN d2.v IS NULL THEN NULL ELSE f.v END) AS v \
+               FROM d d2 JOIN (SELECT l.a AS g0, r.b AS g1, SUM(l.v * r.v) AS v \
+                               FROM l JOIN r ON l.b = r.a GROUP BY l.a, r.b) f \
+                 ON d2.a = f.g0 AND d2.b = f.g1 \
+               GROUP BY d2.a, d2.b) s \
+             ON d.a = s.a AND d.b = s.b";
+    let plan = ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    fn execs(
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        out: &mut Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+    ) {
+        let any: &dyn std::any::Any = plan.as_ref();
+        if any.is::<EinFoldExec>() {
+            out.push(Arc::clone(plan));
+        }
+        for c in plan.children() {
+            execs(c, out);
+        }
+    }
+    let mut found = Vec::new();
+    execs(&plan, &mut found);
+    assert_eq!(found.len(), 1, "one fold joined back");
+    let any: &dyn std::any::Any = found[0].as_ref();
+    let fallback = (any.downcast_ref::<EinFoldExec>().unwrap().fallback()).expect("a fallback");
+    let mut inner = Vec::new();
+    execs(fallback, &mut inner);
+    assert!(inner.is_empty(), "the fallback runs einfold again");
+}

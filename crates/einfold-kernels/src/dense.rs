@@ -392,6 +392,47 @@ pub(crate) fn fold(
     // and is NULL when all of that row's factors are: when `valued[x]` is
     // false.
 
+    // Each domain row's cell, located before the product, so that a domain
+    // whose keys must be unique and aren't is declined before the product is
+    // computed. The dense output is laid out [x][y], X's and Y's dimensions
+    // each first-slowest, so a key's stride is the product of the extents
+    // after it in that order.
+    let located = match (fold.domain(), domain) {
+        (Some(_), Some(domain)) => {
+            let order: Vec<usize> = xs.iter().chain(&ys).copied().collect();
+            let cell_keys: Vec<CellKey> = (fold.outputs().iter())
+                .map(|o| {
+                    let d = o.dimension.0;
+                    let slot = order.iter().position(|&e| e == d).expect("an output");
+                    CellKey {
+                        column: o.domain_key.expect("a fold with a domain").column,
+                        extent: extent[d],
+                        stride: order[slot + 1..].iter().map(|&e| extent[e]).product(),
+                    }
+                })
+                .collect();
+            // Each batch's cells, on the threads in turn: the batches are
+            // independent, and each comes back in its place.
+            let located = par_tasks(domain.len(), threads, |i| locate(&domain[i], &cell_keys))
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            if domain_rows == DomainRows::UniqueKeys {
+                // Batches in parallel: whichever of two rows with one cell
+                // marks it second sees the mark, in any order.
+                let seen: Vec<AtomicBool> = (0..nx * ny).map(|_| AtomicBool::new(false)).collect();
+                let repeated = par_tasks(located.len(), threads, |i| {
+                    (located[i].iter())
+                        .any(|&c| c != NO_GROUP && seen[c].swap(true, atomic::Ordering::Relaxed))
+                });
+                if repeated.contains(&true) {
+                    return Ok(None);
+                }
+            }
+            located
+        }
+        _ => Vec::new(),
+    };
+
     let out = accumulate(
         &a_matrix,
         &held,
@@ -422,21 +463,6 @@ pub(crate) fn fold(
     let masked = !fold.conditions().is_empty();
     match (fold.domain(), domain) {
         (Some(spec), Some(domain)) => {
-            // The dense output is laid out [x][y], X's and Y's dimensions each
-            // first-slowest, so a key's stride is the product of the extents
-            // after it in that order.
-            let order: Vec<usize> = xs.iter().chain(&ys).copied().collect();
-            let cell_keys: Vec<CellKey> = (fold.outputs().iter())
-                .map(|o| {
-                    let d = o.dimension.0;
-                    let slot = order.iter().position(|&e| e == d).expect("an output");
-                    CellKey {
-                        column: o.domain_key.expect("a fold with a domain").column,
-                        extent: extent[d],
-                        stride: order[slot + 1..].iter().map(|&e| extent[e]).product(),
-                    }
-                })
-                .collect();
             // A cell's value as the left join gives it: its sum where the
             // group exists with a value, else the default. Whether it has one
             // is spread from x to its cells, so that a lookup needs no
@@ -457,23 +483,7 @@ pub(crate) fn fold(
                     spec.missing
                 }
             };
-            // Each batch's cells, then its rows, on the threads in turn: the
-            // batches are independent, and each comes back in its place.
-            let located = par_tasks(domain.len(), threads, |i| locate(&domain[i], &cell_keys))
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
-            if domain_rows == DomainRows::UniqueKeys {
-                // Batches in parallel: whichever of two rows with one cell
-                // marks it second sees the mark, in any order.
-                let seen: Vec<AtomicBool> = (0..nx * ny).map(|_| AtomicBool::new(false)).collect();
-                let repeated = par_tasks(located.len(), threads, |i| {
-                    (located[i].iter())
-                        .any(|&c| c != NO_GROUP && seen[c].swap(true, atomic::Ordering::Relaxed))
-                });
-                if repeated.contains(&true) {
-                    return Ok(None);
-                }
-            }
+            // Each batch's rows, on the threads in turn.
             let batches = par_tasks(domain.len(), threads, |i| {
                 domain_batch(&domain[i], &located[i], spec, &value, &schema)
             });

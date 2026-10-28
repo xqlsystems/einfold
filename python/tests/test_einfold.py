@@ -111,6 +111,10 @@ def test_runs_queries_again_and_tables_replaced():
     off, on, found = _pair(_tables)
     for _ in range(3):
         _assert_same(off.sql(MATMUL).to_arrow_table(), on.sql(MATMUL).to_arrow_table())
+        # Nothing a query encoded outlives it: a plan held after it ran would
+        # keep what its operators hold, such as its hash joins' tables.
+        assert EinFold.tables_pending() == 0
+        assert EinFold.plans_pending() == 0
     for ctx in (off, on):
         ctx.deregister_table("w")
         r = np.arange(16 * 8)

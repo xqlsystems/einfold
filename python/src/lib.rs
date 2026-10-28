@@ -162,6 +162,13 @@ impl EinFold {
         codec::tables_pending()
     }
 
+    /// How many plans einfold's codec holds, encoded and not yet decoded:
+    /// 0 between queries.
+    #[staticmethod]
+    fn plans_pending() -> usize {
+        codec::plans_pending()
+    }
+
     fn __datafusion_session_components__<'py>(
         &self,
         py: Python<'py>,

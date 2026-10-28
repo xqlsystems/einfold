@@ -319,3 +319,23 @@ def test_sees_values_changed_in_place():
     w["val"].values *= -2.0
     _assert_same(off.sql(MATMUL).to_arrow_table(), on.sql(MATMUL).to_arrow_table())
     assert found.plans_with_einfold() >= 2
+
+
+@pytest.mark.parametrize("second", ["SELECT s, AVG(val) AS mean FROM a GROUP BY s",
+                                    "SELECT s, k, -val AS val FROM a"])
+def test_tells_unnamed_tables_apart(second):
+    """A DataFrame's cached result (`DataFrame.cache()`) is a table without a
+    name: every scan of one is called `?table?`. einfold copies the tables a
+    query reads once per query, and must copy each unnamed one apart, whether
+    its columns differ from another's or match them."""
+    off, on, found = _pair(_tables)
+    for ctx in (off, on):
+        ctx.register_view("x", ctx.sql("SELECT s, k, val FROM a").cache())
+        ctx.register_view("y", ctx.sql(second).cache())
+    on_k = "AND x.k = y.k" if "k," in second else ""
+    sql = (f"SELECT x.s, SUM(x.val * y.{'val' if on_k else 'mean'}) AS v "
+           f"FROM x JOIN y ON x.s = y.s {on_k} GROUP BY x.s")
+    _assert_same(off.sql(sql).to_arrow_table(), on.sql(sql).to_arrow_table())
+    _assert_same(off.sql(MATMUL.replace("FROM a", "FROM x a")).to_arrow_table(),
+                 on.sql(MATMUL.replace("FROM a", "FROM x a")).to_arrow_table())
+    assert found.plans() >= 2

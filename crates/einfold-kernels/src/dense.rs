@@ -5,16 +5,19 @@
 //! EinFold's dense algorithm: a two-operand fold computed by positions, with
 //! no hashing, when the keys are small non-negative integers.
 //!
-//! Every dimension must have one of three roles:
+//! Every dimension must have one of four roles:
 //!
+//! - **W**: an output held by both operands, such as attention's batch and
+//!   head: in SQL, a join key that is also grouped by;
 //! - **X**: an output held only by the first operand, `a`;
-//! - **Z**: a summed dimension held by both operands (the join's keys);
+//! - **Z**: a summed dimension held by both operands (the join's other keys);
 //! - **Y**: an output held only by the second operand, `b`.
 //!
-//! That is a matrix product `out[x, y] = Σ_z a[x, z]·b[z, y]`, with each role's
-//! dimensions flattened into one position. Keys are used as positions
-//! directly: key `k` of a dimension is position `k`, and a dimension's extent
-//! is its largest key plus one. Both operands are placed in dense matrices,
+//! That is a batch of matrix products `out[w, x, y] = Σ_z a[w, x, z]·b[w, z, y]`,
+//! with each role's dimensions flattened into one position. Below, a *row*
+//! of `a` or of the output is a position of W and X together, `(w, x)`, W
+//! slowest. Keys are used as positions directly: key `k` of a dimension is
+//! position `k`, and a dimension's extent is its largest key plus one. Both operands are placed in dense matrices,
 //! batch by batch, as they arrive, and each position of `a` adds its factor
 //! times a row of `b` into a row of the output.
 //!
@@ -70,6 +73,9 @@ const YB: usize = 2048;
 /// Positions of `z` per block, when the output is smaller.
 const ZB: usize = 4096;
 const FEW_CELLS: usize = 4096;
+/// Input rows below which a fold runs on one thread: starting threads costs
+/// tens of microseconds each, about what folding this many rows does.
+const FEW_ROWS: usize = 1 << 16;
 /// What a position of `a` holds: no row, a row with a NULL factor, or a row
 /// with a value.
 const ABSENT: u8 = 0;
@@ -131,13 +137,17 @@ pub(crate) fn positions(
 
 /// Run `f(i)` for every task `i` in `0..tasks` on up to `threads` threads.
 /// Results come back in task order, so how tasks were assigned to threads
-/// never shows in them.
+/// never shows in them. One thread's tasks run on the calling thread:
+/// starting a thread costs more than a small fold.
 pub(crate) fn par_tasks<T: Send>(
     tasks: usize,
     threads: usize,
     f: impl Fn(usize) -> T + Sync,
 ) -> Vec<T> {
     let threads = threads.clamp(1, tasks.max(1));
+    if threads == 1 {
+        return (0..tasks).map(f).collect();
+    }
     let f = &f;
     let mut slots: Vec<Option<T>> = (0..tasks).map(|_| None).collect();
     thread::scope(|s| {
@@ -175,17 +185,26 @@ pub(crate) fn fold(
     let [op_a, op_b] = fold.operands() else {
         return Ok(None);
     };
-    // The roles: X and Y in output order, Z in dimension order. Here a
+    let inputs: usize = (a.iter().chain(b).chain(domain.unwrap_or_default()))
+        .map(RecordBatch::num_rows)
+        .sum();
+    let threads = if inputs < FEW_ROWS { 1 } else { threads };
+    // The roles: W, X and Y in output order, Z in dimension order. Here a
     // dimension is its index, which indexes the extents too.
-    let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut ws, mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let output_dimensions = fold.outputs().iter().map(|o| o.dimension);
     for d in output_dimensions {
         match (op_a.column_of(d), op_b.column_of(d)) {
+            (Some(_), Some(_)) => ws.push(d.0),
             (Some(_), None) => xs.push(d.0),
             (None, Some(_)) => ys.push(d.0),
-            _ => return Ok(None),
+            (None, None) => return Ok(None),
         }
     }
+    // From here on, `xs` are the dimensions of a row: W's, then X's. Each
+    // operand's rows hold the batch's positions first, so that a batch's
+    // matrices are contiguous.
+    xs.splice(0..0, ws.iter().copied());
     for d in fold.dimension_ids() {
         if fold.is_aggregated(d) {
             if op_a.column_of(d).is_none() || op_b.column_of(d).is_none() {
@@ -237,14 +256,19 @@ pub(crate) fn fold(
         dims.iter()
             .try_fold(1usize, |n, &d| n.checked_mul(extent[d]))
     };
-    let (Some(nx), Some(nz), Some(ny)) = (size(&xs), size(&zs), size(&ys)) else {
+    // b's rows are positions of W and Z together, W slowest.
+    let wzs: Vec<usize> = ws.iter().chain(&zs).copied().collect();
+    let (Some(nw), Some(nx), Some(nz), Some(ny)) = (size(&ws), size(&xs), size(&zs), size(&ys))
+    else {
         return Ok(None);
     };
+    // Rows per batch: an output row `r` is in batch `r / per_batch`.
+    let per_batch = nx.checked_div(nw).unwrap_or(0);
     let out_rows = domain.map_or(nx.saturating_mul(ny), |f| {
         f.iter().map(|b| b.num_rows()).sum()
     });
     if !worth(nx.saturating_mul(nz), rows(a))
-        || !worth(nz.saturating_mul(ny), rows(b))
+        || !worth(nw.saturating_mul(nz).saturating_mul(ny), rows(b))
         || !worth(nx.saturating_mul(ny), out_rows)
     {
         return Ok(None);
@@ -298,13 +322,13 @@ pub(crate) fn fold(
             }
         }
     }
-    // b as a dense matrix [z][y], with holes (missing or NULL rows) as 0.
-    let mut b_matrix = vec![0.0; nz * ny];
-    let mut present = vec![false; nz * ny];
+    // b as dense matrices [w][z][y], with holes (missing or NULL rows) as 0.
+    let mut b_matrix = vec![0.0; nw * nz * ny];
+    let mut present = vec![false; nw * nz * ny];
     let mut b_nulls = false;
     let b_positions = par_tasks(b.len(), threads, |i| {
         let rows = b[i].num_rows();
-        let z = positions(&b_keys[i], &zs, &extent, rows);
+        let z = positions(&b_keys[i], &wzs, &extent, rows);
         let y = positions(&b_keys[i], &ys, &extent, rows);
         (z, y)
     });
@@ -331,7 +355,14 @@ pub(crate) fn fold(
     // and is NULL when all of that row's factors are: when `valued[x]` is
     // false.
 
-    let out = accumulate(&a_matrix, &held, &b_matrix, (nx, nz, ny), threads);
+    let out = accumulate(
+        &a_matrix,
+        &held,
+        &b_matrix,
+        (nx, nz, ny),
+        per_batch,
+        threads,
+    );
     // A dimension's key at an output cell (x, y): its place in x's or y's
     // position, first dimension slowest. Keys are positions.
     let key_at = |d: usize, x: usize, y: usize| -> usize {
@@ -547,22 +578,25 @@ fn domain_batch(
     RecordBatch::try_new(Arc::clone(schema), columns)
 }
 
-/// `out[x][y] = Σ_z a[x, z]·b[z][y]` over the positions of `a` that hold a
-/// value (`held` says which), skipping missing rows and NULL factors, in
-/// fixed blocks.
+/// `out[x][y] = Σ_z a[x, z]·b[w][z][y]` over the positions of `a` that hold
+/// a value (`held` says which), skipping missing rows and NULL factors, in
+/// fixed blocks. Here `x` is a row, `(w, x)` in the module's terms, and its
+/// batch `w` is `x / per_batch`.
 fn accumulate(
     a_matrix: &[f64],
     held: &[u8],
     b_matrix: &[f64],
     (nx, nz, ny): (usize, usize, usize),
+    per_batch: usize,
     threads: usize,
 ) -> Vec<f64> {
-    // Adds a[x, z]·b[z][y0..y1] into `row`, the output's row x over those
-    // columns.
+    // Adds a[x, z]·b[w][z][y0..y1] into `row`, the output's row x over
+    // those columns.
     let add = |row: &mut [f64], x: usize, z: usize, y0: usize| {
         if held[x * nz + z] == VALUED {
             let v = a_matrix[x * nz + z];
-            let b_row = &b_matrix[z * ny + y0..z * ny + y0 + row.len()];
+            let start = ((x / per_batch) * nz + z) * ny + y0;
+            let b_row = &b_matrix[start..start + row.len()];
             for (o, b) in row.iter_mut().zip(b_row) {
                 *o += v * b;
             }

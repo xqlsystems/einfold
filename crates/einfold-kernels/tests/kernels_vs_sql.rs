@@ -30,10 +30,11 @@
 //!
 //! Half the cases are drawn from a *dense family*, shaped so that the dense
 //! algorithm may apply: non-negative integer keys with no NULLs in the
-//! operands, and every dimension either an output of one operand or summed
-//! and held by both. Some of them still take the discrimination algorithm (duplicate key
-//! tuples, or holes in an operand beside NaN or ±inf), and the test checks
-//! that the dense path ran in a good share of them.
+//! operands, and every dimension either an output of one operand, or held by
+//! both and summed or an output (a batch dimension). Some of them still take
+//! the discrimination algorithm (duplicate key tuples, or holes in an operand
+//! beside NaN or ±inf), and the test checks that the dense path ran in a good
+//! share of them, and in some with a batch dimension.
 //!
 //! Reproduce a failure with `EINFOLD_SEED=<seed printed>`; search longer with
 //! `EINFOLD_CASES=<n>` (and a starting `EINFOLD_SEED`).
@@ -365,10 +366,11 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
         }
     }
     // In the dense family, a dimension in one operand is an output, and one
-    // in both is summed.
+    // in both is summed, or else an output too: a batch dimension, such as
+    // attention's heads. A large case's dimensions keep their roles.
     let mut outputs: Vec<usize> = (0..n)
         .filter(|&d| match dense {
-            true => held[d] != [true, true],
+            true => held[d] != [true, true] || (large.is_none() && rng.chance(0.3)),
             false => rng.chance(0.5),
         })
         .collect();
@@ -751,7 +753,7 @@ async fn fold_matches_sql() {
         Err(_) if std::env::var("EINFOLD_SEED").is_ok() => 1,
         Err(_) => 400,
     };
-    let (mut dense_family, mut dense_ran) = (0, 0);
+    let (mut dense_family, mut dense_ran, mut batched_ran) = (0, 0, 0);
     let (mut unique_checked, mut unique_accepted) = (0, 0);
     for i in 0..cases {
         let seed = seed.wrapping_add(i);
@@ -767,6 +769,13 @@ async fn fold_matches_sql() {
         let (again, _) = run_fold(&case, &mut rng);
         dense_family += usize::from(dense);
         dense_ran += usize::from(ran == Algorithm::Dense);
+        let [op_a, op_b] = case.fold.operands() else {
+            unreachable!("two operands")
+        };
+        let batched = (case.fold.outputs().iter()).any(|o| {
+            op_a.column_of(o.dimension).is_some() && op_b.column_of(o.dimension).is_some()
+        });
+        batched_ran += usize::from(batched && ran == Algorithm::Dense);
         if ran == Algorithm::Dense && case.domain.is_some() {
             unique_checked += 1;
             unique_accepted += usize::from(check_unique_domain(&case, &mut rng, fail));
@@ -808,7 +817,9 @@ async fn fold_matches_sql() {
             }
         }
     }
-    eprintln!("dense path: {dense_ran} of {cases} cases; dense family: {dense_family}");
+    eprintln!(
+        "dense path: {dense_ran} of {cases} cases, {batched_ran} with a batch dimension; dense family: {dense_family}"
+    );
     eprintln!("unique-domain check: accepted {unique_accepted} of {unique_checked}");
     // About a third of the dense family qualifies (the rest has duplicate
     // tuples, keys too large for BIGINT, or holes where existence matters);
@@ -817,6 +828,10 @@ async fn fold_matches_sql() {
         assert!(
             dense_ran * 4 >= dense_family,
             "the dense path ran in only {dense_ran} of {dense_family} dense-family cases"
+        );
+        assert!(
+            batched_ran > 0,
+            "the dense path ran in no case with a batch dimension"
         );
     }
 }

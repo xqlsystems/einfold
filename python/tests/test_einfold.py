@@ -151,3 +151,22 @@ def test_gradients_through_ddxdb():
     _tables(on)
     _assert_same(off.sql(sql).to_arrow_table(), on.sql(sql).to_arrow_table())
     assert found.plans_with_einfold() >= 1
+
+
+def _deep(depth):
+    """A query whose plan is a chain of `depth` joins."""
+    ctes = ["t0 AS (SELECT i, x FROM base)"]
+    for n in range(1, depth + 1):
+        ctes.append(f"t{n} AS (SELECT a.i, a.x + b.x AS x FROM t{n - 1} a JOIN base b ON a.i = b.i)")
+    return "WITH " + ", ".join(ctes) + f" SELECT SUM(x) AS s FROM t{depth}"
+
+
+@pytest.mark.parametrize("depth", [15, 60])
+def test_plans_deep_queries(depth):
+    off, on = SessionContext(), SessionContext()
+    _install(on)
+    for ctx in (off, on):
+        ctx.register_record_batches("base", [[pa.record_batch(
+            {"i": [0, 1, 2], "x": [1.0, 2.0, 3.0]})]])
+    sql = _deep(depth)
+    assert on.sql(sql).to_pydict() == off.sql(sql).to_pydict()

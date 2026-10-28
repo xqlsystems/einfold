@@ -1484,6 +1484,7 @@ dependencies = [
  "datafusion-proto",
  "einfold-datafusion",
  "futures",
+ "prost",
  "pyo3",
  "tokio",
 ]

@@ -699,14 +699,17 @@ fn from_domain(p: &Projection, fallback: Fallback) -> Result<Option<LogicalPlan>
             ..*o
         })
         .collect();
-    let Ok(with_domain) = Fold::try_new(
+    let with_domain = Fold::try_new(
         fold.dimensions().to_vec(),
         fold.operands().to_vec(),
         outputs,
         fold.row(),
         fold.aggregate().clone(),
         Some(spec),
-    ) else {
+    )
+    // The inner fold's conditions, such as a causal mask, hold here too.
+    .and_then(|f| f.with_conditions(fold.conditions().to_vec()));
+    let Ok(with_domain) = with_domain else {
         return Ok(None);
     };
     // The plan it replaces: the join, as the domain's columns and the sum.
@@ -734,9 +737,12 @@ fn from_domain(p: &Projection, fallback: Fallback) -> Result<Option<LogicalPlan>
     ) else {
         return Ok(None);
     };
-    let new = match fallback {
-        Fallback::HostPlan => new.with_fallback(original.clone()),
-        Fallback::Kernels => new.marked_found(),
+    // A mask needs the host's plan where the dense algorithm declines, as
+    // the inner fold did.
+    let masked = !fold.conditions().is_empty();
+    let new = match (fallback, masked) {
+        (Fallback::HostPlan, _) | (_, true) => new.with_fallback(original.clone()),
+        (Fallback::Kernels, false) => new.marked_found(),
     }
     .into_plan();
     // Rename the node's columns to the join's, so `p` reads them as before.

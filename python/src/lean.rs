@@ -30,9 +30,9 @@ use std::fmt::{self, Formatter};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{ArrayData, RecordBatch};
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::catalog::default_table_source::{provider_as_source, source_as_provider};
+use datafusion::catalog::default_table_source;
 use datafusion::catalog::{CatalogProviderList, MemoryCatalogProviderList, Session, TableProvider};
 use datafusion::common::config::{ConfigOptions, TableOptions};
 use datafusion::common::stats::Precision;
@@ -60,7 +60,6 @@ use datafusion::physical_plan::statistics::StatisticsArgs;
 use datafusion::physical_plan::{
     self, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
-use futures::StreamExt;
 
 /// A session's table, scanned with the session's configuration only (see
 /// the module's documentation).
@@ -378,35 +377,42 @@ struct Data {
     first: Vec<Slice>,
 }
 
-/// Where a column's values are: its buffers' addresses, and its offset and
-/// length in them.
+/// Where a column's values are: its buffers' addresses, its offset and
+/// length in them, and the same of each child array a nested column has.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct Slice {
     buffers: Vec<usize>,
     offset: usize,
     len: usize,
+    children: Vec<Slice>,
+}
+
+impl Slice {
+    fn of(data: &ArrayData) -> Self {
+        let buffers = (data.buffers().iter())
+            .chain(data.nulls().map(|nulls| nulls.buffer()))
+            .map(|buffer| buffer.as_ptr() as usize)
+            .collect();
+        Slice {
+            buffers,
+            offset: data.offset(),
+            len: data.len(),
+            children: data.child_data().iter().map(Slice::of).collect(),
+        }
+    }
 }
 
 /// Where each of `batch`'s columns is.
 fn slices(batch: &RecordBatch) -> Vec<Slice> {
     (batch.columns().iter())
-        .map(|column| {
-            let data = column.to_data();
-            let buffers = (data.buffers().iter())
-                .chain(data.nulls().map(|nulls| nulls.buffer()))
-                .map(|buffer| buffer.as_ptr() as usize)
-                .collect();
-            Slice {
-                buffers,
-                offset: data.offset(),
-                len: data.len(),
-            }
-        })
+        .map(|column| Slice::of(&column.to_data()))
         .collect()
 }
 
 /// Where each column of `scan`'s first batch with rows is.
 async fn first_of(scan: &Arc<dyn ExecutionPlan>, context: &Arc<TaskContext>) -> Result<Vec<Slice>> {
+    use futures::StreamExt;
+
     let partitions = scan.properties().output_partitioning().partition_count();
     for partition in 0..partitions {
         let mut stream = scan.execute(partition, Arc::clone(context))?;
@@ -420,13 +426,16 @@ async fn first_of(scan: &Arc<dyn ExecutionPlan>, context: &Arc<TaskContext>) -> 
     Ok(Vec::new())
 }
 
-/// `table`'s rows, and a scan of them, if it's a small in-memory table: one
-/// DataFusion's own data source scans, as it does an in-memory table, whose
-/// statistics say it holds at most [`COPIED_BYTES`].
-async fn small_scan(
-    table: &Lean,
-    session: &dyn Session,
-) -> Result<Option<(usize, Arc<dyn ExecutionPlan>)>> {
+/// A scan of a small in-memory table, and its number of rows.
+struct SmallScan {
+    rows: usize,
+    scan: Arc<dyn ExecutionPlan>,
+}
+
+/// A scan of `table`, if it's a small in-memory table: one DataFusion's own
+/// data source scans, as it does an in-memory table, whose statistics say it
+/// holds at most [`COPIED_BYTES`].
+async fn small_scan(table: &Lean, session: &dyn Session) -> Result<Option<SmallScan>> {
     let scan = (table.table)
         .scan(&LeanSession::new(session), None, &[], None)
         .await?;
@@ -437,7 +446,7 @@ async fn small_scan(
         return Ok(None);
     };
     match scan.name() == "DataSourceExec" && bytes <= COPIED_BYTES {
-        true => Ok(Some((rows, scan))),
+        true => Ok(Some(SmallScan { rows, scan })),
         false => Ok(None),
     }
 }
@@ -454,12 +463,20 @@ async fn small_scan(
 /// runs. A scan given filters to evaluate keeps its own table, since the
 /// copy doesn't evaluate them.
 pub(crate) async fn localize(plan: LogicalPlan, session: &dyn Session) -> Result<LogicalPlan> {
-    // Each scan's table and name, unless the scan has filters.
-    let mut scans: Vec<(Arc<dyn TableSource>, TableReference)> = Vec::new();
+    /// A scan's table and name.
+    struct Scanned {
+        source: Arc<dyn TableSource>,
+        name: TableReference,
+    }
+    // Each scan's, unless the scan has filters.
+    let mut scans: Vec<Scanned> = Vec::new();
     plan.apply_with_subqueries(|node| {
         if let LogicalPlan::TableScan(scan) = node {
             if scan.filters.is_empty() {
-                scans.push((Arc::clone(&scan.source), scan.table_name.clone()));
+                scans.push(Scanned {
+                    source: Arc::clone(&scan.source),
+                    name: scan.table_name.clone(),
+                });
             }
         }
         Ok(TreeNodeRecursion::Continue)
@@ -468,15 +485,15 @@ pub(crate) async fn localize(plan: LogicalPlan, session: &dyn Session) -> Result
     let context = lean_task(&session.task_ctx());
     let mut copies: HashMap<Data, Arc<dyn TableSource>> = HashMap::new();
     let mut chosen: HashMap<usize, Arc<dyn TableSource>> = HashMap::new();
-    for (source, name) in scans {
+    for Scanned { source, name } in scans {
         if chosen.contains_key(&address(&source)) {
             continue;
         }
-        let provider = source_as_provider(&source)?;
+        let provider = default_table_source::source_as_provider(&source)?;
         let Some(lean) = provider.downcast_ref::<Lean>() else {
             continue;
         };
-        let Some((rows, scan)) = small_scan(lean, session).await? else {
+        let Some(SmallScan { rows, scan }) = small_scan(lean, session).await? else {
             continue;
         };
         // Read on this library's runtime, where the foreign scan's streams
@@ -507,7 +524,7 @@ pub(crate) async fn localize(plan: LogicalPlan, session: &dyn Session) -> Result
                 if let Some(constraints) = lean.constraints() {
                     table = table.with_constraints(constraints.clone());
                 }
-                let copy = provider_as_source(Arc::new(table));
+                let copy = default_table_source::provider_as_source(Arc::new(table));
                 copies.insert(data, Arc::clone(&copy));
                 copy
             }

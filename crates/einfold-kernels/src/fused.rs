@@ -541,7 +541,7 @@ fn tile(
                 let shape = (1, hi - lo);
                 let lanes = |_: usize, _: ColumnIndex| Lanes::Columns(scores.to_vec());
                 let weights = expression::evaluate(e, shape, &lanes);
-                weights.write(shape, scores, false);
+                weights.write(shape, scores, expression::Write::Replace);
                 z[r] += scores.iter().sum::<f64>();
                 continue;
             }

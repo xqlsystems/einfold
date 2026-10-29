@@ -47,6 +47,11 @@ einfold.plans_with_einfold()   # 1: einfold ran the matrix product
 
 Every query in that session is planned by einfold from then on. What it doesn't recognize runs as DataFusion would run it, planned with DataFusion's default physical planner and optimizer rules. A query planner or physical optimizer rule added to the session before einfold isn't applied.
 
+### Limits
+
+- **Very deep plans.** A session hands einfold each plan through DataFusion's FFI, which decodes it recursively on the thread that asks. On Linux, einfold raises the main thread's stack limit, so plans of about 2,000 joins work there. On another thread, or on macOS, a plan of a few hundred joins can overflow the thread's stack, and the process exits rather than raising an error.
+- **Functions named `sum` and `max`.** einfold replaces them with DataFusion's own, which it recognizes in plans. In a session with einfold, a function you register under either name isn't used.
+
 ## What it finds
 
 - **Sums of products over a join**, grouped by columns of either side: matrix products, contractions, weighted sums and regridding with a weight table. Also the same left-joined from a table, so that every row of the table gets its sum.

@@ -11,7 +11,6 @@ tables and plans by reference, and the planner across the FFI."""
 from __future__ import annotations
 
 import math
-import resource
 import subprocess
 import sys
 import textwrap
@@ -190,6 +189,7 @@ def _in_a_process(depth, thread_stack=None):
     `thread_stack` bytes, and returns the process, so that a crash fails the
     test rather than the test run. It prints whether the two answers agree."""
     script = textwrap.dedent(f"""
+        import sys
         import threading
         import pyarrow as pa
         from datafusion import SessionContext
@@ -206,6 +206,12 @@ def _in_a_process(depth, thread_stack=None):
                 answers.append(ctx.sql({_deep(depth)!r}).to_pydict())
             print(answers[0] == answers[1])
 
+        # A crash writes no core file, which would take most of the test's
+        # time.
+        if sys.platform == "linux":
+            import resource
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
         if {thread_stack!r} is None:
             run()
         else:
@@ -214,12 +220,10 @@ def _in_a_process(depth, thread_stack=None):
             thread.start()
             thread.join()
         """)
-    # A crash writes no core file, which would take most of the test's time.
-    no_core = lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
-                          preexec_fn=no_core)
+    return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="einfold deepens the stack on Linux only")
 def test_plans_deeper_than_the_default_stack():
     """DataFusion's FFI decodes each plan, on the thread that asks for it,
     with about 8 KB of stack per node. A chain of 350 joins needs more than

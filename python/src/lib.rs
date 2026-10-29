@@ -15,6 +15,12 @@
 //!   which finds folds and fold pipelines in each plan, as einfold does in
 //!   DataFusion, and plans them as `EinFoldExec`.
 //!
+//! A *fold* is a sum of products over a join, grouped by columns of its
+//! inputs, such as a matrix product: `SELECT a.i, b.k, SUM(a.v * b.v) FROM a
+//! JOIN b ON a.j = b.j GROUP BY a.i, b.k`. A *fold pipeline* is a fold whose
+//! results weight a second sum, such as attention's scores and its weighted
+//! average of the values, computed together tile by tile.
+//!
 //! The Python package exports [`EinFold`] as `einfold.datafusion.EinFold`.
 
 use std::ffi::CStr;
@@ -46,17 +52,19 @@ fn capsule<'py>(obj: &Bound<'py, PyAny>, getter: &str) -> PyResult<Bound<'py, Py
     Ok(obj.cast_into::<PyCapsule>()?)
 }
 
-/// The value of capsule `capsule`, named `name`.
+/// The value in capsule `capsule`, named `name`, borrowed for as long as the
+/// capsule is.
 ///
 /// # Safety
 ///
 /// The capsule must hold a `T`, as datafusion-python's capsules of that name
 /// do.
-unsafe fn capsule_value<T: Clone>(capsule: &Bound<'_, PyCapsule>, name: &CStr) -> PyResult<T> {
+unsafe fn capsule_value<'a, T>(capsule: &'a Bound<'_, PyCapsule>, name: &CStr) -> PyResult<&'a T> {
     let data: NonNull<T> = capsule.pointer_checked(Some(name))?.cast();
     // SAFETY: the caller guarantees that the capsule holds a `T`, and
-    // `pointer_checked` that it is the capsule of that name.
-    Ok(unsafe { data.as_ref() }.clone())
+    // `pointer_checked` that it is the capsule of that name. The capsule
+    // owns the value, and outlives the borrow.
+    Ok(unsafe { data.as_ref() })
 }
 
 /// Fails unless a foreign object was built against this DataFusion's FFI.
@@ -177,8 +185,9 @@ impl EinFold {
     ) -> PyResult<Bound<'py, PyAny>> {
         let provider = capsule(&ctx, "__datafusion_task_context_provider__")?;
         // SAFETY: capsules of this name hold an FFI_TaskContextProvider.
-        let provider: FFI_TaskContextProvider =
+        let provider: &FFI_TaskContextProvider =
             unsafe { capsule_value(&provider, c"datafusion_task_context_provider")? };
+        let provider = provider.clone();
         let runtime = Some(bridge::runtime());
         let logical = FFI_LogicalExtensionCodec::new(
             Arc::new(ByReference),
@@ -211,21 +220,34 @@ impl EinFold {
         // for them: see `stack`.
         stack::deepen();
         let planner = capsule(&fallback, "__datafusion_query_planner__")?;
+        // Each foreign struct's version is checked before it's cloned, since
+        // cloning calls the struct's own functions, which a struct of
+        // another FFI version may lay out elsewhere. Reading `version` where
+        // this FFI version puts it is the best check this side can make.
+        // SAFETY, for each `version` call: `version` is a plain function the
+        // FFI struct carries.
+        //
         // SAFETY: capsules of this name hold an FFI_QueryPlanner.
-        let session_planner: FFI_QueryPlanner =
+        let session_planner: &FFI_QueryPlanner =
             unsafe { capsule_value(&planner, c"datafusion_query_planner")? };
-        // SAFETY: `version` is a plain function the FFI struct carries.
         check_version("the session's query planner", unsafe {
             (session_planner.version)()
         })?;
         let logical = capsule(&ctx, "__datafusion_logical_extension_codec__")?;
         // SAFETY: capsules of this name hold an FFI_LogicalExtensionCodec.
-        let logical: FFI_LogicalExtensionCodec =
+        let logical: &FFI_LogicalExtensionCodec =
             unsafe { capsule_value(&logical, c"datafusion_logical_extension_codec")? };
+        check_version("the session's logical codec", unsafe {
+            (logical.version)()
+        })?;
         let physical = capsule(&ctx, "__datafusion_physical_extension_codec__")?;
         // SAFETY: capsules of this name hold an FFI_PhysicalExtensionCodec.
-        let physical: FFI_PhysicalExtensionCodec =
+        let physical: &FFI_PhysicalExtensionCodec =
             unsafe { capsule_value(&physical, c"datafusion_physical_extension_codec")? };
+        check_version("the session's physical codec", unsafe {
+            (physical.version)()
+        })?;
+        let (logical, physical) = (logical.clone(), physical.clone());
         let bridge = Bridge {
             counts: Arc::clone(&self.counts),
         };

@@ -7,6 +7,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt::{self, Formatter};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -22,8 +23,8 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::functions_aggregate::min_max::{max_udaf, Max};
-use datafusion::functions_aggregate::sum::{sum_udaf, Sum};
+use datafusion::functions_aggregate::min_max::{self, Max};
+use datafusion::functions_aggregate::sum::{self, Sum};
 use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::registry::ExtensionTypeRegistryRef;
 use datafusion::logical_expr::{
@@ -32,18 +33,20 @@ use datafusion::logical_expr::{
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     self, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
-use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
-use einfold_datafusion::{DetectFolds, EinFoldPlanner};
+use datafusion::physical_planner::DefaultPhysicalPlanner;
+use einfold_datafusion::{DetectFolds, EinFoldPlanner, FoldNode, PipelineNode};
 use futures::Stream;
+use tokio::runtime::{Handle, Runtime};
 
 /// The Tokio runtime einfold's operators run on. This library holds its own
 /// copy of Tokio, so the session's runtime isn't visible to it.
-pub(crate) fn runtime() -> tokio::runtime::Handle {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+pub(crate) fn runtime() -> Handle {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     let runtime = RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -57,49 +60,54 @@ pub(crate) fn runtime() -> tokio::runtime::Handle {
 /// aggregates detection matches by type.
 fn builtin(name: &str) -> Option<Arc<AggregateUDF>> {
     match name {
-        "sum" => Some(sum_udaf()),
-        "max" => Some(max_udaf()),
+        "sum" => Some(sum::sum_udaf()),
+        "max" => Some(min_max::max_udaf()),
         _ => None,
     }
 }
 
-/// Whether `f` is DataFusion's own aggregate, rather than a foreign one.
-fn is_builtin(f: &AggregateUDF) -> bool {
-    let inner: &dyn Any = f.inner().as_ref();
+/// Whether `function` is DataFusion's own aggregate, rather than a foreign
+/// one.
+fn is_builtin(function: &AggregateUDF) -> bool {
+    let inner: &dyn Any = function.inner().as_ref();
     inner.is::<Sum>() || inner.is::<Max>()
 }
 
 /// `plan` with every `SUM` and `MAX` that crossed the FFI as a foreign
 /// function, in aggregates and in windows, replaced by DataFusion's own, so
-/// that detection, which matches them by type, recognizes them. The
-/// session's functions of those names are DataFusion's built-in ones unless
-/// it registers others, which this would then replace.
+/// that detection, which matches them by type, recognizes them.
+///
+/// The session's functions of those names are DataFusion's built-in ones
+/// unless it registers others, which this would then replace. Through the
+/// FFI, a foreign aggregate carries only its name, its aliases and a
+/// generic signature, so a function registered as `sum` can't be told from
+/// DataFusion's.
 fn relink(plan: LogicalPlan) -> Result<LogicalPlan> {
     let relinked = plan.transform_up(|node| {
-        node.map_expressions(|e| {
-            e.transform(|e| match e {
-                Expr::AggregateFunction(mut f) if !is_builtin(&f.func) => {
-                    match builtin(f.func.name()) {
+        node.map_expressions(|expression| {
+            expression.transform(|expression| match expression {
+                Expr::AggregateFunction(mut aggregate) if !is_builtin(&aggregate.func) => {
+                    match builtin(aggregate.func.name()) {
                         Some(own) => {
-                            f.func = own;
-                            Ok(Transformed::yes(Expr::AggregateFunction(f)))
+                            aggregate.func = own;
+                            Ok(Transformed::yes(Expr::AggregateFunction(aggregate)))
                         }
-                        None => Ok(Transformed::no(Expr::AggregateFunction(f))),
+                        None => Ok(Transformed::no(Expr::AggregateFunction(aggregate))),
                     }
                 }
-                Expr::WindowFunction(mut w) => match &w.fun {
-                    WindowFunctionDefinition::AggregateUDF(f) if !is_builtin(f) => {
-                        match builtin(f.name()) {
+                Expr::WindowFunction(mut window) => match &window.fun {
+                    WindowFunctionDefinition::AggregateUDF(function) if !is_builtin(function) => {
+                        match builtin(function.name()) {
                             Some(own) => {
-                                w.fun = WindowFunctionDefinition::AggregateUDF(own);
-                                Ok(Transformed::yes(Expr::WindowFunction(w)))
+                                window.fun = WindowFunctionDefinition::AggregateUDF(own);
+                                Ok(Transformed::yes(Expr::WindowFunction(window)))
                             }
-                            None => Ok(Transformed::no(Expr::WindowFunction(w))),
+                            None => Ok(Transformed::no(Expr::WindowFunction(window))),
                         }
                     }
-                    _ => Ok(Transformed::no(Expr::WindowFunction(w))),
+                    _ => Ok(Transformed::no(Expr::WindowFunction(window))),
                 },
-                e => Ok(Transformed::no(e)),
+                other => Ok(Transformed::no(other)),
             })
         })
     })?;
@@ -116,18 +124,25 @@ pub(crate) struct Counts {
     pub(crate) with_pipelines: AtomicUsize,
 }
 
+/// How many of einfold's nodes a plan holds.
+#[derive(Default)]
+struct Nodes {
+    folds: usize,
+    pipelines: usize,
+}
+
 /// How many of einfold's fold nodes and pipeline nodes `plan` holds.
-fn einfold_nodes(plan: &LogicalPlan) -> Result<(usize, usize)> {
-    let (mut folds, mut pipelines) = (0, 0);
+fn einfold_nodes(plan: &LogicalPlan) -> Result<Nodes> {
+    let mut nodes = Nodes::default();
     plan.apply(|node| {
-        if let LogicalPlan::Extension(e) = node {
-            let any = e.node.as_any();
-            folds += usize::from(any.is::<einfold_datafusion::FoldNode>());
-            pipelines += usize::from(any.is::<einfold_datafusion::PipelineNode>());
+        if let LogicalPlan::Extension(extension) = node {
+            let any = extension.node.as_any();
+            nodes.folds += usize::from(any.is::<FoldNode>());
+            nodes.pipelines += usize::from(any.is::<PipelineNode>());
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
-    Ok((folds, pipelines))
+    Ok(nodes)
 }
 
 /// The session's planner, with einfold's detection in front of it. Every
@@ -145,13 +160,15 @@ impl QueryPlanner for Bridge {
         plan: &LogicalPlan,
         session: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::physical_planner::PhysicalPlanner;
+
         self.counts.plans.fetch_add(1, Ordering::Relaxed);
         let detected = DetectFolds::default().detect(relink(plan.clone())?)?;
-        let (folds, pipelines) = einfold_nodes(&detected)?;
-        if folds + pipelines > 0 {
+        let nodes = einfold_nodes(&detected)?;
+        if nodes.folds + nodes.pipelines > 0 {
             self.counts.with_einfold.fetch_add(1, Ordering::Relaxed);
         }
-        if pipelines > 0 {
+        if nodes.pipelines > 0 {
             self.counts.with_pipelines.fetch_add(1, Ordering::Relaxed);
         }
         let local = LocalRules {
@@ -162,7 +179,7 @@ impl QueryPlanner for Bridge {
         let planner =
             DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(EinFoldPlanner)]);
         let physical = planner.create_physical_plan(&detected, &local).await?;
-        Ok(Arc::new(Opaque(physical)))
+        Ok(Arc::new(Opaque { plan: physical }))
     }
 }
 
@@ -171,12 +188,14 @@ impl QueryPlanner for Bridge {
 /// [`crate::codec::ByReference`]). Its nodes stay in this library, and run
 /// on this library's runtime, entered whenever the session polls them.
 #[derive(Debug)]
-struct Opaque(Arc<dyn ExecutionPlan>);
+struct Opaque {
+    plan: Arc<dyn ExecutionPlan>,
+}
 
 impl DisplayAs for Opaque {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let inner = physical_plan::displayable(self.0.as_ref()).indent(false);
-        write!(f, "einfold:\n{inner}")
+    fn fmt_as(&self, _format: DisplayFormatType, formatter: &mut Formatter) -> fmt::Result {
+        let inner = physical_plan::displayable(self.plan.as_ref()).indent(false);
+        write!(formatter, "einfold:\n{inner}")
     }
 }
 
@@ -186,7 +205,7 @@ impl ExecutionPlan for Opaque {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        self.0.properties()
+        self.plan.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -210,8 +229,8 @@ impl ExecutionPlan for Opaque {
     /// The plan within, with its state reset: a session that runs a plan
     /// again, as a recursive query does, resets it first.
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
-        let reset = physical_plan::execution_plan::reset_plan_states(Arc::clone(&self.0))?;
-        Ok(Arc::new(Opaque(reset)))
+        let reset = physical_plan::execution_plan::reset_plan_states(Arc::clone(&self.plan))?;
+        Ok(Arc::new(Opaque { plan: reset }))
     }
 
     fn execute(
@@ -222,30 +241,30 @@ impl ExecutionPlan for Opaque {
         let handle = runtime();
         let inner = {
             let _entered = handle.enter();
-            self.0.execute(partition, context)?
+            self.plan.execute(partition, context)?
         };
         let schema = inner.schema();
         let stream = Entered { inner, handle };
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn metrics(&self) -> Option<physical_plan::metrics::MetricsSet> {
-        self.0.metrics()
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.plan.metrics()
     }
 }
 
 /// A stream polled inside this library's runtime.
 struct Entered {
     inner: SendableRecordBatchStream,
-    handle: tokio::runtime::Handle,
+    handle: Handle,
 }
 
 impl Stream for Entered {
     type Item = Result<RecordBatch>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let _entered = self.handle.enter();
-        self.inner.as_mut().poll_next(cx)
+        self.inner.as_mut().poll_next(context)
     }
 }
 

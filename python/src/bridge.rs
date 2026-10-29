@@ -213,7 +213,7 @@ impl QueryPlanner for Bridge {
 
 /// A planned plan, shown to the session as one node with no children, so
 /// that returning it through the FFI encodes nothing but a reference (see
-/// [`crate::codec::ByReference`]). Its nodes stay in this library, and run
+/// [`crate::by_reference::ByReference`]). Its nodes stay in this library, and run
 /// on this library's runtime, entered whenever the session polls them.
 #[derive(Debug)]
 struct Opaque {

@@ -94,8 +94,6 @@ mod check;
 mod data;
 #[path = "simulation/queries.rs"]
 mod queries;
-#[path = "simulation/rng.rs"]
-mod rng;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -106,8 +104,8 @@ use datafusion::arrow::array::{Array, ArrayRef, Float64Array, RecordBatch};
 use datafusion::prelude::SessionContext;
 
 use data::{KeyType, Rows, Table, Values};
+use einfold_testkit::Rng;
 use queries::{Options, Query, Shape};
-use rng::Rng;
 
 /// Bugs with an open issue, which the simulation steps around unless
 /// `EINFOLD_SIM_KNOWN` is set, so that they don't drown new findings. Each

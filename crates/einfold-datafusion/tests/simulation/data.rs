@@ -34,7 +34,7 @@ use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 
-use super::rng::Rng;
+use einfold_testkit::Rng;
 
 /// How a dimension's keys are stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

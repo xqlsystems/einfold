@@ -1350,6 +1350,7 @@ dependencies = [
  "datafusion",
  "einfold-ir",
  "einfold-kernels",
+ "einfold-testkit",
  "futures",
  "tokio",
 ]
@@ -1365,9 +1366,14 @@ dependencies = [
  "arrow",
  "datafusion",
  "einfold-ir",
+ "einfold-testkit",
  "ndarray",
  "tokio",
 ]
+
+[[package]]
+name = "einfold-testkit"
+version = "0.0.0"
 
 [[package]]
 name = "either"

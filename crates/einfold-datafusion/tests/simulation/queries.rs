@@ -27,7 +27,7 @@
 //! and compositions: two folds under `UNION ALL`, a fold of a fold's result,
 //! and `ORDER BY` with `LIMIT` above.
 
-use super::rng::Rng;
+use einfold_testkit::Rng;
 
 /// Which shape a query was built as, for the tallies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

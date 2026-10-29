@@ -61,31 +61,7 @@ use einfold_ir::{
     Operand, Output, RowValue,
 };
 use einfold_kernels::{Algorithm, Budget, DomainRows, FloatKeys, Folded, Host, Options, Relation};
-
-struct Rng(u64);
-
-impl Rng {
-    /// A generator for `seed`, scrambled by SplitMix64 so that nearby seeds
-    /// give unrelated streams, and never zero, which xorshift can't leave.
-    fn new(seed: u64) -> Self {
-        let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        Rng((z ^ (z >> 31)).max(1))
-    }
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-    fn chance(&mut self, p: f64) -> bool {
-        ((self.next() >> 11) as f64) / ((1u64 << 53) as f64) < p
-    }
-}
+use einfold_testkit::Rng;
 
 #[derive(Clone, Copy, Debug)]
 enum KeyType {
@@ -189,7 +165,7 @@ fn factor(rng: &mut Rng, specials: bool) -> Option<f64> {
         16..=18 => Some(-0.0),
         19..=25 => Some(if rng.chance(0.5) { 1e16 } else { -1e16 }),
         _ => {
-            let mantissa = (rng.next() >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+            let mantissa = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
             Some(mantissa * 10f64.powi(rng.below(7) as i32 - 3))
         }
     }
@@ -860,7 +836,7 @@ async fn fold_matches_sql() {
     let (mut unique_checked, mut unique_accepted) = (0, 0);
     for i in 0..cases {
         let seed = seed.wrapping_add(i);
-        let mut rng = Rng::new(seed);
+        let mut rng = Rng::seeded(seed, 0);
         // The family follows from the seed, so a seed alone reproduces a case.
         let dense = seed % 2 == 1;
         let large = match seed % 40 {

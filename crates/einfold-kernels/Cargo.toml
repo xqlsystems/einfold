@@ -24,6 +24,7 @@ ndarray = { version = "0.16", default-features = false, features = ["std"] }
 [dev-dependencies]
 # The property test checks the kernels against SQL that DataFusion runs.
 datafusion = { workspace = true }
+einfold-testkit = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

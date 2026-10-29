@@ -62,29 +62,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
 use datafusion::variable::{VarProvider, VarType};
 use einfold_datafusion::{DetectFolds, EinFoldExec, EinFoldQueryPlanner, FoldNode};
-
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        Rng((z ^ (z >> 31)).max(1))
-    }
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-    fn chance(&mut self, p: f64) -> bool {
-        ((self.next() >> 11) as f64) / ((1u64 << 53) as f64) < p
-    }
-}
+use einfold_testkit::Rng;
 
 /// How keys look: dense non-negative integers, integers the dense algorithm
 /// can't use, or text.
@@ -536,7 +514,7 @@ async fn sweep(default_seed: u64, joined_back: bool) -> Ran {
     let (mut joined_dense, mut joined_host) = (0, 0);
     for i in 0..cases {
         let seed = seed.wrapping_add(i);
-        let mut rng = Rng::new(seed);
+        let mut rng = Rng::seeded(seed, 0);
         let keys = [Keys::Dense, Keys::Dense, Keys::Wild, Keys::Text][rng.below(4)];
         // Dense keys are sometimes clean enough for the dense algorithm.
         let messy = !matches!(keys, Keys::Dense) || rng.chance(0.4);
@@ -953,7 +931,7 @@ fn host_plan_runs_where_there_is_no_tokio_runtime() {
     // polls the operator through DataFusion's FFI, where this library's Tokio
     // sees no runtime.
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let mut rng = Rng::new(7);
+    let mut rng = Rng::seeded(7, 0);
     let ours = einfold(4, true);
     table(&mut rng, &[&ours], "l", [4, 3], Keys::Text, false);
     table(&mut rng, &[&ours], "r", [3, 5], Keys::Text, false);
@@ -1161,7 +1139,7 @@ async fn einfold_runs_short_of_memory_only_where_the_host_does() {
     let (mut both_short, mut host_short, mut ours_short, mut fell_back) = (0, 0, 0, 0);
     for i in 0..cases {
         let seed = seed.wrapping_add(i);
-        let mut rng = Rng::new(seed);
+        let mut rng = Rng::seeded(seed, 0);
         let keys = [Keys::Dense, Keys::Dense, Keys::Wild, Keys::Text][rng.below(4)];
         let messy = !matches!(keys, Keys::Dense) || rng.chance(0.4);
         let rule = match rng.chance(0.5) {

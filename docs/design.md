@@ -595,7 +595,7 @@ The milestones are ordered by the value each delivers, and each is **gated**: it
    * row expressions (section 9.1) for producers that aren't einsums, so that demo 1's Gaussian-kernel control fuses by the same rules.
 
    The pipeline node is detected in demo 1's SQL, in both its window and `GROUP BY` spellings, extending M1's rule with masks and a factor that reads several joined tables (S28 found both in the demo's plans). **Gate:** demo 1's success criteria ([`demos.md`](demos.md)):
-   * peak memory beyond inputs and output independent of `N`;
+   * peak memory beyond inputs and output at most one dense copy of the inputs' values and a constant number of tiles per thread, so linear in `N`, never quadratic;
    * about half the key tiles skipped under the causal mask;
    * within section 8.6's bound, and exactly SQL's results on special values and masked rows;
    * the same bits across thread counts;

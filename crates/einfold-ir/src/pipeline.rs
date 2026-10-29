@@ -157,8 +157,10 @@ pub enum Normalizer {
 /// ```
 ///
 /// An output group exists when some producer group joins a row of the values
-/// operand. Its average skips a row whose weight or value is NULL, as `SUM`
-/// does.
+/// operand. NULLs behave as in that SQL: the weighted sum skips a row whose
+/// weight or value is NULL, as `SUM` does, while each [`Normalizer`] is the
+/// sum of weights it names, so it still counts the weight of a joined row
+/// whose value is NULL. Weights 1 and 1 of values 10 and NULL average to 5.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Pipeline {
     producer: Fold,

@@ -8,8 +8,10 @@
 //! integration can share it.
 
 pub mod fold;
+pub mod pipeline;
 
 pub use fold::{
-    Aggregate, ColumnIndex, Dimension, DimensionId, Domain, DomainKey, Finish, Fold, InvalidFold,
-    Key, KeyEquality, Monoid, Operand, Output, RowValue,
+    Aggregate, ColumnIndex, Comparison, Condition, Dimension, DimensionId, Domain, DomainKey,
+    Finish, Fold, InvalidFold, Key, KeyEquality, Monoid, Operand, Output, RowValue,
 };
+pub use pipeline::{Normalizer, Pipeline, Scale, Shift};

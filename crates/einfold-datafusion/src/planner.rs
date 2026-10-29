@@ -20,6 +20,7 @@ use einfold_kernels::DomainRows;
 use crate::detect_folds::DetectFolds;
 use crate::ein_fold_exec::EinFoldExec;
 use crate::fold_node::FoldNode;
+use crate::pipeline_node::PipelineNode;
 
 /// Plans a [`FoldNode`] as an [`EinFoldExec`]. Give it to DataFusion's
 /// physical planner with
@@ -39,6 +40,15 @@ impl ExtensionPlanner for EinFoldPlanner {
         session: &dyn Session,
         _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        if let Some(node) = node.as_any().downcast_ref::<PipelineNode>() {
+            let schema = Arc::new(node.schema().as_arrow().clone());
+            let pipeline = node.pipeline().clone();
+            let exec = EinFoldExec::for_pipeline(pipeline, physical_inputs.to_vec(), schema);
+            let fallback = planner
+                .create_physical_plan(node.fallback(), session)
+                .await?;
+            return Ok(Some(Arc::new(exec.with_fallback(fallback))));
+        }
         let Some(node) = node.as_any().downcast_ref::<FoldNode>() else {
             return Ok(None);
         };

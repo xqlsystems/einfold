@@ -370,7 +370,7 @@ fn exec_folds(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> (usiz
     let any: &dyn Any = plan.as_ref();
     if let Some(e) = any.downcast_ref::<EinFoldExec>() {
         all += 1;
-        domains += usize::from(e.fold().domain().is_some());
+        domains += usize::from(e.fold().is_some_and(|f| f.domain().is_some()));
     }
     for child in plan.children() {
         let (a, d) = exec_folds(child);

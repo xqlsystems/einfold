@@ -12,13 +12,21 @@
 //! [`DetectFolds`] finds such folds in DataFusion's optimized plans and
 //! replaces each with a [`FoldNode`]; [`EinFoldQueryPlanner`] applies it just
 //! before physical planning, and plans each node as [`EinFoldExec`], which
-//! runs `einfold_kernels`. [`install`] adds it to a session. This is the only einfold crate that depends on a query
-//! engine.
+//! runs `einfold_kernels`. A [`PipelineNode`] is a fold whose results another
+//! fold reads: a fold of scores, then a sum of values weighted by them. One
+//! is attention, the step of a transformer (the neural network behind
+//! language models) in which each token averages the others' values,
+//! weighted by a softmax of its scores against them. [`EinFoldExec`]
+//! computes a pipeline one tile at a time, a block of the scores' rows, so
+//! that it never holds all of the scores.
+//! [`install`] adds einfold to a session. This is the only einfold crate
+//! that depends on a query engine.
 
 mod detect_folds;
 mod ein_fold_exec;
 mod fold_node;
 mod join_back;
+mod pipeline_node;
 mod planner;
 
 use std::sync::Arc;
@@ -28,6 +36,7 @@ use datafusion::execution::SessionStateBuilder;
 pub use detect_folds::{DetectFolds, MOVABLE_FUNCTIONS};
 pub use ein_fold_exec::EinFoldExec;
 pub use fold_node::FoldNode;
+pub use pipeline_node::PipelineNode;
 pub use planner::{EinFoldPlanner, EinFoldQueryPlanner};
 
 /// `builder` with einfold installed: an [`EinFoldQueryPlanner`] that applies

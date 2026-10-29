@@ -5,6 +5,7 @@
 //! [`EinFoldExec`], the physical operator that computes a [`FoldNode`](crate::FoldNode).
 
 use std::fmt;
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
@@ -149,18 +150,17 @@ impl DisplayAs for EinFoldExec {
     }
 }
 
-/// Every batch of every partition of the host's plan `plan`, in partition
-/// order. Its operators spawn tasks on a Tokio runtime, so where none is
-/// current, as when a host in another library polls this operator through
-/// DataFusion's FFI, they run on one of this library's own, made when first
-/// needed.
-async fn run_host_plan(
-    plan: Arc<dyn ExecutionPlan>,
-    ctx: Arc<TaskContext>,
-) -> Result<Vec<Vec<RecordBatch>>> {
+/// `work`'s result. A plan's operators spawn tasks on a Tokio runtime, so
+/// where none is current, as when a host in another library polls this
+/// operator through DataFusion's FFI, `work` runs on one of this library's
+/// own, made when first needed. Dropping the future, as a cancelled query
+/// does, aborts that work.
+async fn on_a_runtime<T: Send + 'static>(
+    work: impl Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
     static RUNTIME: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
     if tokio::runtime::Handle::try_current().is_ok() {
-        return physical_plan::collect_partitioned(plan, ctx).await;
+        return work.await;
     }
     let runtime = RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -169,39 +169,40 @@ async fn run_host_plan(
             .ok()
     });
     let Some(runtime) = runtime else {
-        return internal_err!("EinFoldExec could not start a Tokio runtime for the host's plan");
+        return internal_err!("EinFoldExec could not start a Tokio runtime");
     };
-    runtime
-        .spawn(physical_plan::collect_partitioned(plan, ctx))
+    // Entered only to spawn: the task aborts when dropped.
+    let task = {
+        let _entered = runtime.enter();
+        SpawnedTask::spawn(work)
+    };
+    task.join()
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?
+}
+
+/// Every batch of every partition of the host's plan `plan`, in partition
+/// order, on a runtime (see [`on_a_runtime`]).
+async fn run_host_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    ctx: Arc<TaskContext>,
+) -> Result<Vec<Vec<RecordBatch>>> {
+    on_a_runtime(physical_plan::collect_partitioned(plan, ctx)).await
 }
 
 /// Every batch of every partition of `plan`, in partition order, each counted
 /// against `reservation`. The partitions are read concurrently, since an
 /// operator such as a hash repartition produces them together and would
-/// otherwise buffer all but one.
+/// otherwise buffer all but one. They run on a runtime (see
+/// [`on_a_runtime`]), since an input's operators may spawn tasks too.
 async fn collect(
     plan: Arc<dyn ExecutionPlan>,
     ctx: Arc<TaskContext>,
     reservation: &MemoryReservation,
 ) -> Result<Vec<RecordBatch>> {
-    let batches = match tokio::runtime::Handle::try_current() {
-        Ok(_) => physical_plan::collect_partitioned(plan, ctx)
-            .await?
-            .concat(),
-        // No runtime to spawn on: the partitions concurrently, as futures on
-        // this thread.
-        Err(_) => {
-            use futures::TryStreamExt;
-            let partitions = plan.properties().partitioning.partition_count();
-            let reads = (0..partitions).map(|p| {
-                let stream = plan.execute(p, Arc::clone(&ctx));
-                async move { stream?.try_collect::<Vec<_>>().await }
-            });
-            future::try_join_all(reads).await?.concat()
-        }
-    };
+    let batches = on_a_runtime(physical_plan::collect_partitioned(plan, ctx))
+        .await?
+        .concat();
     for b in &batches {
         reservation.try_grow(b.get_array_memory_size())?;
     }

@@ -34,7 +34,7 @@ pub struct Settings {
 
 /// A session on `threads` partitions with `settings`: plain DataFusion, or
 /// with einfold installed; with `fallback` false, every fold einfold finds
-/// runs through its own kernels, the hash algorithm included.
+/// runs through its own kernels, the discrimination algorithm included.
 pub fn session(
     threads: usize,
     einfold: Option<bool>,
@@ -72,8 +72,8 @@ pub fn session(
         None => builder,
         Some(fallback) => {
             let rule = match fallback {
-                true => DetectFolds::default(),
-                false => DetectFolds::without_fallback(),
+                true => DetectFolds::with_host_fallback(),
+                false => DetectFolds::default(),
             };
             builder.with_query_planner(Arc::new(EinFoldQueryPlanner::detecting(rule)))
         }
@@ -108,10 +108,7 @@ impl Ran {
             folds: shown.matches("EinFoldExec:").count(),
             domains: shown.matches("domain").count(),
             dense: shown.matches("dense_folds=1").count(),
-            // The hash algorithm, or the discrimination algorithm that
-            // replaces it: einfold's own route for any keys.
-            hash: shown.matches("hash_folds=1").count()
-                + shown.matches("discrimination_folds=1").count(),
+            discrimination: shown.matches("discrimination_folds=1").count(),
             host: shown.matches("host_plans=1").count(),
             other_aggregates: shown.matches("AggregateExec").count(),
         }
@@ -123,7 +120,7 @@ pub struct Routes {
     pub folds: usize,
     pub domains: usize,
     pub dense: usize,
-    pub hash: usize,
+    pub discrimination: usize,
     pub host: usize,
     /// Aggregates the host runs outside einfold.
     pub other_aggregates: usize,

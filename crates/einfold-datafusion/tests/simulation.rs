@@ -51,8 +51,8 @@
 //!   groups of the mask, of its negation and of its `IS NULL` case are,
 //!   between them, exactly the unmasked fold's, with the same values. An
 //!   exact check that needs no oracle.
-//! - **`[hash]`** a third session runs every fold detection finds through
-//!   einfold's own kernels (`DetectFolds::without_fallback`), so the hash
+//! - **`[kernels]`** a third session runs every fold detection finds through
+//!   einfold's own kernels (`DetectFolds::default`), so the discrimination
 //!   algorithm is checked on the plans detection finds, not only the dense
 //!   one and the host's.
 //!
@@ -367,7 +367,7 @@ impl Tally {
             1,
             usize::from(r.folds > 0),
             r.dense,
-            r.hash,
+            r.discrimination,
             r.host,
             r.domains,
         ]) {
@@ -385,10 +385,10 @@ impl Tally {
             "\n  memory pools: {} cases; out of memory in einfold only {}, in the host only {}",
             self.pooled, self.out_of_memory[0], self.out_of_memory[1]
         );
-        for (shape, [n, fired, dense, hash, host, domains]) in &self.by_shape {
+        for (shape, [n, fired, dense, discrimination, host, domains]) in &self.by_shape {
             let _ = write!(
                 s,
-                "\n  {shape}: {n} cases, fired in {fired}; dense {dense}, hash {hash}, \
+                "\n  {shape}: {n} cases, fired in {fired}; dense {dense}, discrimination {discrimination}, \
                  host {host}; folds with a domain {domains}"
             );
         }
@@ -679,33 +679,34 @@ async fn run_case(case: &Case) -> Outcome {
             }
         }
     }
-    // Every fold through einfold's kernels, the hash algorithm included.
+    // Every fold through einfold's kernels, the discrimination algorithm
+    // included.
     if case.fallback && r.folds > 0 && case.seed.is_multiple_of(3) {
-        let hash = check::session(
+        let kernels = check::session(
             case.threads[2],
             Some(false),
             case.batch_sizes[2],
             case.settings,
         );
-        register(&hash, &case.tables);
-        trace("einfold, hash");
-        let ran = check::run(&hash, sql).await;
+        register(&kernels, &case.tables);
+        trace("einfold, kernels");
+        let ran = check::run(&kernels, sql).await;
         match &ran.result {
             Err(e) if out_of_memory(e) => {}
             Err(e) => fail(
-                "hash",
+                "kernels",
                 format!("failed where the host succeeded: {e}"),
                 Some(&ran),
             ),
             Ok(b) if case.values == Values::Exact => {
                 let (g, w) = (check::exact(b), check::exact(want));
                 if g != w {
-                    fail("hash", diff(&g, &w), Some(&ran));
+                    fail("kernels", diff(&g, &w), Some(&ran));
                 }
             }
             Ok(b) => {
                 if let Err(e) = within_bound(case, b, want).await {
-                    fail("hash", e, Some(&ran));
+                    fail("kernels", e, Some(&ran));
                 }
             }
         }
@@ -878,7 +879,7 @@ fn check_coverage(tally: &Tally) {
         ("folds from a domain fired", fired(Shape::FromDomain) > 0),
         ("folds joined back fired", fired(Shape::JoinedBack) > 0),
         ("the dense algorithm ran", ran(2) > 0),
-        ("the hash algorithm ran", ran(3) > 0),
+        ("the discrimination algorithm ran", ran(3) > 0),
         ("the host's plan ran", ran(4) > 0),
         ("some cases were deterministic", tally.deterministic > 0),
         (

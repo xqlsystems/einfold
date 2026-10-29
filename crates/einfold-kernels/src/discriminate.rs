@@ -154,44 +154,55 @@ fn radix(words: &[u64], threads: usize) -> Vec<(u64, u32)> {
     pairs
 }
 
-/// Sorts `index` by `keys.get(i)[depth..]`, most significant byte first: a
-/// counting pass per byte, recursing into each bucket. A key that ends sorts
-/// before one that continues, and equal keys keep their order.
-fn by_bytes(keys: &Keys, index: &mut [u32], depth: usize, scratch: &mut Vec<u32>) {
-    let rest = |i: u32| keys.get(i as usize).get(depth..).unwrap_or(&[]);
-    if index.len() <= SMALL {
-        index.sort_by(|&a, &b| rest(a).cmp(rest(b)));
-        return;
-    }
-    // Bucket 0 holds keys that end here, bucket 1 + b those whose byte is b.
-    let bucket = |i: u32| {
-        keys.get(i as usize)
-            .get(depth)
-            .map_or(0, |&b| usize::from(b) + 1)
-    };
-    let mut start = [0usize; 258];
-    for &i in index.iter() {
-        start[bucket(i) + 1] += 1;
-    }
-    if start[1] == 0 && start.iter().filter(|&&c| c > 0).count() == 1 {
-        // Every key has the same byte here.
-        return by_bytes(keys, index, depth + 1, scratch);
-    }
-    for b in 1..258 {
-        start[b] += start[b - 1];
-    }
-    let mut at = start;
-    scratch.clear();
-    scratch.resize(index.len(), 0);
-    for &i in index.iter() {
-        let b = bucket(i);
-        scratch[at[b]] = i;
-        at[b] += 1;
-    }
-    index.copy_from_slice(scratch);
-    for b in 1..257 {
-        if start[b + 1] - start[b] > 1 {
-            by_bytes(keys, &mut index[start[b]..start[b + 1]], depth + 1, scratch);
+/// Sorts `index` by `keys.get(i)`, most significant byte first: a counting
+/// pass per byte, then each bucket the same way at the next byte. A key that
+/// ends sorts before one that continues, and equal keys keep their order.
+///
+/// The buckets still to sort are a list on the heap rather than calls on the
+/// stack: keys can share a prefix thousands of bytes long, as URLs or paths
+/// do, and a call per byte would overflow a thread's stack.
+fn by_bytes(keys: &Keys, index: &mut [u32], scratch: &mut Vec<u32>) {
+    // Each range of `index` to sort, and the byte it is sorted by.
+    let mut work = vec![(0, index.len(), 0usize)];
+    while let Some((lo, hi, depth)) = work.pop() {
+        let index = &mut index[lo..hi];
+        let rest = |i: u32| keys.get(i as usize).get(depth..).unwrap_or(&[]);
+        if index.len() <= SMALL {
+            index.sort_by(|&a, &b| rest(a).cmp(rest(b)));
+            continue;
+        }
+        // Bucket 0 holds keys that end here, bucket 1 + b those whose byte
+        // is b.
+        let bucket = |i: u32| {
+            keys.get(i as usize)
+                .get(depth)
+                .map_or(0, |&b| usize::from(b) + 1)
+        };
+        let mut start = [0usize; 258];
+        for &i in index.iter() {
+            start[bucket(i) + 1] += 1;
+        }
+        if start[1] == 0 && start.iter().filter(|&&c| c > 0).count() == 1 {
+            // Every key has the same byte here.
+            work.push((lo, hi, depth + 1));
+            continue;
+        }
+        for b in 1..258 {
+            start[b] += start[b - 1];
+        }
+        let mut at = start;
+        scratch.clear();
+        scratch.resize(index.len(), 0);
+        for &i in index.iter() {
+            let b = bucket(i);
+            scratch[at[b]] = i;
+            at[b] += 1;
+        }
+        index.copy_from_slice(scratch);
+        for b in 1..257 {
+            if start[b + 1] - start[b] > 1 {
+                work.push((lo + start[b], lo + start[b + 1], depth + 1));
+            }
         }
     }
 }
@@ -207,7 +218,7 @@ fn ranks(keys: &Keys, n: usize, threads: usize) -> Ranks {
         Some(words) => return ranks_of_words(&words, threads),
         None => {
             let mut index: Vec<u32> = (0..n as u32).collect();
-            by_bytes(keys, &mut index, 0, &mut Vec::new());
+            by_bytes(keys, &mut index, &mut Vec::new());
             let mut previous: Option<&[u8]> = None;
             for &i in &index {
                 let key = keys.get(i as usize);
@@ -363,10 +374,14 @@ pub(crate) fn fold(
     host: Host,
     threads: usize,
 ) -> Result<Vec<RecordBatch>> {
+    // Rows are ranked as u32s: the operands' together, and each operand's
+    // with the domain's.
     let (na, nb) = (a.num_rows(), b.num_rows());
-    if u32::try_from(na.max(nb)).is_err() {
+    let nd: usize = domain.map_or(0, |d| d.iter().map(RecordBatch::num_rows).sum());
+    let ranked = (na.saturating_add(nb)).max(na.max(nb).saturating_add(nd));
+    if u32::try_from(ranked).is_err() {
         return Err(ArrowError::ComputeError(
-            "EinFold's discrimination algorithm takes at most 2³² - 1 rows per operand".into(),
+            "EinFold's discrimination algorithm ranks at most 2³² - 1 rows together".into(),
         ));
     }
     let ops = fold.operands();
@@ -432,7 +447,6 @@ pub(crate) fn fold(
             .collect();
         concat(&per_batch)
     };
-    let nd: usize = domain.map_or(0, |d| d.iter().map(RecordBatch::num_rows).sum());
     let with_domain = |own: &[ArrayRef], outs: &[usize], n: usize| -> Result<Ranks> {
         match nd {
             0 => rank_columns(own, n, threads),
@@ -592,4 +606,38 @@ pub(crate) fn fold(
         out.push(RecordBatch::try_new(Arc::clone(&schema), columns)?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, StringArray};
+
+    use super::*;
+
+    /// Keys sharing a prefix 100,000 bytes long sort on a thread with a
+    /// 256 KB stack, which a call per byte would overflow, and sort as their
+    /// bytes do.
+    #[test]
+    fn sorts_keys_with_long_shared_prefixes_in_a_small_stack() {
+        let prefix = "p".repeat(100_000);
+        let strings: Vec<String> = (0..200).rev().map(|i| format!("{prefix}{i:03}")).collect();
+        let column: ArrayRef = Arc::new(StringArray::from(strings.clone()));
+        let keys = Keys::new(&[column]).unwrap();
+        let sorted = thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(move || {
+                let mut index: Vec<u32> = (0..200).collect();
+                by_bytes(&keys, &mut index, &mut Vec::new());
+                index
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        let got: Vec<&String> = sorted.iter().map(|&i| &strings[i as usize]).collect();
+        let mut want: Vec<&String> = strings.iter().collect();
+        want.sort();
+        assert_eq!(got, want);
+    }
 }

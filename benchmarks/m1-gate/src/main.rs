@@ -137,6 +137,29 @@ struct Measured {
     w: Vec<f64>,
 }
 
+/// The best of several measurements of one configuration: its fastest whole
+/// program, and each step at its fastest.
+fn best(mut runs: Vec<Measured>) -> Measured {
+    let steps: Vec<(String, f64)> = (0..runs[0].steps.len())
+        .map(|i| {
+            let ms = runs.iter().map(|r| r.steps[i].1).fold(f64::MAX, f64::min);
+            (runs[0].steps[i].0.clone(), ms)
+        })
+        .collect();
+    runs.sort_by(|a, b| a.run.total_cmp(&b.run));
+    let mut fastest = runs.swap_remove(0);
+    fastest.steps = steps;
+    fastest
+}
+
+/// Rounds of einfold off and on, alternating which goes first, so that
+/// neither always runs on a warmer or cooler machine.
+const ROUNDS: usize = 4;
+
+/// The speedup M1's gate asks for, at [`GATE_N`] rows of `a`.
+const GATE: f64 = 4.0;
+const GATE_N: usize = 50_000;
+
 /// ddx's `matmul` tables and gradient program, run and timed on `ctx`.
 async fn measure(ctx: SessionContext, n: usize) -> Measured {
     let (d, h) = (16, 8);
@@ -224,15 +247,30 @@ async fn main() {
         std::thread::available_parallelism().unwrap(),
         datafusion::DATAFUSION_VERSION
     );
+    let einfold = |config: SessionConfig| {
+        let builder = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(config);
+        SessionContext::new_with_state(einfold_datafusion::install(builder).build())
+    };
+    let mut failed = false;
     for n in sizes {
-        let off = measure(SessionContext::new(), n).await;
-        let einfold = |config: SessionConfig| {
-            let builder = SessionStateBuilder::new()
-                .with_default_features()
-                .with_config(config);
-            SessionContext::new_with_state(einfold_datafusion::install(builder).build())
-        };
-        let on = measure(einfold(SessionConfig::new()), n).await;
+        let (mut offs, mut ons, mut rounds) = (Vec::new(), Vec::new(), Vec::new());
+        for round in 0..ROUNDS {
+            let off_first = round % 2 == 0;
+            for on in [!off_first, off_first] {
+                match on {
+                    false => offs.push(measure(SessionContext::new(), n).await),
+                    true => ons.push(measure(einfold(SessionConfig::new()), n).await),
+                }
+            }
+            let (off, on) = (offs[round].run, ons[round].run);
+            rounds.push(match off_first {
+                true => format!("off {off:.1}, then on {on:.1}"),
+                false => format!("on {on:.1}, then off {off:.1}"),
+            });
+        }
+        let (off, on) = (best(offs), best(ons));
         let one_thread = measure(einfold(SessionConfig::new().with_target_partitions(1)), n).await;
         // The same gradients, within their bounds.
         let bound = bounds(&on.a, &on.w, (n, 16, 8));
@@ -275,12 +313,22 @@ async fn main() {
         for ((name, a), (_, b)) in off.1.iter().zip(&on.1) {
             println!("| `{name}` | {a:.1} | {b:.1} |");
         }
+        let speedup = off.0 / on.0;
         println!(
-            "| **whole program** | **{:.1}** | **{:.1}** |\n\nSpeedup: {:.1}×. Gradients agree within their bounds, \
+            "| **whole program** | **{:.1}** | **{:.1}** |\n\nSpeedup: {speedup:.2}×. Gradients agree within their bounds, \
              and einfold's are the same bits on one thread.",
-            off.0,
-            on.0,
-            off.0 / on.0
+            off.0, on.0,
         );
+        println!("\nRounds, each the best of 5 runs, in ms:");
+        for (i, r) in rounds.iter().enumerate() {
+            println!("{}. {r}", i + 1);
+        }
+        if n == GATE_N && speedup < GATE {
+            println!("\n**Below M1's gate of {GATE}× at n = {GATE_N}.**");
+            failed = true;
+        }
+    }
+    if failed {
+        std::process::exit(1);
     }
 }

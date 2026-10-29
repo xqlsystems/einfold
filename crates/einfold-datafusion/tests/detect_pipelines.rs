@@ -10,7 +10,7 @@
 //! Each case draws tables `q(t, d, x)`, `k(t, d, x)` and `v(t, c, x)`,
 //! complete or with a row missing, and a query:
 //!
-//! - **demo 1's causal attention**, the maximum as a window (`MAX(s) OVER
+//! - **causal attention**, the maximum as a window (`MAX(s) OVER
 //!   (PARTITION BY i)`) or as `MAX(s) … GROUP BY i` joined back, the scores
 //!   divided or multiplied by a constant or neither, with the causal mask
 //!   either way round or none, normalized by `norm.z`, either the sum or,

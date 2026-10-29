@@ -4,7 +4,7 @@
 
 //! The fourth shape [`DetectFolds`](crate::DetectFolds) finds: a fold
 //! pipeline, a softmax-weighted average of a fold's results (see
-//! [`einfold_ir::pipeline`]). Causal attention, as demo 1 writes it, is one:
+//! [`einfold_ir::pipeline`]). Causal attention, written in SQL, is one:
 //!
 //! ```sql
 //! WITH scores AS (SELECT q.t AS i, k.t AS j, SUM(q.x * k.x) / 8.0 AS s

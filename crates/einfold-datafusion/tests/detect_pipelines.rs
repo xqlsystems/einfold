@@ -22,6 +22,11 @@
 //!   it, each term (`SUM(w / norm.z * v.x)`);
 //! - **a weighted average over joined rows**, `SUM(exp(s) * v.x) / SUM(exp(s))`
 //!   with no shift, as a recommender or kernel smoother writes it;
+//! - **kernel smoothers**, the same average with weights of a distance
+//!   between points (`exp(-power(q.x - k.x, 2) / 0.5)` or `exp(-abs(q.x -
+//!   k.x) * 2)`), over a `CROSS JOIN` of one coordinate per point with
+//!   nothing to sum, or `exp(SUM(-power(q.x - k.x, 2)))` over every
+//!   coordinate `d`, the Nadaraya–Watson estimator's shape;
 //! - **look-alikes** it must leave alone: a maximum partitioned by the summed
 //!   key or ordered, a normalizer of an expression of the weights
 //!   (`exp(2 * w)`), and a normalizer of weights over other scores (the same
@@ -120,7 +125,29 @@ fn query(rng: &mut Rng) -> (String, Expect) {
              GROUP BY weights.i, v.c"
         )
     };
-    match rng.below(10) {
+    // Kernel smoothers: weights of a distance between points rather than of
+    // a dot product. Over a `CROSS JOIN` of one coordinate per point, with
+    // nothing to sum; or summing the squared distance over every coordinate
+    // `d`.
+    let kernel = |weights: &str| {
+        format!(
+            "WITH weights AS ({weights}) \
+             SELECT weights.i AS t, v.c, SUM(weights.w * v.x) / SUM(weights.w) AS x \
+             FROM weights JOIN v ON weights.j = v.t GROUP BY weights.i, v.c"
+        )
+    };
+    let distance = ["-power(q.x - k.x, 2.0) / 0.5", "-abs(q.x - k.x) * 2.0"][rng.below(2)];
+    let cross = format!(
+        "SELECT q.t AS i, k.t AS j, exp({distance}) AS w \
+         FROM q CROSS JOIN k WHERE q.d = 0 AND k.d = 0{mask}"
+    );
+    let long = format!(
+        "SELECT i, j, exp(s) AS w FROM (SELECT q.t AS i, k.t AS j, \
+         SUM(-power(q.x - k.x, 2.0)) AS s FROM q JOIN k ON q.d = k.d{mask} GROUP BY q.t, k.t)"
+    );
+    match rng.below(13) {
+        10 | 11 => (kernel(&cross), Expect::Pipeline),
+        12 => (kernel(&long), Expect::Pipeline),
         8 => (inside(window), Expect::Pipeline),
         9 => (inside(group_by), Expect::Pipeline),
         0 | 1 => (average(window, norm), Expect::Pipeline),
@@ -140,10 +167,32 @@ fn query(rng: &mut Rng) -> (String, Expect) {
             ][rng.below(2)];
             (average(wrong, norm), Expect::Decline)
         }
-        6 => {
-            let other = "SELECT i, SUM(exp(2.0 * w)) AS z FROM weights GROUP BY i";
-            (average(window, other), Expect::Decline)
-        }
+        6 => match rng.chance(0.5) {
+            true => {
+                let other = "SELECT i, SUM(exp(2.0 * w)) AS z FROM weights GROUP BY i";
+                (average(window, other), Expect::Decline)
+            }
+            // A key named `s`, beside the weights merged with their scores.
+            false if rng.chance(0.5) => (
+                format!(
+                    "WITH {scores}, weights AS (SELECT i AS s, j, exp(s) AS w FROM scores) \
+                     SELECT weights.s AS t, v.c, SUM(weights.w * v.x) / SUM(weights.w) AS x \
+                     FROM weights JOIN v ON weights.j = v.t GROUP BY weights.s, v.c"
+                ),
+                Expect::Pipeline,
+            ),
+            // The scores and their weights side by side, the scores summed
+            // with the values: DataFusion merges the projections, and the
+            // raw score is no weight.
+            false => (
+                format!(
+                    "WITH {scores}, weights AS (SELECT i, j, s, exp(s) AS w FROM scores) \
+                     SELECT weights.i AS t, v.c, SUM(weights.s * v.x) / SUM(weights.w) AS x \
+                     FROM weights JOIN v ON weights.j = v.t GROUP BY weights.i, v.c"
+                ),
+                Expect::Decline,
+            ),
+        },
         _ => {
             // The normalizer sums weights of other scores: the same fold,
             // scaled differently, so the shift doesn't cancel.
@@ -378,5 +427,80 @@ async fn einfold_finds_pipelines_and_changes_no_answer() {
     }
     if cases >= 50 {
         assert!(found > 0 && fused > 0, "found {found}, fused {fused}");
+    }
+}
+
+/// The Nadaraya–Watson estimator, a kernel smoother used in regridding, as
+/// written for points in two coordinates `x` and `y`: a Gaussian kernel of
+/// the distance between each target and each source point, averaging the
+/// sources' `v`. It is
+/// found as a pipeline, fused, and gives DataFusion's averages.
+#[tokio::test]
+async fn the_nadaraya_watson_control_fuses() {
+    let sql = "WITH kernel AS ( \
+                 SELECT t.p, s.q, exp(-(power(t.x - s.x, 2) + power(t.y - s.y, 2)) / 0.25) AS w \
+                 FROM target t CROSS JOIN source s) \
+               SELECT k.p, SUM(k.w * s.v) / SUM(k.w) AS v \
+               FROM kernel k JOIN source s ON k.q = s.q GROUP BY k.p";
+    let host = SessionContext::new();
+    let builder = SessionStateBuilder::new().with_default_features();
+    let ours = SessionContext::new_with_state(einfold_datafusion::install(builder).build());
+    let mut rng = Rng::new(97);
+    let mut unit = |n: usize| -> Vec<f64> {
+        (0..n)
+            .map(|_| ((rng.next() >> 11) as f64) / ((1u64 << 53) as f64))
+            .collect()
+    };
+    let (targets, sources) = (64, 256);
+    let (tx, ty) = (unit(targets), unit(targets));
+    let (sx, sy, sv) = (unit(sources), unit(sources), unit(sources));
+    let table = |key: &str, n: usize, values: Vec<(&str, &Vec<f64>)>| {
+        let mut fields = vec![Field::new(key, DataType::Int64, false)];
+        let mut columns: Vec<Arc<dyn Array>> =
+            vec![Arc::new(Int64Array::from_iter_values(0..n as i64))];
+        for (name, v) in values {
+            fields.push(Field::new(name, DataType::Float64, true));
+            columns.push(Arc::new(Float64Array::from(v.clone())));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+    };
+    for ctx in [&host, &ours] {
+        let target = table("p", targets, vec![("x", &tx), ("y", &ty)]);
+        let source = table("q", sources, vec![("x", &sx), ("y", &sy), ("v", &sv)]);
+        ctx.register_table("target", target).unwrap();
+        ctx.register_table("source", source).unwrap();
+    }
+    let frame = ours.sql(sql).await.unwrap();
+    let task = Arc::new(frame.task_ctx());
+    let plan = frame.create_physical_plan().await.unwrap();
+    let batches = datafusion::physical_plan::collect(Arc::clone(&plan), task)
+        .await
+        .unwrap();
+    let shown = DisplayableExecutionPlan::with_metrics(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(
+        shown.contains("softmax(") && shown.contains("fused_pipelines=1"),
+        "not fused:\n{shown}"
+    );
+    let averages = |batches: &[RecordBatch]| -> Vec<(i64, f64)> {
+        let mut out = Vec::new();
+        for b in batches {
+            let p = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let v = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+            out.extend((0..b.num_rows()).map(|r| (p.value(r), v.value(r))));
+        }
+        out.sort_by_key(|r| r.0);
+        out
+    };
+    let (got, want) = (
+        averages(&batches),
+        averages(&host.sql(sql).await.unwrap().collect().await.unwrap()),
+    );
+    assert_eq!(got.len(), targets);
+    for ((p, x), (q, y)) in got.iter().zip(&want) {
+        assert!(p == q && (x - y).abs() <= 1e-12, "{p}: {x}, DataFusion {y}");
     }
 }

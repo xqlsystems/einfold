@@ -32,8 +32,9 @@
 //!   values relation on the summed key. It is divided by `norm.z`, a
 //!   `SUM(w) … GROUP BY i` of the same weights joined on `i`: either the sum
 //!   (`SUM(w * v.x) / norm.z`, with `norm.z` grouped by too), or each term
-//!   (`SUM(w / norm.z * v.x)`, the spelling ddx can differentiate, since it
-//!   groups by no key that depends on a differentiated column). Or it is
+//!   (`SUM(w / norm.z * v.x)`, the spelling that ddx, an XQL Systems project
+//!   for automatic differentiation of SQL queries, can differentiate, since
+//!   it groups by no key that depends on a differentiated column). Or it is
 //!   divided by a second aggregate of the same `GROUP BY`, `SUM(w)`.
 //!
 //! Every copy of the scores and weights must be the same fold with the same

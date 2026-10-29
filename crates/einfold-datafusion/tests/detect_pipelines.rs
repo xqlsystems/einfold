@@ -14,7 +14,8 @@
 //!   (PARTITION BY i)`) or as `MAX(s) … GROUP BY i` joined back, the scores
 //!   divided or multiplied by a constant or neither, with the causal mask
 //!   either way round or none, normalized by `norm.z`, either the sum or,
-//!   as ddx writes it, each term (`SUM(w / norm.z * v.x)`);
+//!   as ddx (an XQL Systems project for automatic differentiation of SQL
+//!   queries) writes it, each term (`SUM(w / norm.z * v.x)`);
 //! - **a weighted average over joined rows**, `SUM(exp(s) * v.x) / SUM(exp(s))`
 //!   with no shift, as a recommender or kernel smoother writes it;
 //! - **look-alikes** it must leave alone: a maximum partitioned by the summed

@@ -9,7 +9,7 @@ The peak is the process's peak resident memory while the query runs, above
 what it held once its tables were loaded: Linux's VmHWM, reset just before
 the query.
 
-Usage, with einfold and datafusion-python installed:
+Usage, with einfold, datafusion-python, NumPy and PyArrow installed:
 
     python memory.py                      # every case
     python memory.py contraction-256      # one case

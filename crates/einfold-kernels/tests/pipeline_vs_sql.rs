@@ -24,8 +24,8 @@
 //! invariants:
 //!
 //! 1. **Runs when it can, and declines when it can't.** With every table
-//!    complete, and a producer that reads both of its operands, the
-//!    algorithm runs. When a table misses a row, repeats one,
+//!    complete, a producer that reads both of its operands, and no special
+//!    values, the algorithm runs; with special values it may decline. When a table misses a row, repeats one,
 //!    or holds a NULL factor, it either returns `None`, so that the caller
 //!    runs the host's plan, or (when the gap only shrinks a dimension's
 //!    range) gives SQL's result, as below.
@@ -246,7 +246,8 @@ fn case(rng: &mut Rng) -> Case {
     // ones after. Rows are (t, d) in order, so row t·nd + d is (t, d).
     let at = |t: usize, d: usize| t * nd + d;
     let target = rng.below(nq);
-    match rng.below(6) {
+    let extremes = rng.below(6);
+    match extremes {
         0 => {
             q.rows[at(target, 0)].1 = Some(f64::NEG_INFINITY);
             for j in 0..nk {
@@ -487,7 +488,9 @@ fn case(rng: &mut Rng) -> Case {
         v,
         pipeline,
         sql,
-        complete: complete && reads_both,
+        // Special values, or the extreme scores above, may make it decline
+        // too: sums that overflow, or expression weights that aren't finite.
+        complete: complete && reads_both && !specials && extremes > 1,
         v_scale,
         magnitudes,
     }
@@ -843,4 +846,96 @@ fn gives_no_rows_without_queries_or_keys() {
     let piped = einfold_kernels::pipeline(&pipeline, inputs, schema, Options::default()).unwrap();
     // Declining is right too: the caller's SQL then gives no rows.
     assert!(piped.is_none_or(|p| rows(&p.batches).is_empty()));
+}
+
+/// A row's sums overflow in its first tile of keys, then a larger score in
+/// a later tile shifts every weight before it to 0. SQL weighs each term by
+/// the final maximum, `exp(0 - 800) · 1e308 = 0`, so the average is 0; the
+/// fused algorithm's running sums would rescale infinity to NaN. It
+/// declines instead, normalized or not, so that the caller's SQL runs.
+#[test]
+fn declines_where_a_rescale_meets_an_overflowed_sum() {
+    for normalizer in [Normalizer::KeptGroups, Normalizer::None] {
+        let q = Table::complete(&["t", "d"], &[1, 1], || 1.0);
+        let mut i = 0;
+        let k = Table::complete(&["t", "d"], &[65, 1], || {
+            i += 1;
+            if i == 65 {
+                800.0
+            } else {
+                0.0
+            }
+        });
+        let mut i = 0;
+        let v = Table::complete(&["t"], &[65], || {
+            i += 1;
+            if i == 65 {
+                0.0
+            } else {
+                1e308
+            }
+        });
+        const EQ: Dimension = Dimension {
+            equality: KeyEquality::Equal,
+        };
+        let key = |d, c| Key::new(DimensionId(d), ColumnIndex(c));
+        let out = |d| Output {
+            dimension: DimensionId(d),
+            domain_key: None,
+        };
+        let ops = vec![
+            Operand {
+                keys: vec![key(0, 0), key(1, 1)],
+                factor: Some(ColumnIndex(2)),
+            },
+            Operand {
+                keys: vec![key(2, 0), key(1, 1)],
+                factor: Some(ColumnIndex(2)),
+            },
+        ];
+        let producer = Fold::try_new(
+            vec![EQ; 3],
+            ops,
+            vec![out(0), out(2)],
+            RowValue::Product,
+            Aggregate::sum(),
+            None,
+        )
+        .unwrap();
+        let values = Operand {
+            keys: vec![key(2, 0)],
+            factor: Some(ColumnIndex(1)),
+        };
+        let pipeline = Pipeline::try_new(
+            producer,
+            Weight::Exp {
+                scale: Scale::One,
+                shift: Shift::KeptMaximum,
+            },
+            vec![],
+            values,
+            vec![DimensionId(0)],
+            normalizer,
+        )
+        .unwrap();
+        let batches = |t: &Table| t.partitions(&mut Rng::new(1)).concat();
+        let (bq, bk, bv) = (batches(&q), batches(&k), batches(&v));
+        let schemas = [q.schema.as_ref(), k.schema.as_ref(), v.schema.as_ref()];
+        let schema = einfold_kernels::pipeline_schema(&pipeline, &schemas).unwrap();
+        let inputs = [
+            Relation::new(&q.schema, &bq),
+            Relation::new(&k.schema, &bk),
+            Relation::new(&v.schema, &bv),
+        ];
+        let piped =
+            einfold_kernels::pipeline(&pipeline, inputs, schema, Options::default()).unwrap();
+        // Declining is right; so would be SQL's 0.
+        if let Some(p) = piped {
+            let rows = rows(&p.batches);
+            assert!(
+                rows.iter().all(|(_, x)| *x == Some(0.0)),
+                "{normalizer:?}: {rows:?}"
+            );
+        }
+    }
 }

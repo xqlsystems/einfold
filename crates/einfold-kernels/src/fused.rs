@@ -343,10 +343,24 @@ pub(crate) fn pipeline(
         let clamp = |p: i128| usize::try_from(p.clamp(0, n)).expect("clamped to the extent");
         (clamp(lo), clamp(hi.max(lo)))
     };
+    // Whether each J position's values are all finite: sums of finite terms
+    // that reach infinity overflowed, which sums of an infinite value don't.
+    let finite: Vec<bool> = (0..nj)
+        .map(|j| v[j * ny..(j + 1) * ny].iter().all(|x| x.is_finite()))
+        .collect();
     let (x_tiles, j_tiles) = (nx.div_ceil(XT), nj.div_ceil(JT));
     let tiles = dense::par_tasks(x_tiles, threads, |t| {
-        tile(pipeline, t, (nx, ne, nj, ny), (&scores, v), &allowed)
+        tile(
+            pipeline,
+            t,
+            (nx, ne, nj, ny),
+            (&scores, v, &finite),
+            &allowed,
+        )
     });
+    if tiles.iter().any(|t| t.overflowed) {
+        return Ok(None);
+    }
     let tiles_visited = tiles.iter().map(|t| t.visited).sum();
 
     // The rows: every y for each x with an allowed J position, in position
@@ -448,6 +462,14 @@ fn place(
 struct Tile {
     out: Vec<f64>,
     visited: usize,
+    /// Whether a row's sums of finite terms overflowed to infinity before a
+    /// larger score rescaled them. SQL weighs each term by the final maximum,
+    /// so its result can be finite where rescaling infinity gives infinity
+    /// or NaN (infinity times `exp(-800)`, which is 0): the algorithm
+    /// declines. A sum that's infinite because a value is, is SQL's too.
+    /// Also set where weights of an expression, rather than a softmax's,
+    /// meet a weight or value that isn't finite.
+    overflowed: bool,
 }
 
 /// X tile `t` of `pipeline`, from its `scores` and `v [j][y]`, with
@@ -456,7 +478,7 @@ fn tile(
     pipeline: &Pipeline,
     t: usize,
     (nx, ne, nj, ny): (usize, usize, usize, usize),
-    (scores, v): (&Scores, &[f64]),
+    (scores, v, finite): (&Scores, &[f64], &[bool]),
     allowed: &(impl Fn(usize) -> (usize, usize) + Sync),
 ) -> Tile {
     let (x0, x1) = (t * XT, ((t + 1) * XT).min(nx));
@@ -473,6 +495,10 @@ fn tile(
     let mut a = vec![0.0; rows * ny];
     let mut block = vec![0.0; XT * JT];
     let mut visited = 0;
+    let mut overflowed = false;
+    let unnormalized = pipeline.normalizer() == Normalizer::None;
+    // Whether each row has summed a value that isn't finite.
+    let mut special = vec![false; rows];
     for j0 in (0..nj).step_by(JT) {
         let width = JT.min(nj - j0);
         // Each row's allowed positions within this tile, relative to j0.
@@ -542,6 +568,11 @@ fn tile(
                 let lanes = |_: usize, _: ColumnIndex| Lanes::Columns(scores.to_vec());
                 let weights = expression::evaluate(e, shape, &lanes);
                 weights.write(shape, scores, expression::Write::Replace);
+                // A weight or value that isn't finite meets the others in
+                // the matrix product, whose special values needn't be SQL's
+                // term by term: the host's plan gives SQL's.
+                overflowed |=
+                    scores.iter().any(|w| !w.is_finite()) || (lo..hi).any(|j| !finite[j0 + j]);
                 z[r] += scores.iter().sum::<f64>();
                 continue;
             }
@@ -568,10 +599,20 @@ fn tile(
                 sum += *s;
             }
             if shifted && rescale != 1.0 {
+                let row = &a[r * ny..(r + 1) * ny];
+                let infinite = z[r].is_infinite() || row.iter().any(|a: &f64| a.is_infinite());
+                overflowed |= infinite && !special[r];
                 z[r] *= rescale;
                 a[r * ny..(r + 1) * ny]
                     .iter_mut()
                     .for_each(|a| *a *= rescale);
+            }
+            special[r] |= (lo..hi).any(|j| !finite[j0 + j]);
+            // Unnormalized, there's no division by a normalizer to give a
+            // special value SQL's result, so weights or values that aren't
+            // finite decline, as expression weights' do.
+            if unnormalized {
+                overflowed |= scores.iter().any(|w| !w.is_finite()) || special[r];
             }
             z[r] += sum;
             m[r] = shift;
@@ -621,5 +662,9 @@ fn tile(
             }
         }
     }
-    Tile { out: a, visited }
+    Tile {
+        out: a,
+        visited,
+        overflowed,
+    }
 }

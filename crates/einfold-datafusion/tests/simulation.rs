@@ -30,7 +30,10 @@
 //!   can answer is one einfold must answer too: moving an expression below a
 //!   join must not make it fail on rows the join drops.
 //! - **`[masks-error]`** einfold fails wherever the host does, rather than
-//!   answering a query whose answer is an error.
+//!   answering a query whose answer is an error. For both, the host also
+//!   runs on einfold's partitions and batch size, since where an error
+//!   happens can depend on DataFusion's own plan; einfold is blamed only
+//!   where it differs from that run too.
 //! - **`[schema]`** the same columns, in order: names, types, nullability and
 //!   metadata, both as planned and as the batches carry them.
 //! - **`[rows]`** the same rows, as a multiset. With exact values (small
@@ -103,6 +106,7 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, Float64Array, RecordBatch};
+use datafusion::arrow::datatypes::DataType;
 use datafusion::prelude::SessionContext;
 
 use data::{KeyType, Rows, Table, Values};
@@ -139,10 +143,18 @@ enum Known {
     ResetRerunUnderPool,
     /// DataFusion's `EliminateCrossJoin` makes an `=` in the WHERE clause a
     /// key of the join below it, and gives it that join's NULL equality: over
-    /// an `IS NOT DISTINCT FROM` join, NULL then equals NULL. No
-    /// `[partition]` where a mask's `=` is over such a join (einfold#21,
-    /// upstream).
+    /// an `IS NOT DISTINCT FROM` join, NULL then equals NULL. DataFusion
+    /// simplifies `NOT (a <> b)` to `a = b` first, so a mask's `<>` reaches
+    /// it through the mask's negation. No `[partition]` where a mask's `=`
+    /// or `<>` is over such a join (einfold#21, upstream).
     WhereEqualityNullsEqual,
+    /// DataFusion compares dictionary-encoded floats by their bits: of them,
+    /// `0.0` is greater than `-0.0` and the two are separate groups, while
+    /// plain floats' `0.0` and `-0.0` are equal. A mask comparing such a key
+    /// with another float key then splits a group of the unmasked fold
+    /// between the mask and its negation: no `[partition]` over
+    /// dictionary-encoded floats (einfold#41, upstream).
+    DictionaryFloatZeros,
 }
 
 const KNOWN: &[Known] = &[
@@ -152,6 +164,7 @@ const KNOWN: &[Known] = &[
     Known::SortMergeFilterProjection,
     Known::ResetRerunUnderPool,
     Known::WhereEqualityNullsEqual,
+    Known::DictionaryFloatZeros,
 ];
 
 impl check::Settings {
@@ -408,6 +421,15 @@ fn register(ctx: &SessionContext, tables: &[Table]) {
     }
 }
 
+/// Whether the host, on einfold's partitions, batch size and settings,
+/// succeeds where einfold failed, or fails where it succeeded.
+async fn differs_from_control(case: &Case, sql: &str, einfold_succeeded: bool) -> bool {
+    trace("host, on einfold's partitions");
+    let control = check::session(case.threads[1], None, case.batch_sizes[1], case.settings);
+    register(&control, &case.tables);
+    check::run(&control, sql).await.result.is_ok() != einfold_succeeded
+}
+
 /// A failure report: the tag, what differed, and how to replay it.
 fn report(case: &Case, tag: &str, what: &str, ours: Option<&check::Ran>) -> String {
     let mut s = format!(
@@ -510,6 +532,18 @@ async fn run_case(case: &Case) -> Outcome {
             }
         }
     }
+    // An error can depend on the plan, not only on einfold: a cast of text
+    // that doesn't read as a number fails only where a row reaches it, and
+    // DataFusion's own plan on other partitions can reach rows the host's
+    // plan didn't. So the host on einfold's partitions and batch size is the
+    // control: einfold is to blame only where it fails, or succeeds, unlike
+    // the control.
+    let einfold_to_blame = match (&theirs.result, &mine.result) {
+        (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
+            differs_from_control(case, sql, mine.result.is_ok()).await
+        }
+        _ => true,
+    };
     let (want, got) = match (&theirs.result, &mine.result) {
         (Ok(w), Ok(g)) => (w, g),
         // Under a small memory pool, either side may run out where the other
@@ -526,6 +560,10 @@ async fn run_case(case: &Case) -> Outcome {
             if avoids(Known::FallbackOptimizedTwice)
                 && e.contains("Cannot swap HashJoinExec inputs after dynamic filters") =>
         {
+            return out;
+        }
+        (Ok(_), Err(_)) | (Err(_), Ok(_)) if !einfold_to_blame => {
+            out.host_failed = theirs.result.is_err();
             return out;
         }
         (Ok(_), Err(e)) => {
@@ -582,10 +620,16 @@ async fn run_case(case: &Case) -> Outcome {
     // case are, between them, exactly the unmasked fold's, with the same
     // values.
     if let (Some(m), Values::Exact) = (&case.query.mask, case.values) {
-        let nulls_equal = m.condition.contains(" = ")
+        let nulls_equal = (m.condition.contains(" = ") || m.condition.contains(" <> "))
             && case.query.sql.contains("IS NOT DISTINCT FROM")
             && avoids(Known::WhereEqualityNullsEqual);
-        if m.partitions && !nulls_equal {
+        let dictionary_floats = (case.tables.iter())
+            .flat_map(|t| t.schema.fields().iter())
+            .any(
+                |f| matches!(f.data_type(), DataType::Dictionary(_, v) if **v == DataType::Float64),
+            )
+            && avoids(Known::DictionaryFloatZeros);
+        if m.partitions && !nulls_equal && !dictionary_floats {
             trace("einfold, partition");
             let with = |c: &str| m.template.replace("{MASK}", c);
             let all = check::run(&host, &with("TRUE")).await.result;

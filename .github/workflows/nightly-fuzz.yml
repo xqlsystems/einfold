@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       duration_secs:
-        description: 'Soak budget per region, in seconds'
+        description: 'Soak budget per region, in seconds (at most 3000)'
         required: false
         default: '600'
       base_override:
@@ -43,7 +43,9 @@ jobs:
   soak:
     name: soak region ${{ matrix.region }}
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # A build without a cache takes about 15 minutes, and the soak up to 50
+    # more: the job's limit holds both, so its log is uploaded on time.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -54,6 +56,10 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # A soak that finds a failure fails its job, and the build is worth
+          # keeping all the same.
+          cache-on-failure: true
       - name: Build the soak
         run: cargo test -p einfold-datafusion --test simulation --release --no-run
       - name: Run the soak
@@ -65,6 +71,7 @@ jobs:
           REGION: ${{ matrix.region }}
         run: |
           case "$SECS" in ''|*[!0-9]*) echo "duration_secs must be a number"; exit 1;; esac
+          if [ "$SECS" -gt 3000 ]; then echo "duration_secs must be at most 3000"; exit 1; fi
           case "$OVERRIDE" in *[!0-9]*) echo "base_override must be a number"; exit 1;; esac
           # Disjoint seed windows that never repeat across runs: runs are
           # 1e8 seeds apart and regions 1e7, and a region explores far fewer.

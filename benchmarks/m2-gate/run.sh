@@ -46,6 +46,6 @@ for form in window groupby; do
   done
 done
 for scale in 1 10 40; do
-  "$BIN" accuracy 2048 "$scale"
+  "$BIN" accuracy 2048 "$scale" || exit 1
 done
 "$BIN" edges

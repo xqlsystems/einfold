@@ -143,9 +143,18 @@ fn context(
     ctx
 }
 
-/// The query's rows, `x[t·D + d]`, NaN where a row is missing or NULL, and
-/// what `EXPLAIN ANALYZE` shows of the plan.
-async fn run(ctx: &SessionContext, form: &str, l: usize) -> (Vec<f64>, usize, String) {
+/// What a run of the query gave.
+struct Ran {
+    /// Its values, `x[t·D + d]`, NaN where a row is missing or NULL.
+    out: Vec<f64>,
+    /// How many rows it had.
+    rows: usize,
+    /// What `EXPLAIN ANALYZE` shows of its plan.
+    shown: String,
+}
+
+/// The query, run in `form`'s spelling.
+async fn run(ctx: &SessionContext, form: &str, l: usize) -> Ran {
     let frame = ctx.sql(&sql(form)).await.expect("the query plans");
     let task = Arc::new(frame.task_ctx());
     let plan = frame
@@ -174,7 +183,7 @@ async fn run(ctx: &SessionContext, form: &str, l: usize) -> (Vec<f64>, usize, St
     let shown = DisplayableExecutionPlan::with_metrics(plan.as_ref())
         .indent(true)
         .to_string();
-    (out, rows, shown)
+    Ran { out, rows, shown }
 }
 
 /// A metric's value from `EXPLAIN ANALYZE`'s text, such as `tiles_visited`,
@@ -245,14 +254,15 @@ async fn main() {
         "df" => {
             let planner = match arg(4).as_str() {
                 "on" => Planner::EinFold,
-                _ => Planner::DataFusion,
+                "off" => Planner::DataFusion,
+                other => panic!("einfold is `on` or `off`, not {other:?}"),
             };
             let (form, l) = (arg(2), number::<usize>(3));
             let tables: Vec<(&str, Vec<f64>)> =
                 ["q", "k", "v"].iter().map(|n| (*n, dense(n, l))).collect();
             let ctx = context(l, &tables, planner, 12);
             let t = Instant::now();
-            let (out, rows, shown) = run(&ctx, &form, l).await;
+            let Ran { out, rows, shown } = run(&ctx, &form, l).await;
             let ms = t.elapsed().as_secs_f64() * 1e3;
             let tiles = match (metric(&shown, "tiles_visited"), metric(&shown, "tiles")) {
                 (Some(v), Some(a)) => {
@@ -286,7 +296,10 @@ async fn main() {
         }
         "accuracy" => {
             let l = number::<usize>(2);
-            let qs = arg(3).parse::<f64>().unwrap_or(1.0);
+            let qs = match arg(3).as_str() {
+                "" => 1.0,
+                _ => number::<f64>(3),
+            };
             let q: Vec<f64> = dense("q", l).iter().map(|x| x * qs).collect();
             let (k, v) = (dense("k", l), dense("v", l));
             let truth = reference(&q, &k, &v, l);
@@ -305,14 +318,13 @@ async fn main() {
                     .fold(0.0, f64::max)
                     / scale
             };
-            let (host, _, _) =
-                run(&context(l, &tables, Planner::DataFusion, 12), "window", l).await;
+            let host = (run(&context(l, &tables, Planner::DataFusion, 12), "window", l).await).out;
             for form in ["window", "groupby"] {
                 let mut bits = Vec::new();
                 let mut ours = Vec::new();
                 for threads in [1, 2, 5, 12] {
                     let ctx = context(l, &tables, Planner::EinFold, threads);
-                    let (out, _, shown) = run(&ctx, form, l).await;
+                    let Ran { out, shown, .. } = run(&ctx, form, l).await;
                     assert!(shown.contains("fused_pipelines=1"), "{shown}");
                     bits.push(out.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
                     ours = out;
@@ -356,10 +368,10 @@ async fn main() {
                         t[1].1[j * D] = 1.0;
                     }
                 }
-                let (host, host_rows, _) =
-                    run(&context(l, &t, Planner::DataFusion, 4), "window", l).await;
-                let (ours, our_rows, shown) =
-                    run(&context(l, &t, Planner::EinFold, 4), "window", l).await;
+                let host = run(&context(l, &t, Planner::DataFusion, 4), "window", l).await;
+                let ours = run(&context(l, &t, Planner::EinFold, 4), "window", l).await;
+                let (host_rows, our_rows, shown) = (host.rows, ours.rows, ours.shown);
+                let (host, ours) = (host.out, ours.out);
                 let same = |a: f64, b: f64| {
                     (a.is_nan() && b.is_nan()) || a == b || (a - b).abs() <= 1e-12 * (1.0 + b.abs())
                 };

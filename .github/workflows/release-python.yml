@@ -58,8 +58,7 @@ jobs:
           }
 
   # One wheel per platform: the extension uses Python's stable ABI (abi3), so
-  # each wheel serves every Python from 3.10. Windows waits until the tests
-  # run there (they use Unix's `resource` module).
+  # each wheel serves every Python from 3.10.
   wheels:
     name: wheel (${{ matrix.platform.name }})
     runs-on: ${{ matrix.platform.runner }}
@@ -71,6 +70,7 @@ jobs:
           - { name: linux aarch64, runner: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
           - { name: macOS arm64, runner: macos-15, target: aarch64-apple-darwin, manylinux: "" }
           - { name: macOS x86_64, runner: macos-15-intel, target: x86_64-apple-darwin, manylinux: "" }
+          - { name: windows x86_64, runner: windows-latest, target: x64, manylinux: "" }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
@@ -111,6 +111,7 @@ jobs:
           - { name: linux aarch64, runner: ubuntu-24.04-arm, wheel: wheel-ubuntu-24.04-arm-aarch64 }
           - { name: macOS arm64, runner: macos-15, wheel: wheel-macos-15-aarch64-apple-darwin }
           - { name: macOS x86_64, runner: macos-15-intel, wheel: wheel-macos-15-intel-x86_64-apple-darwin }
+          - { name: windows x86_64, runner: windows-latest, wheel: wheel-windows-latest-x64 }
         python: ["3.10", "3.13", "3.15"]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

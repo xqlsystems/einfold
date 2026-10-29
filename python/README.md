@@ -51,7 +51,7 @@ Every query in that session is planned by einfold from then on. What it doesn't 
 
 ### Limits
 
-- **Very deep plans.** A session hands einfold each plan through DataFusion's FFI, which decodes it recursively on the thread that asks. On Linux, einfold raises the main thread's stack limit, so plans of about 2,000 joins work there. On another thread, or on macOS, a plan of a few hundred joins can overflow the thread's stack, and the process exits rather than raising an error.
+- **Very deep plans.** A session hands einfold each plan through DataFusion's FFI, which decodes it recursively on the thread that asks. On Linux, einfold raises the main thread's stack limit, so plans of about 2,000 joins work there. On another thread, or on macOS or Windows (whose main thread has 1 MB by default), a plan of a few hundred joins, fewer on Windows, can overflow the thread's stack, and the process exits rather than raising an error.
 - **Functions named `sum` and `max`.** einfold replaces them with DataFusion's own, which it recognizes in plans. In a session with einfold, a function you register under either name isn't used.
 
 ## What it finds

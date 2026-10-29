@@ -212,7 +212,10 @@ fn case(seed: u64) -> Case {
         // Not only over float keys: the sort's last key is the sum `v`, and
         // where keys repeat, as in a domain's duplicates or under `UNION
         // ALL`, `v`'s `-0.0` and `0.0` decide which rows are kept.
-        limit: !avoids(Known::TopKSignedZeros),
+        // And only with exact values: at a tie on the keys, an inexact `v`
+        // that differs in its last bits between the host and einfold, as
+        // the bound allows, keeps other rows.
+        limit: values == Values::Exact && !avoids(Known::TopKSignedZeros),
     };
     // Sometimes r's J column is narrower than l's, so the join casts it.
     let tj_r = match tj {

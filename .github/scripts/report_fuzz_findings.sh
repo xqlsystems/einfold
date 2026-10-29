@@ -80,8 +80,8 @@ for log in "${logs[@]}"; do
           ;;
         *) blocks+="$line"$'\n' ;;
       esac
-    # Each block is cut to its first 60 lines of at most 300 characters, so
-    # that eight of them stay inside GitHub's limit on an issue's length.
+    # Each block is cut to its first 60 lines of at most 300 characters; the
+    # samples as a whole are capped below, after the loop.
     done < <(awk '
       /^FAILURE \(seed/ { if (inblk) print "===BLOCK==="; inblk=1; n=0; print; next }
       inblk == 1 {
@@ -92,7 +92,24 @@ for log in "${logs[@]}"; do
       END { if (inblk) print "===BLOCK===" }
     ' "$log")
   fi
+
+  # A soak that ended without its summary and without a failure crashed,
+  # say on a segfault or a panic outside a case: that's a finding too.
+  if [ "$n" -eq 0 ] && ! grep -q '^SOAK done' "$log" 2>/dev/null; then
+    total=$((total + 1))
+    if [ "$block_count" -lt "$MAX_BLOCKS" ]; then
+      blocks+="CRASH ($(basename "$log")): the soak ended without its summary. The log's last lines:"$'\n'
+      blocks+="$(tail -n 20 "$log" | cut -c1-300)"$'\n'
+      block_count=$((block_count + 1))
+    fi
+  fi
 done
+
+# GitHub rejects an issue body or comment over 65,536 characters, and the
+# blocks alone could reach 8 × 60 × 300. Keep the samples well inside it.
+if [ "${#blocks}" -gt 40000 ]; then
+  blocks="${blocks:0:40000}"$'\n'"… (cut; the full logs are attached to the run)"$'\n'
+fi
 
 if [ "$total" -eq 0 ]; then
   echo "Soak completed with 0 property failures. Nothing to file."

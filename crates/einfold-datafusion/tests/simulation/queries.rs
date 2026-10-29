@@ -357,7 +357,7 @@ pub fn query(rng: &mut Rng, options: Options) -> Query {
     let with_ctes = |body: &str| format!("{prefix}{body}");
     let mut sql = with_ctes(&body);
     // Sometimes ordered and limited above: the order is on every column, so
-    // the rows kept don't depend on the plan.
+    // with exact values the rows kept don't depend on the plan.
     let limited = !matches!(shape, Shape::Fold | Shape::Masked);
     if options.limit && limited && rng.chance(0.08) {
         sql = format!("SELECT * FROM ({sql}) q ORDER BY 1, 2, 3 LIMIT 5");

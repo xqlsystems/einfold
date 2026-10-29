@@ -75,13 +75,16 @@ jobs:
           fi
           LOG="$PWD/soak-region-${REGION}.log"
           echo "ENV rustc=$(rustc --version) os=${RUNNER_OS} sha=${GITHUB_SHA}" > "$LOG"
-          # A failing soak exits non-zero; the report job reads the log.
+          # A failing soak exits non-zero, and so does this step, after
+          # showing the log's end; the report job reads the log either way.
           set +e
           EINFOLD_SOAK_SECS="$SECS" EINFOLD_SOAK_BASE="$BASE" EINFOLD_SOAK_LOG="$LOG" \
             cargo test -p einfold-datafusion --test simulation --release \
             -- --ignored --nocapture soak
-          echo "soak exit code: $?"
+          status=$?
+          echo "soak exit code: $status"
           tail -n 12 "$LOG" || true
+          exit "$status"
       - name: Upload the region's log
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

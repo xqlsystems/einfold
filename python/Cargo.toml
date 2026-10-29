@@ -27,12 +27,13 @@ datafusion-ffi = "=55.2.0"
 datafusion-proto = "=55.2.0"
 einfold-datafusion = { path = "../crates/einfold-datafusion" }
 futures = "0.3"
-# The allocator datafusion-python uses. With the system allocator, each of the
-# threads this library computes on keeps memory of its own, and a session
-# that runs many queries grew by about 150 MB per query. Its version 2:
-# mimalloc 3 crashes on macOS arm64 when another copy of it runs in the same
-# process, as PyArrow 24's does (apache/datafusion-python#1607,
-# microsoft/mimalloc#1287).
+# mimalloc, Microsoft's general-purpose memory allocator, which
+# datafusion-python (DataFusion's Python bindings) uses too. With the system
+# allocator, each of the threads this library computes on keeps memory of its
+# own, and a session that runs many queries grew by about 150 MB per query.
+# Its version 2, because version 3 crashes on macOS arm64 when a second copy
+# of mimalloc runs in the same process, as PyArrow 24 (Apache Arrow's Python
+# library) loads one: apache/datafusion-python#1607, microsoft/mimalloc#1287.
 mimalloc = { version = "0.1", default-features = false, features = ["v2"] }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3", "abi3-py310"] }
 # A session hands einfold each logical plan as protobuf, and prost's decoder

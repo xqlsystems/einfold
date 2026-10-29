@@ -42,7 +42,9 @@ mod codec;
 mod lean;
 mod stack;
 
-/// mimalloc, the allocator datafusion-python uses (see `Cargo.toml`).
+/// mimalloc, Microsoft's general-purpose allocator, which datafusion-python
+/// uses too, in its version 2, which runs beside PyArrow's own copy (see
+/// `Cargo.toml`).
 #[global_allocator]
 static ALLOCATOR: MiMalloc = MiMalloc;
 

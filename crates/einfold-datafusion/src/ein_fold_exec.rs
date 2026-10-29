@@ -14,8 +14,9 @@ use datafusion::arrow::compute::nullif;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::error::ArrowError;
 use datafusion::common::runtime::SpawnedTask;
+use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{internal_err, DataFusionError, Result};
+use datafusion::common::{internal_err, DataFusionError, Result, Statistics};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, SessionStateBuilder, TaskContext};
 use datafusion::logical_expr::execution_props::ExecutionProps;
@@ -25,6 +26,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
     self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
+use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     self, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
@@ -100,6 +102,10 @@ pub struct EinFoldExec {
     null_when: Option<ColumnIndex>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
+    /// The operator's statistics, once computed: DataFusion's planner asks
+    /// at every join above, and the inputs' would be computed again each
+    /// time, all the way down a deep plan.
+    statistics: OnceLock<Arc<Statistics>>,
 }
 
 impl EinFoldExec {
@@ -141,6 +147,7 @@ impl EinFoldExec {
             null_when: None,
             properties: Arc::new(properties),
             metrics: ExecutionPlanMetricsSet::new(),
+            statistics: OnceLock::new(),
         }
     }
 
@@ -449,6 +456,65 @@ impl ExecutionPlan for EinFoldExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
+    }
+
+    /// The statistics of the inputs its own are estimated from (see
+    /// [`ExecutionPlan::statistics_from_inputs`]), over all their partitions,
+    /// which the operator reads whole, into its one partition: the domain's
+    /// alone for a fold with one, and otherwise its operands'. None, once its
+    /// own are known.
+    fn child_stats_requests(&self, _partition: Option<usize>) -> Vec<ChildStats> {
+        if self.statistics.get().is_some() {
+            return vec![ChildStats::Skip; self.inputs.len()];
+        }
+        let domain = matches!(&self.work, Work::Fold(fold) if fold.domain().is_some());
+        (0..self.inputs.len())
+            .map(|i| match domain && i < 2 {
+                true => ChildStats::Skip,
+                false => ChildStats::At(None),
+            })
+            .collect()
+    }
+
+    /// How many rows the operator emits, and their bytes, as DataFusion's
+    /// planner asks to choose, for one, which side of a join above to hold.
+    /// A fold with a domain emits one row per domain row, as exactly as the
+    /// domain's count is known. Otherwise the count is an estimate: as many
+    /// rows as the larger operand, but no more than the pairs they make. A
+    /// matrix product `x[s, k] · w[k, e]` emits `s · e` rows, between `w`'s
+    /// count and `x`'s when `k` is the smallest extent, as in a model's
+    /// layers; attention emits a row per row of its queries.
+    fn statistics_from_inputs(
+        &self,
+        inputs: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        if let Some(known) = self.statistics.get() {
+            return Ok(Arc::clone(known));
+        }
+        let rows = |i: usize| inputs.get(i).map_or(Precision::Absent, |s| s.num_rows);
+        let num_rows = match &self.work {
+            Work::Fold(fold) if fold.domain().is_some() => rows(2),
+            _ => match (rows(0).get_value(), rows(1).get_value()) {
+                (Some(&a), Some(&b)) => Precision::Inexact(a.max(b).min(a.saturating_mul(b))),
+                _ => Precision::Absent,
+            },
+        };
+        // A row's bytes, where every column's type has a fixed width; the
+        // size is left unknown otherwise, as for text keys, and DataFusion's
+        // join planning goes by the rows.
+        let width: Option<usize> = (self.schema().fields().iter())
+            .map(|f| f.data_type().primitive_width())
+            .sum();
+        let mut statistics = Statistics::new_unknown(&self.schema());
+        statistics.total_byte_size = match width {
+            Some(width) => num_rows.map(|n| n.saturating_mul(width)),
+            None => Precision::Absent,
+        };
+        statistics.num_rows = num_rows;
+        Ok(Arc::clone(
+            self.statistics.get_or_init(|| Arc::new(statistics)),
+        ))
     }
 
     fn with_new_children(

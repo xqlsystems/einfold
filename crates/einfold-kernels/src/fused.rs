@@ -11,10 +11,11 @@
 //! with the dimensions it sums away, whatever the query means. Two such
 //! queries: attention, in which each query position averages the values at
 //! the key positions, weighted by a softmax of its dot products with the
-//! keys; and a kernel smoother, which averages values at source points,
-//! weighted by a function of their distance to each target point. The names
-//! below follow attention, where they are familiar: the operands `q`, `k`
-//! and `v`, and a query, a key and a feature.
+//! keys (each exponentiated, then divided by their sum, so that the weights
+//! sum to one); and a kernel smoother, which averages values at source
+//! points, weighted by a function of their distance to each target point.
+//! The names below follow attention, where they are familiar: the operands
+//! `q`, `k` and `v`, and a query, a key and a feature.
 //!
 //! Every dimension has one of four roles:
 //!

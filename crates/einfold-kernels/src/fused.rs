@@ -46,6 +46,14 @@
 //! exactly one row: two would be two weights `exp(s)` in SQL, not one
 //! `exp(2s)`.
 //!
+//! **Weights.** A weight of an expression of the score (see [`Weight::Of`])
+//! is evaluated over each row's scores of the block, and a row's state is
+//! plain sums, `z = Σ w` and `a[y] = Σ w·v[y]`. A softmax's weight is
+//! `exp(score)`, computed in a scaled accumulator, below. Either way, the
+//! weighted sums of a block are a matrix product of its weights and `v`'s
+//! rows, and the result is `a / z`, or `a` itself when nothing normalizes
+//! it ([`Normalizer::None`]).
+//!
 //! **The scaled accumulator.** A row's state is `(m, z, a[y])`: a shift `m`,
 //! the sum of its weights `z = Σ exp(s − m)`, and the weighted sums `a[y] =
 //! Σ exp(s − m)·v[y]`. A block whose largest score is above `m` raises the
@@ -87,7 +95,8 @@ use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::compute;
 use arrow::datatypes::SchemaRef;
 use einfold_ir::{
-    ColumnIndex, Comparison, DimensionId, Expression, Operand, Pipeline, RowValue, Shift,
+    ColumnIndex, Comparison, DimensionId, Expression, Normalizer, Operand, Pipeline, RowValue,
+    Scale, Shift, Weight,
 };
 
 use crate::dense;
@@ -142,6 +151,9 @@ pub(crate) fn pipeline(
     schema: SchemaRef,
     threads: usize,
 ) -> Result<Option<Piped>> {
+    if !matches!(pipeline.weight(), Weight::Exp { .. } | Weight::Of(_)) {
+        return Ok(None);
+    }
     let producer = pipeline.producer();
     let [op_q, op_k] = producer.operands() else {
         return Ok(None);
@@ -449,8 +461,13 @@ fn tile(
 ) -> Tile {
     let (x0, x1) = (t * XT, ((t + 1) * XT).min(nx));
     let rows = x1 - x0;
-    let scale = pipeline.scale();
-    let shifted = pipeline.shift() == Shift::KeptMaximum;
+    // A softmax's scale and whether it is shifted, or another weight's
+    // expression of the score.
+    let (scale, shifted, map) = match pipeline.weight() {
+        Weight::Exp { scale, shift } => (*scale, *shift == Shift::KeptMaximum, None),
+        Weight::Of(e) => (Scale::One, false, Some(e)),
+        _ => unreachable!("pipeline() declines other weights"),
+    };
     let mut m = vec![if shifted { f64::NEG_INFINITY } else { 0.0 }; rows];
     let mut z = vec![0.0; rows];
     let mut a = vec![0.0; rows * ny];
@@ -518,6 +535,16 @@ fn tile(
             }
             let row = &mut block[r * width..(r + 1) * width];
             let scores = &mut row[lo..hi];
+            if let Some(e) = map {
+                // Each weight is the expression of its score, and the row's
+                // state is a plain sum, `z = Σ w`, `a[y] = Σ w·v[y]`.
+                let shape = (1, hi - lo);
+                let lanes = |_: usize, _: ColumnIndex| Lanes::Columns(scores.to_vec());
+                let weights = expression::evaluate(e, shape, &lanes);
+                weights.write(shape, scores, false);
+                z[r] += scores.iter().sum::<f64>();
+                continue;
+            }
             for s in scores.iter_mut() {
                 *s = scale.apply(*s);
             }
@@ -578,8 +605,21 @@ fn tile(
     }
     // A row whose every score was -inf has z = 0, and 0 / 0 is NaN, as
     // SQL's exp(-inf - -inf) is.
-    for (r, z) in z.iter().enumerate() {
-        a[r * ny..(r + 1) * ny].iter_mut().for_each(|a| *a /= z);
+    // Unnormalized, there is no division to give it, so a shifted row
+    // whose every score was -inf is NaN outright.
+    match pipeline.normalizer() {
+        Normalizer::None => {
+            for (r, &m) in m.iter().enumerate() {
+                if shifted && m == f64::NEG_INFINITY {
+                    a[r * ny..(r + 1) * ny].fill(f64::NAN);
+                }
+            }
+        }
+        _ => {
+            for (r, z) in z.iter().enumerate() {
+                a[r * ny..(r + 1) * ny].iter_mut().for_each(|a| *a /= z);
+            }
+        }
     }
     Tile { out: a, visited }
 }

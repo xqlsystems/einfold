@@ -17,7 +17,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::common::{plan_err, DFSchema, DFSchemaRef, Result};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan, UserDefinedLogicalNodeCore};
-use einfold_ir::{DimensionId, Normalizer, Pipeline, Shift};
+use einfold_ir::{DimensionId, Normalizer, Pipeline, Shift, Weight};
 
 use crate::fold_node;
 
@@ -164,23 +164,37 @@ pub(crate) fn describe(pipeline: &Pipeline) -> String {
         .map(|k| name(k.dimension))
         .collect();
     let outputs: Vec<String> = pipeline.outputs().iter().map(|&d| name(d)).collect();
-    // The scale, if any, then whether the scores are shifted and how the
-    // average is normalized, as `/ 8, shifted`.
-    let mut softmax = Vec::new();
-    let scale = pipeline.scale().to_string();
-    if !scale.trim().is_empty() {
-        softmax.push(scale.trim().to_string());
-    }
-    if pipeline.shift() == Shift::KeptMaximum {
-        softmax.push("shifted".to_string());
-    }
-    if pipeline.normalizer() == Normalizer::JoinedRows {
-        softmax.push("over joined rows".to_string());
+    // The weight: a softmax's scale, if any, and whether its scores are
+    // shifted, as `softmax(/ 8, shifted)`, or another weight's expression of
+    // the producer's value `#0.0`, as `weights(power(#0.0, 2))`; then how the
+    // sum is normalized.
+    let mut parts = Vec::new();
+    let kind = match pipeline.weight() {
+        Weight::Exp { scale, shift } => {
+            let scale = scale.to_string();
+            if !scale.trim().is_empty() {
+                parts.push(scale.trim().to_string());
+            }
+            if *shift == Shift::KeptMaximum {
+                parts.push("shifted".to_string());
+            }
+            "softmax"
+        }
+        Weight::Of(e) => {
+            parts.push(e.to_string());
+            "weights"
+        }
+        _ => "weights",
+    };
+    match pipeline.normalizer() {
+        Normalizer::JoinedRows => parts.push("over joined rows".to_string()),
+        Normalizer::None => parts.push("unnormalized".to_string()),
+        _ => {}
     }
     format!(
-        "{}; softmax({}) * {} -> {}",
+        "{}; {kind}({}) * {} -> {}",
         fold_node::describe(producer, einfold_kernels::DomainRows::Any),
-        softmax.join(", "),
+        parts.join(", "),
         values.join(","),
         outputs.join(",")
     )

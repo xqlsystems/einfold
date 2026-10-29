@@ -22,6 +22,10 @@
 //!   it, each term (`SUM(w / norm.z * v.x)`);
 //! - **a weighted average over joined rows**, `SUM(exp(s) * v.x) / SUM(exp(s))`
 //!   with no shift, as a recommender or kernel smoother writes it;
+//! - **other weights**: a sigmoid of attention's scores, averaged; a Cauchy
+//!   kernel of points, `1 / (1 + (q.x - k.x)²)`, averaged; and the scores
+//!   themselves, summed with no normalizer, `SUM(scores.s * v.x)`, a chain
+//!   of two einsums;
 //! - **kernel smoothers**, the same average with weights of a distance
 //!   between points (`exp(-power(q.x - k.x, 2) / 0.5)` or `exp(-abs(q.x -
 //!   k.x) * 2)`), over a `CROSS JOIN` of one coordinate per point with
@@ -145,7 +149,22 @@ fn query(rng: &mut Rng) -> (String, Expect) {
         "SELECT i, j, exp(s) AS w FROM (SELECT q.t AS i, k.t AS j, \
          SUM(-power(q.x - k.x, 2.0)) AS s FROM q JOIN k ON q.d = k.d{mask} GROUP BY q.t, k.t)"
     );
-    match rng.below(13) {
+    // Weights other than a softmax's: a sigmoid of the scores, averaged; a
+    // Cauchy kernel of points, averaged; and the scores themselves, summed
+    // with no normalizer, a chain of two einsums.
+    let sigmoid = "weights AS (SELECT i, j, 1.0 / (1.0 + exp(-s)) AS w FROM scores)";
+    let cauchy = format!(
+        "SELECT q.t AS i, k.t AS j, 1.0 / (1.0 + power(q.x - k.x, 2.0)) AS w \
+         FROM q CROSS JOIN k WHERE q.d = 0 AND k.d = 0{mask}"
+    );
+    let chain = format!(
+        "WITH {scores} SELECT scores.i AS t, v.c, SUM(scores.s * v.x) AS x \
+         FROM scores JOIN v ON scores.j = v.t GROUP BY scores.i, v.c"
+    );
+    match rng.below(16) {
+        13 => (average(sigmoid, norm), Expect::Pipeline),
+        14 => (kernel(&cauchy), Expect::Pipeline),
+        15 => (chain, Expect::Pipeline),
         10 | 11 => (kernel(&cross), Expect::Pipeline),
         12 => (kernel(&long), Expect::Pipeline),
         8 => (inside(window), Expect::Pipeline),
@@ -390,7 +409,7 @@ async fn einfold_finds_pipelines_and_changes_no_answer() {
         let shown = DisplayableExecutionPlan::with_metrics(plan.as_ref())
             .indent(true)
             .to_string();
-        let is_pipeline = shown.contains("softmax(");
+        let is_pipeline = shown.contains("softmax(") || shown.contains("weights(");
         // A nullable key may keep detection from proving the plan a
         // pipeline; it must still not find one in a look-alike.
         let nullable = matches!(damage, Damage::NullKey(_));

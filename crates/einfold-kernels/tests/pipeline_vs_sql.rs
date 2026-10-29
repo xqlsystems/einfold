@@ -50,6 +50,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use einfold_ir::{
     Aggregate, Binary, ColumnIndex, Comparison, Condition, Dimension, DimensionId, Expression,
     Fold, Key, KeyEquality, Normalizer, Operand, Output, Pipeline, RowValue, Scale, Shift, Unary,
+    Weight,
 };
 use einfold_kernels::{FloatKeys, Host, Options, Relation};
 
@@ -153,6 +154,9 @@ struct Case {
     complete: bool,
     /// The largest `|v.x|`, the scale of every average.
     v_scale: f64,
+    /// For a sum that nothing normalizes, SQL for each group's `Σ |w · v.x|`,
+    /// the scale of its rounding.
+    magnitudes: Option<String>,
 }
 
 /// A value: mostly in [-1, 1] times `spread`, sometimes special.
@@ -377,13 +381,48 @@ fn case(rng: &mut Rng) -> Case {
         1 => (Scale::Times(-0.7), " * -0.7".to_string()),
         _ => (Scale::Over(8.0), " / 8.0".to_string()),
     };
-    let (shift, weight) = match rng.chance(0.7) {
-        true => (Shift::KeptMaximum, "exp(s - MAX(s) OVER (PARTITION BY i))"),
-        false => (Shift::None, "exp(s)"),
+    // A softmax's weight, or another expression of the score: positive, so
+    // that a normalized average stays an average, or, for a sum that
+    // nothing normalizes, the score itself, a chain of two einsums.
+    let normalizer = [
+        Normalizer::KeptGroups,
+        Normalizer::JoinedRows,
+        Normalizer::None,
+    ][rng.below(3)];
+    let lit = Expression::literal;
+    let p = || {
+        let p = Expression::column(0, 0);
+        match scale {
+            Scale::Times(c) => p.binary(Binary::Multiply, lit(c)),
+            Scale::Over(c) => p.binary(Binary::Divide, lit(c)),
+            _ => p,
+        }
     };
-    let normalizer = match rng.chance(0.5) {
-        true => Normalizer::KeptGroups,
-        false => Normalizer::JoinedRows,
+    let one_over = |e: Expression| lit(1.0).binary(Binary::Divide, lit(1.0).binary(Binary::Add, e));
+    let (weight_ir, weight) = match rng.below(5) {
+        0 => (
+            Weight::Of(one_over(p().unary(Unary::Negate).unary(Unary::Exp))),
+            "1.0 / (1.0 + exp(-s))",
+        ),
+        1 => (
+            Weight::Of(one_over(p().binary(Binary::Multiply, p()))),
+            "1.0 / (1.0 + s * s)",
+        ),
+        2 if normalizer == Normalizer::None => (Weight::Of(p()), "s"),
+        2 | 3 => (
+            Weight::Exp {
+                scale,
+                shift: Shift::KeptMaximum,
+            },
+            "exp(s - MAX(s) OVER (PARTITION BY i))",
+        ),
+        _ => (
+            Weight::Exp {
+                scale,
+                shift: Shift::None,
+            },
+            "exp(s)",
+        ),
     };
     let (values, outputs, c_col, c_group) = match channels {
         Some(_) => (
@@ -407,7 +446,7 @@ fn case(rng: &mut Rng) -> Case {
     };
     let own = if channels.is_some() { vec![EQ] } else { vec![] };
     let pipeline =
-        Pipeline::try_new(producer, scale, shift, own, values, outputs, normalizer).unwrap();
+        Pipeline::try_new(producer, weight_ir, own, values, outputs, normalizer).unwrap();
     let producer = match cross {
         true => format!(
             "SELECT q.t AS i, k.t AS j, ({row_sql}){scale_sql} AS s \
@@ -427,11 +466,21 @@ fn case(rng: &mut Rng) -> Case {
              FROM weights JOIN v ON weights.j = v.t JOIN norm ON weights.i = norm.i \
              GROUP BY weights.i{c_group}, norm.z"
         ),
-        _ => format!(
+        Normalizer::JoinedRows => format!(
             "{scores} SELECT weights.i{c_col}, SUM(weights.w * v.x) / SUM(weights.w) \
              FROM weights JOIN v ON weights.j = v.t GROUP BY weights.i{c_group}"
         ),
+        _ => format!(
+            "{scores} SELECT weights.i{c_col}, SUM(weights.w * v.x) \
+             FROM weights JOIN v ON weights.j = v.t GROUP BY weights.i{c_group}"
+        ),
     };
+    let magnitudes = (normalizer == Normalizer::None).then(|| {
+        format!(
+            "{scores} SELECT weights.i{c_col}, SUM(abs(weights.w * v.x)) \
+             FROM weights JOIN v ON weights.j = v.t GROUP BY weights.i{c_group}"
+        )
+    });
     Case {
         q,
         k,
@@ -440,6 +489,7 @@ fn case(rng: &mut Rng) -> Case {
         sql,
         complete: complete && reads_both,
         v_scale,
+        magnitudes,
     }
 }
 
@@ -544,8 +594,14 @@ async fn pipeline_matches_sql() {
         if ours.len() != theirs.len() {
             fail(format!("{} rows, SQL has {}", ours.len(), theirs.len()));
         }
-        let bound = 1e-9 * case.v_scale;
-        for ((ok, ov), (tk, tv)) in ours.iter().zip(&theirs) {
+        // An average's rounding is on the scale of the values; a sum's, of
+        // the sum of its terms' magnitudes.
+        let magnitudes = match &case.magnitudes {
+            Some(sql) => rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap()),
+            None => vec![(Vec::new(), Some(case.v_scale)); theirs.len()],
+        };
+        for (((ok, ov), (tk, tv)), (_, scale)) in ours.iter().zip(&theirs).zip(&magnitudes) {
+            let bound = 1e-9 * scale.unwrap_or(0.0);
             let same = match (ov, tv) {
                 (Some(x), Some(y)) if x.is_nan() || y.is_nan() => x.is_nan() && y.is_nan(),
                 (Some(x), Some(y)) if x.is_infinite() || y.is_infinite() => x == y,
@@ -612,8 +668,10 @@ fn tiles_visited(conditions: &[(Comparison, i64)]) -> (usize, usize) {
     };
     let pipeline = Pipeline::try_new(
         producer,
-        Scale::One,
-        Shift::KeptMaximum,
+        Weight::Exp {
+            scale: Scale::One,
+            shift: Shift::KeptMaximum,
+        },
         vec![],
         values,
         vec![DimensionId(0)],

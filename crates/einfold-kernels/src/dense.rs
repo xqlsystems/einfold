@@ -38,11 +38,13 @@
 //! Otherwise the caller falls back to the hash path.
 //!
 //! **Determinism.** Work is split into fixed blocks chosen from the shape
-//! alone: blocks of output rows when the output is large, or blocks along `z`
-//! when it is small, whose partial outputs are added in block order. Within a
-//! block, rows are visited in position order. So the bits depend neither on
-//! the number of threads nor on the order in which rows arrive.
+//! alone: blocks of output rows and columns when the output is large, or
+//! blocks along `z` when it is small, whose partial outputs are added in
+//! block order. Within a block, rows are visited in position order. So the
+//! bits depend neither on the number of threads nor on the order in which
+//! rows arrive.
 
+use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
 use std::thread;
 
@@ -56,6 +58,9 @@ use crate::Result;
 
 /// Output rows per block, when the output has at least [`FEW_CELLS`] cells.
 const XB: usize = 256;
+/// Output columns per block, likewise, so that an output of few rows still
+/// splits into blocks.
+const YB: usize = 2048;
 /// Positions of `z` per block, when the output is smaller.
 const ZB: usize = 4096;
 const FEW_CELLS: usize = 4096;
@@ -93,31 +98,29 @@ fn keys(column: &ArrayRef) -> Option<(Int64Array, usize)> {
     Some((keys, extent))
 }
 
-/// A row's position over some dimensions, flattened with the first
-/// dimension slowest: each dimension's keys, with its extent.
-struct Position<'a>(Vec<(&'a [i64], usize)>);
-
-impl<'a> Position<'a> {
-    /// The position over `dims`, from an operand's `(dimension, keys)`
-    /// columns.
-    fn new(keys: &'a [(usize, Int64Array)], dims: &[usize], extent: &[usize]) -> Self {
-        Position(
-            dims.iter()
-                .map(|&d| {
-                    let (_, k) = keys
-                        .iter()
-                        .find(|(e, _)| *e == d)
-                        .expect("a held dimension");
-                    (&k.values()[..], extent[d])
-                })
-                .collect(),
-        )
+/// Each row's position over `dims`, flattened with the first dimension
+/// slowest, from a batch's `(dimension, keys)` columns. It is computed a
+/// column at a time, in 32 bits, which the compiler vectorizes: every
+/// position fits, as the dense algorithm runs only on fewer cells than
+/// `u32::MAX`.
+fn positions(
+    keys: &[(usize, Int64Array)],
+    dims: &[usize],
+    extent: &[usize],
+    rows: usize,
+) -> Vec<u32> {
+    let mut position = vec![0u32; rows];
+    for &d in dims {
+        let (_, k) = keys
+            .iter()
+            .find(|(e, _)| *e == d)
+            .expect("a held dimension");
+        let n = extent[d] as u32;
+        for (p, &k) in position.iter_mut().zip(k.values()) {
+            *p = *p * n + k as u32;
+        }
     }
-
-    /// Row `r`'s position.
-    fn of(&self, r: usize) -> usize {
-        self.0.iter().fold(0, |p, (k, n)| p * n + k[r] as usize)
-    }
+    position
 }
 
 /// Run `f(i)` for every task `i` in `0..tasks` on up to `threads` threads.
@@ -181,26 +184,35 @@ pub(crate) fn fold(
             zs.push(d.0);
         }
     }
-    // Each batch's key columns as non-negative i64, cast once; and each
-    // dimension's extent, its largest key in either operand, plus one.
-    let mut extent = vec![0usize; fold.dimensions().len()];
-    let mut cast_keys = |op: &Operand, batches: &[RecordBatch]| {
-        (batches.iter())
-            .map(|batch| {
-                (op.keys.iter())
-                    .map(|key| {
-                        let (DimensionId(d), ColumnIndex(c)) = (key.dimension, key.column);
-                        let (k, n) = keys(batch.column(c))?;
-                        extent[d] = extent[d].max(n);
-                        Some((d, k))
-                    })
-                    .collect::<Option<Vec<_>>>()
-            })
-            .collect::<Option<Vec<_>>>()
+    // Each batch's key columns as non-negative i64, cast once, with their
+    // extents, batches in parallel; then each dimension's extent, its largest
+    // key in either operand, plus one.
+    let cast_keys = |op: &Operand, batches: &[RecordBatch]| {
+        let batch_keys = par_tasks(batches.len(), threads, |i| {
+            (op.keys.iter())
+                .map(|key| {
+                    let (DimensionId(d), ColumnIndex(c)) = (key.dimension, key.column);
+                    let (k, n) = keys(batches[i].column(c))?;
+                    Some((d, k, n))
+                })
+                .collect::<Option<Vec<_>>>()
+        });
+        batch_keys.into_iter().collect::<Option<Vec<_>>>()
     };
     let (Some(a_keys), Some(b_keys)) = (cast_keys(op_a, a), cast_keys(op_b, b)) else {
         return Ok(None);
     };
+    let mut extent = vec![0usize; fold.dimensions().len()];
+    for &(d, _, n) in a_keys.iter().chain(&b_keys).flatten() {
+        extent[d] = extent[d].max(n);
+    }
+    let strip =
+        |batch_keys: Vec<Vec<(usize, Int64Array, usize)>>| -> Vec<Vec<(usize, Int64Array)>> {
+            (batch_keys.into_iter())
+                .map(|keys| keys.into_iter().map(|(d, k, _)| (d, k)).collect())
+                .collect()
+        };
+    let (a_keys, b_keys) = (strip(a_keys), strip(b_keys));
     let rows = |batches: &[RecordBatch]| batches.iter().map(|b| b.num_rows()).sum::<usize>();
     let size = |dims: &[usize]| {
         dims.iter()
@@ -238,17 +250,21 @@ pub(crate) fn fold(
     let mut reached = vec![false; nx];
     let mut valued = vec![false; if zero_default { 0 } else { nx }];
     let mut finite = true;
-    for (batch, keys) in a.iter().zip(&a_keys) {
-        let (a_x, a_z) = (
-            Position::new(keys, &xs, &extent),
-            Position::new(keys, &zs, &extent),
-        );
+    // Each row's x and z positions, batches in parallel; then the rows
+    // placed in order.
+    let a_positions = par_tasks(a.len(), threads, |i| {
+        let rows = a[i].num_rows();
+        let x = positions(&a_keys[i], &xs, &extent, rows);
+        let z = positions(&a_keys[i], &zs, &extent, rows);
+        (x, z)
+    });
+    for (batch, (a_x, a_z)) in a.iter().zip(&a_positions) {
         let Some(a_factors) = factors(op_a, batch) else {
             return Ok(None);
         };
         for r in 0..batch.num_rows() {
-            let x = a_x.of(r);
-            let p = x * nz + a_z.of(r);
+            let x = a_x[r] as usize;
+            let p = x * nz + a_z[r] as usize;
             let valid = a_factors.is_valid(r);
             if std::mem::replace(&mut held[p], if valid { VALUED } else { NULL }) != ABSENT {
                 return Ok(None);
@@ -267,17 +283,19 @@ pub(crate) fn fold(
     let mut b_matrix = vec![0.0; nz * ny];
     let mut present = vec![false; nz * ny];
     let mut b_nulls = false;
-    for (batch, keys) in b.iter().zip(&b_keys) {
-        let (b_z, b_y) = (
-            Position::new(keys, &zs, &extent),
-            Position::new(keys, &ys, &extent),
-        );
+    let b_positions = par_tasks(b.len(), threads, |i| {
+        let rows = b[i].num_rows();
+        let z = positions(&b_keys[i], &zs, &extent, rows);
+        let y = positions(&b_keys[i], &ys, &extent, rows);
+        (z, y)
+    });
+    for (batch, (b_z, b_y)) in b.iter().zip(&b_positions) {
         let Some(b_factors) = factors(op_b, batch) else {
             return Ok(None);
         };
         b_nulls |= b_factors.null_count() > 0;
         for r in 0..batch.num_rows() {
-            let p = b_z.of(r) * ny + b_y.of(r);
+            let p = b_z[r] as usize * ny + b_y[r] as usize;
             if std::mem::replace(&mut present[p], true) {
                 return Ok(None);
             }
@@ -335,11 +353,15 @@ pub(crate) fn fold(
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?;
             if domain_rows == DomainRows::UniqueKeys {
-                let mut seen = vec![false; nx * ny];
-                for &c in located.iter().flatten() {
-                    if c != NO_GROUP && std::mem::replace(&mut seen[c], true) {
-                        return Ok(None);
-                    }
+                // Batches in parallel: whichever of two rows with one cell
+                // marks it second sees the mark, in any order.
+                let seen: Vec<AtomicBool> = (0..nx * ny).map(|_| AtomicBool::new(false)).collect();
+                let repeated = par_tasks(located.len(), threads, |i| {
+                    (located[i].iter())
+                        .any(|&c| c != NO_GROUP && seen[c].swap(true, atomic::Ordering::Relaxed))
+                });
+                if repeated.contains(&true) {
+                    return Ok(None);
                 }
             }
             let batches = par_tasks(domain.len(), threads, |i| {
@@ -485,33 +507,49 @@ fn accumulate(
     (nx, nz, ny): (usize, usize, usize),
     threads: usize,
 ) -> Vec<f64> {
-    let add = |row: &mut [f64], x: usize, z: usize| {
+    // Adds a[x, z]·b[z][y0..y1] into `row`, the output's row x over those
+    // columns.
+    let add = |row: &mut [f64], x: usize, z: usize, y0: usize| {
         if held[x * nz + z] == VALUED {
             let v = a_matrix[x * nz + z];
-            for (o, b) in row.iter_mut().zip(&b_matrix[z * ny..(z + 1) * ny]) {
+            let b_row = &b_matrix[z * ny + y0..z * ny + y0 + row.len()];
+            for (o, b) in row.iter_mut().zip(b_row) {
                 *o += v * b;
             }
         }
     };
     if nx * ny >= FEW_CELLS {
-        par_tasks(nx.div_ceil(XB), threads, |t| {
-            let (x0, x1) = (t * XB, ((t + 1) * XB).min(nx));
-            let mut block = vec![0.0; (x1 - x0) * ny];
+        // Blocks of rows and columns of the output; each cell's terms are
+        // still added in z order.
+        let (row_blocks, column_blocks) = (nx.div_ceil(XB), ny.div_ceil(YB));
+        let blocks = par_tasks(row_blocks * column_blocks, threads, |t| {
+            let (x0, y0) = ((t / column_blocks) * XB, (t % column_blocks) * YB);
+            let (x1, width) = ((x0 + XB).min(nx), YB.min(ny - y0));
+            let mut block = vec![0.0; (x1 - x0) * width];
             for x in x0..x1 {
-                let row = &mut block[(x - x0) * ny..(x - x0 + 1) * ny];
+                let row = &mut block[(x - x0) * width..(x - x0 + 1) * width];
                 for z in 0..nz {
-                    add(row, x, z);
+                    add(row, x, z, y0);
                 }
             }
             block
-        })
-        .concat()
+        });
+        let mut out = vec![0.0; nx * ny];
+        for (t, block) in blocks.into_iter().enumerate() {
+            let (x0, y0) = ((t / column_blocks) * XB, (t % column_blocks) * YB);
+            let width = YB.min(ny - y0);
+            for (i, row) in block.chunks(width).enumerate() {
+                let start = (x0 + i) * ny + y0;
+                out[start..start + width].copy_from_slice(row);
+            }
+        }
+        out
     } else {
         let partials = par_tasks(nz.div_ceil(ZB), threads, |t| {
             let mut part = vec![0.0; nx * ny];
             for z in t * ZB..((t + 1) * ZB).min(nz) {
                 for x in 0..nx {
-                    add(&mut part[x * ny..(x + 1) * ny], x, z);
+                    add(&mut part[x * ny..(x + 1) * ny], x, z, 0);
                 }
             }
             part

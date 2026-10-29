@@ -116,8 +116,8 @@ use rng::Rng;
 enum Known {
     /// DataFusion's TopK prunes with a dynamic filter that compares `-0.0`
     /// and `0.0` as equal, while its sort orders `-0.0` first, so `ORDER BY
-    /// … LIMIT` over float keys depends on timing: no `LIMIT` over them
-    /// (einfold#63, upstream).
+    /// … LIMIT` over a float column depends on timing. The sort's keys
+    /// include the sum, a float, so: no `LIMIT` (einfold#63, upstream).
     TopKSignedZeros,
     /// `EinFoldExec`'s fallback is optimized when planned, then again as a
     /// child of the plan, and `JoinSelection` can't swap a join that already
@@ -209,7 +209,10 @@ fn case(seed: u64) -> Case {
     let options = Options {
         fallible: values == Values::Exact && rng.chance(0.25),
         exact: values == Values::Exact,
-        limit: !(floats && avoids(Known::TopKSignedZeros)),
+        // Not only over float keys: the sort's last key is the sum `v`, and
+        // where keys repeat, as in a domain's duplicates or under `UNION
+        // ALL`, `v`'s `-0.0` and `0.0` decide which rows are kept.
+        limit: !avoids(Known::TopKSignedZeros),
     };
     // Sometimes r's J column is narrower than l's, so the join casts it.
     let tj_r = match tj {

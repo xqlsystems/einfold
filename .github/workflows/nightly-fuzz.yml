@@ -27,9 +27,10 @@ on:
         required: false
         default: ''
 
+# Only the report job writes issues: the soaks build and run the
+# repository and its dependencies, and need no more than to read it.
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: nightly-fuzz
@@ -56,10 +57,15 @@ jobs:
       - name: Build the soak
         run: cargo test -p einfold-datafusion --test simulation --release --no-run
       - name: Run the soak
+        # Inputs reach the script as variables, never as its text, and must
+        # be numbers, since the shell's arithmetic evaluates what it's given.
+        env:
+          SECS: ${{ github.event.inputs.duration_secs || '600' }}
+          OVERRIDE: ${{ github.event.inputs.base_override }}
+          REGION: ${{ matrix.region }}
         run: |
-          SECS='${{ github.event.inputs.duration_secs || '600' }}'
-          OVERRIDE='${{ github.event.inputs.base_override }}'
-          REGION='${{ matrix.region }}'
+          case "$SECS" in ''|*[!0-9]*) echo "duration_secs must be a number"; exit 1;; esac
+          case "$OVERRIDE" in *[!0-9]*) echo "base_override must be a number"; exit 1;; esac
           # Disjoint seed windows that never repeat across runs: runs are
           # 1e8 seeds apart and regions 1e7, and a region explores far fewer.
           if [ -n "$OVERRIDE" ]; then
@@ -90,6 +96,9 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Download the regions' logs

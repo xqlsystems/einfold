@@ -63,8 +63,10 @@ for log in "${logs[@]}"; do
     env_line=$(grep -m1 '^ENV ' "$log" 2>/dev/null || true)
   fi
 
-  base=$(grep -m1 '^SOAK start' "$log" 2>/dev/null | sed -n 's/.*base=\([0-9]*\).*/\1/p')
-  iters=$(grep -m1 '^SOAK done' "$log" 2>/dev/null | sed -n 's/.*iters=\([0-9]*\).*/\1/p')
+  # A soak that hung or was cut short has no `SOAK done` line, and its
+  # failures must still be reported: a missing line is no error.
+  base=$(grep -m1 '^SOAK start' "$log" 2>/dev/null | sed -n 's/.*base=\([0-9]*\).*/\1/p' || true)
+  iters=$(grep -m1 '^SOAK done' "$log" 2>/dev/null | sed -n 's/.*iters=\([0-9]*\).*/\1/p' || true)
   region_summary+="- \`$(basename "$log")\`: base=${base:-?}, iters=${iters:-?}, failures=${n}"$'\n'
 
   if [ "$n" -gt 0 ] && [ "$block_count" -lt "$MAX_BLOCKS" ]; then

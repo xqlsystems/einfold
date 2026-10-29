@@ -327,8 +327,9 @@ impl Session for LeanSession<'_> {
     }
 }
 
-/// The largest table [`localize`] copies, in bytes: xarray-sql's bound for
-/// the datasets it keeps as in-memory tables.
+/// The largest table [`localize`] copies, in bytes: the bound under which
+/// xarray-sql, an XQL Systems project for querying xarray datasets with SQL,
+/// keeps a dataset as an in-memory table.
 const COPIED_BYTES: usize = 64 << 20;
 
 /// Which table a scan reads, as far as a plan says.

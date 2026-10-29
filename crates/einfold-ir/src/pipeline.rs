@@ -5,40 +5,45 @@
 //! A fold pipeline: a fold (the *producer*) whose results another fold (the
 //! *consumer*) reads through an expression.
 //!
-//! The consumer here is a softmax-weighted average: each producer group's
-//! value `p` becomes a *score*, the score a weight `exp(score)`, and the
-//! consumer averages a third relation's values (the *values* operand) with
-//! those weights, over the producer's outputs that it sums away. Causal
-//! attention is one:
+//! Hosts compute the producer in full before the consumer reads it. When
+//! every producer group is a consumer group paired with values of
+//! dimensions the consumer sums away, the two can instead be computed
+//! together, one tile of producer groups at a time, each folded into the
+//! consumer's state as soon as it is complete and then dropped, so the
+//! producer's results never exist in full. That condition is all fusion
+//! needs; nothing in it is specific to one query.
+//!
+//! The consumers this module describes are weighted averages whose weights
+//! are exponentials of the producer's values, a softmax: each producer
+//! group's value `p` becomes a *score* (`p`, `p * c` or `p / c`), the score
+//! a weight `exp(score)`, optionally shifted, and the consumer averages a
+//! third relation's values (the *values* operand) with those weights, over
+//! the producer's outputs that it sums away:
 //!
 //! ```sql
-//! WITH scores AS (                                  -- the producer
-//!   SELECT q.t AS i, k.t AS j, SUM(q.x * k.x) / 8.0 AS s
-//!   FROM q JOIN k ON q.d = k.d AND q.t >= k.t
-//!   GROUP BY q.t, k.t),
-//! weights AS (
-//!   SELECT i, j, exp(s - MAX(s) OVER (PARTITION BY i)) AS w FROM scores),
-//! norm AS (SELECT i, SUM(w) AS z FROM weights GROUP BY i)
-//! SELECT weights.i, v.d, SUM(weights.w * v.x) / norm.z   -- the consumer
-//! FROM weights JOIN v ON weights.j = v.t JOIN norm ON weights.i = norm.i
-//! GROUP BY weights.i, v.d, norm.z
+//! WITH p AS (SELECT <kept>, <summed>, <fold> AS s FROM … GROUP BY <kept>, <summed>),
+//! w AS (SELECT <kept>, <summed>, exp(s) AS w FROM p)
+//! SELECT <kept>, <the values' own keys>, SUM(w.w * v.y) / SUM(w.w)
+//! FROM w JOIN values v ON w.<summed> = v.<summed>
+//! GROUP BY <kept>, <the values' own keys>
 //! ```
 //!
-//! So is a Gaussian-kernel weighted average, `SUM(exp(-dist² / h²) * y) /
-//! SUM(exp(-dist² / h²))`, where the producer computes `dist²`.
+//! Many queries have this shape:
+//!
+//! - attention, where the producer is `SUM(q.x * k.x)` over a feature, the
+//!   kept output a query, and the summed output a key;
+//! - a kernel smoother, such as the Nadaraya–Watson estimator used in
+//!   regridding, where the score is `-dist²/h²` between a target and a
+//!   source point, and the average is of the sources' values (its producer
+//!   isn't a sum of products, which [`Pipeline::try_new`] requires);
+//! - a softmax over a recommender's scores, averaging items' features.
 //!
 //! **Dimensions.** A pipeline's dimensions are its producer's, then its
-//! own: dimensions that only the values operand holds, such as attention's
-//! `d`. Each of the producer's outputs is either *kept*, an output of the
-//! pipeline too (attention's `i`), or *summed* by the consumer (`j`). The
-//! values operand is joined with the producer's groups on the producer's
-//! outputs it holds, compared as each dimension's [`KeyEquality`] says.
-//!
-//! **Why it can be fused.** Every producer group is a consumer group paired
-//! with values of dimensions the consumer sums away, so the producer can be
-//! computed one tile of groups at a time, each folded into the consumer's
-//! state as soon as it is complete, and dropped: the producer's results
-//! never exist in full.
+//! own: dimensions that only the values operand holds, such as a feature of
+//! the values. Each of the producer's outputs is either *kept*, an output of
+//! the pipeline too, or *summed* by the consumer. The values operand is
+//! joined with the producer's groups on the producer's outputs it holds,
+//! compared as each dimension's [`KeyEquality`] says.
 //!
 //! [`KeyEquality`]: crate::KeyEquality
 
@@ -128,8 +133,8 @@ pub enum Shift {
 #[non_exhaustive]
 pub enum Normalizer {
     /// The sum of the weights of every producer group with the output's kept
-    /// keys, whether or not it joined a row of the values operand: demo 1's
-    /// `norm` CTE, joined on the kept outputs.
+    /// keys, whether or not it joined a row of the values operand: a `norm`
+    /// relation of `SUM(w) … GROUP BY <kept>`, joined on the kept outputs.
     KeptGroups,
     /// The sum of the weights of the joined rows of the output's own group:
     /// `SUM(w * y) / SUM(w)` in one aggregate.

@@ -33,9 +33,18 @@
 //! flattened into one position, and every operand is placed in a dense
 //! matrix. For each tile of X positions, on one thread, the J positions are
 //! visited in tiles, in order. Each pair of tiles computes its block of
-//! producer values with a matrix product over E, turns them into scores and
-//! weights, and folds the weights into the tile's state, then the next pair
-//! reuses the block. Memory beyond inputs and output is one block per thread.
+//! producer values, turns them into scores and weights, and folds the
+//! weights into the tile's state, then the next pair reuses the block.
+//! Memory beyond inputs and output is one block per thread.
+//!
+//! **The producer's block.** A `SUM` of products is a matrix product over E.
+//! A `SUM` of a row expression, such as a Gaussian kernel's `-dist²` between
+//! a target and a source point, is the expression evaluated over the block's
+//! pairs at each E position, summed in position order; with no E dimension,
+//! it is the expression itself, with each pair's bits as SQL computes them.
+//! Its columns are placed as a product's factors are, so each pair has
+//! exactly one row: two would be two weights `exp(s)` in SQL, not one
+//! `exp(2s)`.
 //!
 //! **The scaled accumulator.** A row's state is `(m, z, a[y])`: a shift `m`,
 //! the sum of its weights `z = Σ exp(s − m)`, and the weighted sums `a[y] =
@@ -58,14 +67,14 @@
 //! position has no rows in the output, as in SQL.
 //!
 //! **When SQL and dense arrays agree.** Every operand must be complete: one
-//! row at every position of its dimensions, and no NULL factors. Then every
+//! row at every position of its dimensions, and no NULL in a column read. Then every
 //! producer group exists unless masked, both [`Normalizer`]s agree, and NaN
 //! and infinities propagate as SQL's arithmetic does. Otherwise the caller
 //! runs something else, such as the host's plan.
 //!
 //! **Determinism.** Tiles are fixed by the shape, each X tile is computed by
 //! one thread, J tiles are visited in order, and each tile's matrix products
-//! are the same calls, on the same shapes, on every run. So the bits don't
+//! and expressions are the same calls, on the same shapes, on every run. So the bits don't
 //! depend on the number of threads nor on the order in which rows arrive.
 //! They can differ between machines, as the matrix product picks its
 //! kernel, with or without fused multiply-adds, by the CPU's features.
@@ -77,9 +86,12 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::compute;
 use arrow::datatypes::SchemaRef;
-use einfold_ir::{Comparison, DimensionId, Operand, Pipeline, Shift};
+use einfold_ir::{
+    ColumnIndex, Comparison, DimensionId, Expression, Operand, Pipeline, RowValue, Shift,
+};
 
 use crate::dense;
+use crate::expression::{self, Lanes};
 use crate::gemm::{self, Matrix};
 use crate::Result;
 
@@ -105,6 +117,20 @@ struct Placement<'a> {
     batches: &'a [RecordBatch],
     rows: &'a [usize],
     columns: &'a [usize],
+    /// The column placed.
+    column: ColumnIndex,
+}
+
+/// How a pair of tiles computes its block of producer values.
+enum Scores<'a> {
+    /// A product's: `q [x][e]` times `kt [e][j]`.
+    Product { q: &'a [f64], kt: &'a [f64] },
+    /// A row expression's, from the columns it reads, each placed as `q`'s
+    /// or `kt`'s factor would be, by its operand, summed over E.
+    Expression {
+        e: &'a Expression,
+        columns: Vec<((usize, ColumnIndex), &'a [f64])>,
+    },
 }
 
 /// `pipeline` over its operands `q`, `k` and values `v`, by the fused
@@ -170,28 +196,58 @@ pub(crate) fn pipeline(
         mask.push(condition);
     }
 
-    // Each batch's keys as positions, and each dimension's extent.
-    let placements = [
-        Placement {
-            operand: op_q,
-            batches: q,
-            rows: &xs,
-            columns: &es,
+    // The producer's columns: each operand's factor for a product, or every
+    // column its expression reads.
+    let read: Vec<(usize, ColumnIndex)> = match producer.row() {
+        RowValue::Product => match (op_q.factor, op_k.factor) {
+            (Some(a), Some(b)) => vec![(0, a), (1, b)],
+            _ => return Ok(None),
         },
-        // k is placed transposed, [e][j], so that the scores are q · k.
-        Placement {
-            operand: op_k,
-            batches: k,
-            rows: &es,
-            columns: &js,
-        },
-        Placement {
-            operand: values,
-            batches: v,
-            rows: &js,
-            columns: &ys,
-        },
-    ];
+        RowValue::Expression(e) => {
+            let mut read = e.columns();
+            read.sort();
+            read.dedup();
+            // Only the operands an expression reads are placed, and placing
+            // an operand is what checks that it has every row. One that
+            // reads neither operand, or one only, isn't this algorithm's.
+            if !(0..2).all(|o| read.iter().any(|&(operand, _)| operand == o)) {
+                return Ok(None);
+            }
+            read
+        }
+        _ => return Ok(None),
+    };
+    let Some(factor) = values.factor else {
+        return Ok(None);
+    };
+    // Each batch's keys as positions, and each dimension's extent. q's
+    // columns are placed [x][e], and k's transposed, [e][j], so that a
+    // product's scores are q · k; the values [j][y], last.
+    let mut placements: Vec<Placement> = (read.iter())
+        .map(|&(o, column)| match o {
+            0 => Placement {
+                operand: op_q,
+                batches: q,
+                rows: &xs,
+                columns: &es,
+                column,
+            },
+            _ => Placement {
+                operand: op_k,
+                batches: k,
+                rows: &es,
+                columns: &js,
+                column,
+            },
+        })
+        .collect();
+    placements.push(Placement {
+        operand: values,
+        batches: v,
+        rows: &js,
+        columns: &ys,
+        column: factor,
+    });
     let mut extent = vec![0usize; n];
     let mut all_keys = Vec::new();
     for p in &placements {
@@ -232,9 +288,22 @@ pub(crate) fn pipeline(
         };
         matrices.push(matrix);
     }
-    let [q, kt, v] = &matrices[..] else {
-        unreachable!("three placements");
+    let v = matrices.pop().expect("the values' placement");
+    let scores = match producer.row() {
+        RowValue::Expression(e) => Scores::Expression {
+            e,
+            columns: read
+                .iter()
+                .copied()
+                .zip(matrices.iter().map(Vec::as_slice))
+                .collect(),
+        },
+        _ => Scores::Product {
+            q: &matrices[0],
+            kt: &matrices[1],
+        },
     };
+    let v = &v;
     if nx
         .checked_mul(ny)
         .is_none_or(|cells| cells >= u32::MAX as usize)
@@ -264,7 +333,7 @@ pub(crate) fn pipeline(
     };
     let (x_tiles, j_tiles) = (nx.div_ceil(XT), nj.div_ceil(JT));
     let tiles = dense::par_tasks(x_tiles, threads, |t| {
-        tile(pipeline, t, (nx, ne, nj, ny), [q, kt, v], &allowed)
+        tile(pipeline, t, (nx, ne, nj, ny), (&scores, v), &allowed)
     });
     let tiles_visited = tiles.iter().map(|t| t.visited).sum();
 
@@ -318,8 +387,8 @@ pub(crate) fn pipeline(
     }))
 }
 
-/// `p`'s rows as a dense `rows × columns` matrix of its factors, or `None`
-/// unless it has exactly one row, with a non-NULL factor, at every position.
+/// `p`'s rows as a dense `rows × columns` matrix of its column, or `None`
+/// unless it has exactly one row, with a non-NULL value, at every position.
 fn place(
     p: &Placement,
     keys: &[Vec<(usize, Int64Array)>],
@@ -334,7 +403,6 @@ fn place(
     if total != cells || cells >= u32::MAX as usize {
         return None;
     }
-    let factor = p.operand.factor?;
     let positions = dense::par_tasks(p.batches.len(), threads, |i| {
         let n = p.batches[i].num_rows();
         let row = dense::positions(&keys[i], p.rows, extent, n);
@@ -345,7 +413,7 @@ fn place(
     let mut held = vec![false; cells];
     for (batch, (row, column)) in p.batches.iter().zip(&positions) {
         let factors = batch
-            .column(factor.0)
+            .column(p.column.0)
             .as_any()
             .downcast_ref::<Float64Array>()?;
         if factors.null_count() > 0 {
@@ -370,13 +438,13 @@ struct Tile {
     visited: usize,
 }
 
-/// X tile `t` of `pipeline`, from `q [x][e]`, `kt [e][j]` and `v [j][y]`,
-/// with `allowed(x)` the interval of J positions that position `x` may join.
+/// X tile `t` of `pipeline`, from its `scores` and `v [j][y]`, with
+/// `allowed(x)` the interval of J positions that position `x` may join.
 fn tile(
     pipeline: &Pipeline,
     t: usize,
     (nx, ne, nj, ny): (usize, usize, usize, usize),
-    [q, kt, v]: [&[f64]; 3],
+    (scores, v): (&Scores, &[f64]),
     allowed: &(impl Fn(usize) -> (usize, usize) + Sync),
 ) -> Tile {
     let (x0, x1) = (t * XT, ((t + 1) * XT).min(nx));
@@ -403,17 +471,47 @@ fn tile(
         visited += 1;
         let full = spans.iter().all(|&span| span == (0, width));
         let block = &mut block[..rows * width];
-        block.fill(0.0);
-        // The producer's values for the pair: q[x0..x1] · kt[.., j0..j0+width].
-        let q_tile = Matrix {
-            data: &q[x0 * ne..],
-            stride: ne,
-        };
-        let k_tile = Matrix {
-            data: &kt[j0..],
-            stride: nj,
-        };
-        gemm::multiply_add((rows, ne, width), q_tile, k_tile, block, width);
+        match scores {
+            // The producer's values for the pair: q[x0..x1] · kt[.., j0..j0+width].
+            Scores::Product { q, kt } => {
+                block.fill(0.0);
+                let q_tile = Matrix {
+                    data: &q[x0 * ne..],
+                    stride: ne,
+                };
+                let k_tile = Matrix {
+                    data: &kt[j0..],
+                    stride: nj,
+                };
+                gemm::multiply_add((rows, ne, width), q_tile, k_tile, block, width);
+            }
+            // The expression over the pair's rows at each E position, summed
+            // in position order.
+            Scores::Expression { e, columns } => {
+                for at in 0..ne {
+                    let lanes = |o: usize, c: ColumnIndex| {
+                        let (_, m) = (columns.iter())
+                            .find(|(read, _)| *read == (o, c))
+                            .expect("every column read is placed");
+                        match o {
+                            0 => Lanes::Rows((x0..x1).map(|x| m[x * ne + at]).collect()),
+                            _ => Lanes::Columns(m[at * nj + j0..at * nj + j0 + width].to_vec()),
+                        }
+                    };
+                    // The first position replaces the block's, and the rest
+                    // add to it.
+                    let write = match at {
+                        0 => expression::Write::Replace,
+                        _ => expression::Write::Add,
+                    };
+                    expression::evaluate(e, (rows, width), &lanes).write(
+                        (rows, width),
+                        block,
+                        write,
+                    );
+                }
+            }
+        }
         for (r, &(lo, hi)) in spans.iter().enumerate() {
             if lo >= hi {
                 continue;

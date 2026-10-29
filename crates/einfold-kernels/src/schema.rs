@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use einfold_ir::{ColumnIndex, DimensionId, Fold, Key, Pipeline};
+use einfold_ir::{ColumnIndex, DimensionId, Fold, Key, Pipeline, RowValue};
 
 use crate::{bad, Result};
 
@@ -28,6 +28,15 @@ use crate::{bad, Result};
 /// and every column of one dimension, in the operands and the domain, has one
 /// type, so that keys compare as the SQL join would, without a cast.
 pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Result<SchemaRef> {
+    if !fold.is_einsum() {
+        return bad("EinFold computes SUM of products only".into());
+    }
+    fold_schema(fold, operands, domain)
+}
+
+/// [`schema`] for a `SUM` of products or of a row expression, whose columns
+/// must then be `Float64`.
+fn fold_schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Result<SchemaRef> {
     if fold.operands().len() != 2 || operands.len() != 2 {
         return bad(format!(
             "EinFold computes folds of two operands, not {}",
@@ -37,8 +46,8 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
     if fold.domain().is_some() != domain.is_some() {
         return bad("a domain relation must be given exactly when the fold has a domain".into());
     }
-    if !fold.is_einsum() {
-        return bad("EinFold computes SUM of products only".into());
+    if !fold.aggregate().is_sum() {
+        return bad("EinFold computes SUM only".into());
     }
     let field = |schema: &Schema, ColumnIndex(col): ColumnIndex| -> Result<Field> {
         match schema.fields().get(col) {
@@ -51,17 +60,26 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
     };
     // Each dimension's type and nullability, from the first operand holding it.
     let mut types: Vec<Option<Field>> = vec![None; fold.dimensions().len()];
-    for (op, schema) in fold.operands().iter().zip(operands) {
-        let Some(factor) = op.factor else {
-            return bad("EinFold doesn't compute masks yet".into());
-        };
-        let factor = field(schema, factor)?;
-        if factor.data_type() != &DataType::Float64 {
+    let values: Vec<(usize, ColumnIndex)> = match fold.row() {
+        RowValue::Product => (fold.operands().iter().enumerate())
+            .map(|(o, op)| match op.factor {
+                Some(f) => Ok((o, f)),
+                None => bad("EinFold doesn't compute masks yet".into()),
+            })
+            .collect::<Result<_>>()?,
+        RowValue::Expression(e) => e.columns(),
+        _ => return bad("EinFold computes products and row expressions only".into()),
+    };
+    for (o, c) in values {
+        let value = field(operands[o], c)?;
+        if value.data_type() != &DataType::Float64 {
             return bad(format!(
-                "EinFold factors must be Float64, not {}",
-                factor.data_type()
+                "EinFold's values must be Float64, not {}",
+                value.data_type()
             ));
         }
+    }
+    for (op, schema) in fold.operands().iter().zip(operands) {
         for &Key {
             dimension: d,
             column: col,
@@ -125,11 +143,13 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
 /// per output, typed as the dimension's columns are, then the average, a
 /// nullable `Float64`. Columns are named by position, as [`schema`]'s are.
 ///
-/// Fails unless the producer's schema is valid (see [`schema`]), the values
-/// operand's columns exist, its factor is `Float64`, and each of its keys has
-/// the type of its dimension's other columns.
+/// Fails unless the producer is valid: a `SUM` of products whose schema is
+/// valid (see [`schema`]), or a `SUM` of a row expression whose columns are
+/// all `Float64`. Fails too unless the values operand's columns exist, its
+/// factor is `Float64`, and each of its keys has the type of its dimension's
+/// other columns.
 pub fn pipeline_schema(pipeline: &Pipeline, inputs: &[&Schema; 3]) -> Result<SchemaRef> {
-    let producer = schema(pipeline.producer(), &inputs[..2], None)?;
+    let producer = fold_schema(pipeline.producer(), &inputs[..2], None)?;
     let values = pipeline.values();
     let column = |ColumnIndex(c): ColumnIndex| match inputs[2].fields().get(c) {
         Some(f) => Ok(f.as_ref().clone()),

@@ -891,7 +891,7 @@ fn declines_where_a_rescale_meets_an_overflowed_sum() {
             normalizer,
         )
         .unwrap();
-        let batches = |t: &Table| t.partitions(&mut Rng::new(1)).concat();
+        let batches = |t: &Table| t.partitions(&mut Rng::seeded(1, 0)).concat();
         let (bq, bk, bv) = (batches(&q), batches(&k), batches(&v));
         let schemas = [q.schema.as_ref(), k.schema.as_ref(), v.schema.as_ref()];
         let schema = einfold_kernels::pipeline_schema(&pipeline, &schemas).unwrap();

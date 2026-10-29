@@ -150,7 +150,14 @@ pub(crate) fn pipeline(
     let mask = match producer.conditions() {
         [] => None,
         [c] => match (&xs[..], &js[..]) {
-            ([x], [j]) if (c.left.0, c.right.0) == (*x, *j) => Some(c.comparison),
+            // The four comparisons `allowed` knows; one added later declines.
+            ([x], [j]) if (c.left.0, c.right.0) == (*x, *j) => match c.comparison {
+                Comparison::Less
+                | Comparison::LessOrEqual
+                | Comparison::Greater
+                | Comparison::GreaterOrEqual => Some(c.comparison),
+                _ => return Ok(None),
+            },
             ([x], [j]) if (c.left.0, c.right.0) == (*j, *x) => match c.comparison {
                 Comparison::Less => Some(Comparison::Greater),
                 Comparison::LessOrEqual => Some(Comparison::GreaterOrEqual),

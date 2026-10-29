@@ -33,7 +33,8 @@
 //! - attention, where the producer is `SUM(q.x * k.x)` over a feature, the
 //!   kept output a query, and the summed output a key;
 //! - a kernel smoother, such as the Nadaraya–Watson estimator used in
-//!   regridding, where the score is `-dist²/h²` between a target and a
+//!   regridding (resampling values from one set of points onto another),
+//!   where the score is `-dist²/h²` between a target and a
 //!   source point, and the average is of the sources' values (its producer
 //!   isn't a sum of products, which [`Pipeline::try_new`] requires);
 //! - a softmax over a recommender's scores, averaging items' features.
@@ -122,9 +123,12 @@ pub enum Shift {
     None,
     /// The largest score among the kept outputs' groups, in SQL `exp(s -
     /// MAX(s) OVER (PARTITION BY <kept>))`, or `MAX(s) … GROUP BY <kept>`
-    /// joined back. It cancels between the average's numerator and its
-    /// normalizer, so it changes no result beyond rounding, and keeps every
-    /// weight at most 1.
+    /// joined back. It keeps every weight at most 1, and cancels between the
+    /// average's numerator and its normalizer while the unshifted weights
+    /// and their sums are finite and normal, changing the result only by
+    /// rounding there. Outside that range they differ: where `exp(score)`
+    /// overflows, the unshifted average is NaN (`inf / inf`) and the shifted
+    /// one finite. So the two shifts aren't interchangeable.
     KeptMaximum,
 }
 

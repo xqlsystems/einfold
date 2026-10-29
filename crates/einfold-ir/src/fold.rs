@@ -41,8 +41,9 @@
 //! A fold may also have a **domain**: a relation that the output is
 //! left-joined from, so that the output has one row per domain row (see
 //! [`Domain`]), and **conditions**: comparisons between dimensions that a
-//! joined row must meet, such as causal attention's `q.t >= k.t` (see
-//! [`Condition`]).
+//! joined row must meet, such as causal attention's `q.t >= k.t`, under
+//! which a query position may use a key only if the key isn't at a later
+//! position (see [`Condition`]).
 //!
 //! Indices into a fold's dimensions and into its inputs' columns have types
 //! of their own, [`DimensionId`] and [`ColumnIndex`], so that one can't be

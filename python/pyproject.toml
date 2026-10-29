@@ -10,10 +10,21 @@ build-backend = "maturin"
 name = "einfold"
 description = "Array algorithms for tensor computations written in SQL: matrix products, contractions and attention, run fast inside your SQL engine"
 requires-python = ">=3.10"
-version = "0.0.0"
+version = "0.1.0rc1"
 license = "Apache-2.0"
 readme = "README.md"
 dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Source = "https://github.com/xqlsystems/einfold"
+Issues = "https://github.com/xqlsystems/einfold/issues"
 
 [project.optional-dependencies]
 # The FFI that einfold's DataFusion extension speaks is DataFusion 55's.

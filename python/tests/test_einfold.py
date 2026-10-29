@@ -382,3 +382,42 @@ def test_explains_the_plan_einfold_runs():
     assert len(verbose) > 2 and "physical_plan" in verbose
     analyzed = "\n".join(on.sql("EXPLAIN ANALYZE " + MATMUL).to_pydict()["plan"])
     assert "dense_folds=1" in analyzed
+
+
+_SCORES = ("scores AS (SELECT q.t AS i, k.t AS j, SUM(q.x * k.x) / 8.0 AS s "
+           "FROM q JOIN k ON q.d = k.d{mask} GROUP BY q.t, k.t)")
+_SOFTMAX = "weights AS (SELECT i, j, exp(s - MAX(s) OVER (PARTITION BY i)) AS w FROM scores)"
+_SIGMOID = "weights AS (SELECT i, j, 1.0 / (1.0 + exp(-s)) AS w FROM scores)"
+
+
+def _average(weights, mask=""):
+    return (f"WITH {_SCORES.format(mask=mask)}, {weights}, "
+            "norm AS (SELECT i, SUM(w) AS z FROM weights GROUP BY i) "
+            "SELECT weights.i AS t, v.d, SUM(weights.w * v.x) / norm.z AS x "
+            "FROM weights JOIN v ON weights.j = v.t JOIN norm ON weights.i = norm.i "
+            "GROUP BY weights.i, v.d, norm.z")
+
+
+@pytest.mark.parametrize("sql", [
+    # Attention under a sliding window, spelled as a difference and with abs.
+    _average(_SOFTMAX, " WHERE q.t >= k.t AND q.t - k.t < 16"),
+    _average(_SOFTMAX, " WHERE abs(q.t - k.t) <= 8"),
+    # Weights other than a softmax's: a sigmoid of the scores, averaged.
+    _average(_SIGMOID),
+    # The scores themselves, summed with no normalizer: two matrix products.
+    (f"WITH {_SCORES.format(mask='')} SELECT scores.i AS t, v.d, SUM(scores.s * v.x) AS x "
+     "FROM scores JOIN v ON scores.j = v.t GROUP BY scores.i, v.d"),
+    # A Gaussian kernel smoother: weights of the distance between two points,
+    # over a cross join.
+    ("WITH weights AS (SELECT q.t AS i, k.t AS j, exp(-power(q.x - k.x, 2.0) / 0.5) AS w "
+     "FROM q CROSS JOIN k WHERE q.d = 0 AND k.d = 0) "
+     "SELECT weights.i AS t, v.d, SUM(weights.w * v.x) / SUM(weights.w) AS x "
+     "FROM weights JOIN v ON weights.j = v.t GROUP BY weights.i, v.d"),
+], ids=["window", "abs-band", "sigmoid", "chain", "gaussian"])
+def test_fuses_weighted_sums_beyond_attention(sql):
+    """The README's list of what einfold finds: each of these runs as one
+    fused pipeline, with the rows DataFusion gives."""
+    off, on, _ = _pair(_attention_tables)
+    _assert_same(off.sql(sql).to_arrow_table(), on.sql(sql).to_arrow_table())
+    analyzed = "\n".join(on.sql("EXPLAIN ANALYZE " + sql).to_pydict()["plan"])
+    assert "fused_pipelines=1" in analyzed, analyzed

@@ -43,11 +43,11 @@
 //! - **`[swap]`** swapping the operands gives the same values within the
 //!   bound. The dense algorithm treats its operands differently (only `b` may
 //!   have holes), so this crosses its conditions;
-//! - **`[hash]`** one row of `b` that joins nothing (a negative key) moves the
-//!   fold to the hash algorithm, which must give the oracle's rows;
+//! - **`[discriminate]`** one row of `b` that joins nothing (a negative key) moves the
+//!   fold to the discrimination algorithm, which must give the oracle's rows;
 //! - **`[duplicates]`** a repeated row of `a` or `b` moves the fold to the
-//!   hash algorithm, which must sum it twice, as the oracle does;
-//! - **`[sparse]`** a sparse case runs the hash algorithm and gives the
+//!   discrimination algorithm, which must sum it twice, as the oracle does;
+//! - **`[sparse]`** a sparse case runs the discrimination algorithm and gives the
 //!   oracle's rows;
 //! - **`[domain]`** each domain row gets exactly its group's bits from the same
 //!   fold without a domain, or the default;
@@ -736,7 +736,7 @@ fn check(seed: u64, stats: &mut Stats) -> Result<(), String> {
     // [sparse]
     if case.sparse {
         stats.sparse += 1;
-        if first.algorithm != Algorithm::Hash {
+        if first.algorithm != Algorithm::Discriminate {
             return Err("[sparse] the dense algorithm ran on a sparse case".into());
         }
         return Ok(());
@@ -901,15 +901,18 @@ fn check(seed: u64, stats: &mut Stats) -> Result<(), String> {
         }
     }
 
-    // [hash]: one row of b that joins nothing.
+    // [discriminate]: one row of b that joins nothing.
     let mut extra = case.clone();
     extra.b.keys.push(vec![-1; extra.b.dims.len()]);
     extra.b.values.push(Some(1.0));
-    let hashed = run(&extra, &mut rng, &int64, false, true, Mode::Best).expect("runs");
-    if hashed.algorithm != Algorithm::Hash {
-        return Err("[hash] a negative key didn't move the fold to the hash algorithm".into());
+    let discriminated = run(&extra, &mut rng, &int64, false, true, Mode::Best).expect("runs");
+    if discriminated.algorithm != Algorithm::Discriminate {
+        return Err(
+            "[discriminate] a negative key didn't move the fold to the discrimination algorithm"
+                .into(),
+        );
     }
-    matches("hash", &rows(&hashed.batches, keys), &want)?;
+    matches("discriminate", &rows(&discriminated.batches, keys), &want)?;
 
     // [duplicates]: a repeated row of a or b.
     if dense {
@@ -923,7 +926,7 @@ fn check(seed: u64, stats: &mut Stats) -> Result<(), String> {
         side.keys.push(side.keys[r].clone());
         side.values.push(Some(0.5));
         let ran = run(&dup, &mut rng, &int64, false, true, Mode::Best).expect("runs");
-        if ran.algorithm != Algorithm::Hash {
+        if ran.algorithm != Algorithm::Discriminate {
             return Err("[duplicates] a repeated key tuple stayed on the dense algorithm".into());
         }
         matches(
@@ -980,7 +983,7 @@ fn dense_metamorphic() {
             ("the unique check accepted", stats.unique_accepted > 0),
             ("the unique check declined", stats.unique_declined > 0),
             ("a domain had NULL keys", stats.null_domain_keys > 0),
-            ("a duplicate moved to hash", stats.duplicates > 0),
+            ("a duplicate moved to discrimination", stats.duplicates > 0),
             ("a sparse case ran", stats.sparse > 0),
         ];
         for (what, ok) in reached {

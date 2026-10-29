@@ -3,8 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! [`multiply_add`]: matrix products for tiles that fit in cache, by
-//! `matrixmultiply` through `ndarray`'s safe interface. It picks AVX2 and FMA
-//! kernels at run time when the CPU has them.
+//! [`matrixmultiply`](https://docs.rs/matrixmultiply), a Rust crate of dense
+//! matrix products, through the safe interface of
+//! [`ndarray`](https://docs.rs/ndarray), Rust's n-dimensional arrays. It
+//! picks kernels using AVX2 and FMA, x86's 256-bit vector and fused
+//! multiply-add instructions, at run time when the CPU has them.
 
 /// A matrix in a slice, row-major, with `stride` elements from one row's
 /// start to the next.

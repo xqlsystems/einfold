@@ -67,7 +67,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::compute;
 use arrow::datatypes::SchemaRef;
 use einfold_ir::{Comparison, DimensionId, Operand, Pipeline, Shift};
@@ -135,6 +135,12 @@ pub(crate) fn pipeline(
         }
     }
     let ys: Vec<usize> = (own..n).collect();
+    // The output has a row for each position of the pipeline's own
+    // dimensions, so one left out of the outputs, to be summed away, isn't
+    // this algorithm's.
+    if !ys.iter().all(|&d| output(d)) {
+        return Ok(None);
+    }
     // A condition between the one X and the one J dimension, as `x <op> j`.
     let mask = match producer.conditions() {
         [] => None,
@@ -299,6 +305,8 @@ fn place(
     (rows, columns): (usize, usize),
     threads: usize,
 ) -> Option<Vec<f64>> {
+    use arrow::array::Array;
+
     let cells = rows.checked_mul(columns)?;
     let total: usize = p.batches.iter().map(|b| b.num_rows()).sum();
     if total != cells || cells >= u32::MAX as usize {

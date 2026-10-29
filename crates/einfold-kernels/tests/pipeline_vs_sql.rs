@@ -522,3 +522,68 @@ fn causal_masks_skip_half_the_tiles() {
     assert_eq!(rows.len(), l);
     assert!(rows.iter().all(|(_, x)| (x.unwrap() - 1.0).abs() < 1e-12));
 }
+
+/// A pipeline may leave one of its own dimensions out of its outputs, to be
+/// summed away: `SELECT i, SUM(w * v.x) / norm.z ... GROUP BY i` over values
+/// keyed by `(t, c)`. The fused algorithm writes a row for each position of
+/// its own dimensions, so it declines such a pipeline, and the caller runs
+/// SQL's plan instead.
+#[test]
+fn declines_a_pipeline_that_sums_its_own_dimension_away() {
+    let q = Table::complete(&["t", "d"], &[4, 2], || 0.5);
+    let k = Table::complete(&["t", "d"], &[4, 2], || 0.25);
+    let v = Table::complete(&["t", "c"], &[4, 3], || 1.0);
+    const EQ: Dimension = Dimension {
+        equality: KeyEquality::Equal,
+    };
+    let key = |d, c| Key::new(DimensionId(d), ColumnIndex(c));
+    let out = |d| Output {
+        dimension: DimensionId(d),
+        domain_key: None,
+    };
+    let ops = vec![
+        Operand {
+            keys: vec![key(0, 0), key(1, 1)],
+            factor: Some(ColumnIndex(2)),
+        },
+        Operand {
+            keys: vec![key(2, 0), key(1, 1)],
+            factor: Some(ColumnIndex(2)),
+        },
+    ];
+    let producer = Fold::try_new(
+        vec![EQ; 3],
+        ops,
+        vec![out(0), out(2)],
+        RowValue::Product,
+        Aggregate::sum(),
+        None,
+    )
+    .unwrap();
+    let values = Operand {
+        keys: vec![key(2, 0), key(3, 1)],
+        factor: Some(ColumnIndex(2)),
+    };
+    // Dimension 3, `v.c`, is the pipeline's own, and not an output.
+    let pipeline = Pipeline::try_new(
+        producer,
+        Scale::One,
+        Shift::KeptMaximum,
+        vec![EQ],
+        values,
+        vec![DimensionId(0)],
+        Normalizer::KeptGroups,
+    )
+    .unwrap();
+    let batches = |t: &Table| t.partitions(&mut Rng::new(1)).concat();
+    let (bq, bk, bv) = (batches(&q), batches(&k), batches(&v));
+    let schemas = [q.schema.as_ref(), k.schema.as_ref(), v.schema.as_ref()];
+    let schema = einfold_kernels::pipeline_schema(&pipeline, &schemas).unwrap();
+    let inputs = [
+        Relation::new(&q.schema, &bq),
+        Relation::new(&k.schema, &bk),
+        Relation::new(&v.schema, &bv),
+    ];
+    let piped = einfold_kernels::pipeline(&pipeline, inputs, schema, Options::default()).unwrap();
+    assert!(piped.is_none());
+}

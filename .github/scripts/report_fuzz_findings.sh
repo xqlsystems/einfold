@@ -67,7 +67,18 @@ for log in "${logs[@]}"; do
   # failures must still be reported: a missing line is no error.
   base=$(grep -m1 '^SOAK start' "$log" 2>/dev/null | sed -n 's/.*base=\([0-9]*\).*/\1/p' || true)
   iters=$(grep -m1 '^SOAK done' "$log" 2>/dev/null | sed -n 's/.*iters=\([0-9]*\).*/\1/p' || true)
-  region_summary+="- \`$(basename "$log")\`: base=${base:-?}, iters=${iters:-?}, failures=${n}"$'\n'
+  # A soak that ended without its summary crashed, say on a segfault or a
+  # panic outside a case, whether or not it recorded failures first: that's a
+  # finding too. The watchdog's hang reports, `[stall]` or a failure whose
+  # shrinking hung, already explain a missing summary. The region's summary
+  # line says so even when the samples are full.
+  crashed=""
+  if ! grep -q '^SOAK done' "$log" 2>/dev/null &&
+    ! grep -qE '^\[stall\]|a try at shrinking it ran for more than' "$log" 2>/dev/null; then
+    crashed=", crashed"
+    total=$((total + 1))
+  fi
+  region_summary+="- \`$(basename "$log")\`: base=${base:-?}, iters=${iters:-?}, failures=${n}${crashed}"$'\n'
 
   if [ "$n" -gt 0 ] && [ "$block_count" -lt "$MAX_BLOCKS" ]; then
     # Extract each FAILURE block: the header plus its report lines, stopping at
@@ -93,18 +104,11 @@ for log in "${logs[@]}"; do
     ' "$log")
   fi
 
-  # A soak that ended without its summary crashed, say on a segfault or a
-  # panic outside a case, whether or not it recorded failures first: that's a
-  # finding too. The watchdog's hang reports, `[stall]` or a failure whose
-  # shrinking hung, already explain a missing summary.
-  if ! grep -q '^SOAK done' "$log" 2>/dev/null &&
-    ! grep -qE '^\[stall\]|a try at shrinking it ran for more than' "$log" 2>/dev/null; then
-    total=$((total + 1))
-    if [ "$block_count" -lt "$MAX_BLOCKS" ]; then
-      blocks+="CRASH ($(basename "$log")): the soak ended without its summary. The log's last lines:"$'\n'
-      blocks+="$(tail -n 20 "$log" | cut -c1-300)"$'\n'
-      block_count=$((block_count + 1))
-    fi
+  # The crash's sample, the log's end, if there is room for one.
+  if [ -n "$crashed" ] && [ "$block_count" -lt "$MAX_BLOCKS" ]; then
+    blocks+="CRASH ($(basename "$log")): the soak ended without its summary. The log's last lines:"$'\n'
+    blocks+="$(tail -n 20 "$log" | cut -c1-300)"$'\n'
+    block_count=$((block_count + 1))
   fi
 done
 

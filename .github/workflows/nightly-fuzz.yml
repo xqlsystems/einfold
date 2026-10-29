@@ -1,0 +1,114 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Nightly simulation soak: einfold's simulation test
+# (crates/einfold-datafusion/tests/simulation.rs :: soak) on fresh seeds, in
+# three disjoint seed regions in parallel, then one GitHub issue filed or
+# updated if any property failed. Modeled on the nightly fuzz of ddx
+# (https://github.com/xqlsystems/ddx), the XQL Systems project for automatic
+# differentiation of SQL queries, whose triage script this shares.
+#
+# 16:00 UTC is 08:00 in California in winter and 09:00 in summer: GitHub's
+# cron doesn't follow daylight saving.
+name: Nightly fuzz
+
+on:
+  schedule:
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      duration_secs:
+        description: 'Soak budget per region, in seconds'
+        required: false
+        default: '600'
+      base_override:
+        description: 'Base seed (blank: derived from the run number)'
+        required: false
+        default: ''
+
+# Only the report job writes issues: the soaks build and run the
+# repository and its dependencies, and need no more than to read it.
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-fuzz
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    name: soak region ${{ matrix.region }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        region: [0, 1, 2]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build the soak
+        run: cargo test -p einfold-datafusion --test simulation --release --no-run
+      - name: Run the soak
+        # Inputs reach the script as variables, never as its text, and must
+        # be numbers, since the shell's arithmetic evaluates what it's given.
+        env:
+          SECS: ${{ github.event.inputs.duration_secs || '600' }}
+          OVERRIDE: ${{ github.event.inputs.base_override }}
+          REGION: ${{ matrix.region }}
+        run: |
+          case "$SECS" in ''|*[!0-9]*) echo "duration_secs must be a number"; exit 1;; esac
+          case "$OVERRIDE" in *[!0-9]*) echo "base_override must be a number"; exit 1;; esac
+          # Disjoint seed windows that never repeat across runs: runs are
+          # 1e8 seeds apart and regions 1e7, and a region explores far fewer.
+          if [ -n "$OVERRIDE" ]; then
+            BASE=$(( OVERRIDE + REGION * 10000000 ))
+          else
+            BASE=$(( GITHUB_RUN_NUMBER * 100000000 + REGION * 10000000 ))
+          fi
+          LOG="$PWD/soak-region-${REGION}.log"
+          echo "ENV rustc=$(rustc --version) os=${RUNNER_OS} sha=${GITHUB_SHA}" > "$LOG"
+          # A failing soak exits non-zero, and so does this step, after
+          # showing the log's end; the report job reads the log either way.
+          set +e
+          EINFOLD_SOAK_SECS="$SECS" EINFOLD_SOAK_BASE="$BASE" EINFOLD_SOAK_LOG="$LOG" \
+            cargo test -p einfold-datafusion --test simulation --release \
+            -- --ignored --nocapture soak
+          status=$?
+          echo "soak exit code: $status"
+          tail -n 12 "$LOG" || true
+          exit "$status"
+      - name: Upload the region's log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: soak-log-${{ matrix.region }}
+          path: soak-region-${{ matrix.region }}.log
+          if-no-files-found: warn
+
+  report:
+    name: triage and file an issue
+    needs: [soak]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Download the regions' logs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: logs
+      - name: Triage, and file or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/report_fuzz_findings.sh logs

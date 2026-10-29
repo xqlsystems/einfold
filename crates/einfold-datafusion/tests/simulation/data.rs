@@ -22,6 +22,7 @@
 //! and batches, empty batches included.
 
 use std::fmt::Write as _;
+use std::ops::Range;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -29,12 +30,13 @@ use datafusion::arrow::array::{
     StringArray, UInt64Array, UInt8Array,
 };
 use datafusion::arrow::buffer::NullBuffer;
+use datafusion::arrow::compute;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 
-use super::rng::Rng;
+use einfold_testkit::Rng;
 
 /// How a dimension's keys are stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,12 +257,23 @@ impl Rows {
 }
 
 /// One table, as batches split into partitions.
+#[derive(Clone)]
 pub struct Table {
     pub name: &'static str,
     pub schema: SchemaRef,
     /// All its rows, for reports.
     pub all: RecordBatch,
+    /// Its batches, as ranges of `all`'s rows, each with its partition, in
+    /// the order the partitions hold them. Some are empty.
+    pub slices: Vec<Slice>,
     pub partitions: Vec<Vec<RecordBatch>>,
+}
+
+/// One batch of a table: a range of its rows, in a partition.
+#[derive(Clone, Debug)]
+pub struct Slice {
+    pub partition: usize,
+    pub rows: Range<usize>,
 }
 
 impl Table {
@@ -269,6 +282,69 @@ impl Table {
             .expect("a valid table");
         ctx.register_table(self.name, Arc::new(t))
             .expect("a new table name");
+    }
+
+    /// The table of `all`'s rows, batched as `slices` say.
+    pub fn sliced(name: &'static str, all: RecordBatch, slices: Vec<Slice>) -> Table {
+        let parts = slices.iter().map(|s| s.partition + 1).max().unwrap_or(1);
+        let mut partitions = vec![Vec::new(); parts];
+        for s in &slices {
+            partitions[s.partition].push(all.slice(s.rows.start, s.rows.len()));
+        }
+        Table {
+            name,
+            schema: all.schema(),
+            all,
+            slices,
+            partitions,
+        }
+    }
+
+    /// The table without the rows in `rows`, each batch keeping the rest of
+    /// its own.
+    pub fn without(&self, rows: Range<usize>) -> Table {
+        let (cut, n) = (rows.len(), self.all.num_rows());
+        let kept = [
+            self.all.slice(0, rows.start),
+            self.all.slice(rows.end, n - rows.end),
+        ];
+        let all = compute::concat_batches(&self.schema, &kept).expect("same schema");
+        let at = |i: usize| match i {
+            i if i < rows.start => i,
+            i if i < rows.end => rows.start,
+            i => i - cut,
+        };
+        let slices = (self.slices.iter())
+            .map(|s| Slice {
+                partition: s.partition,
+                rows: at(s.rows.start)..at(s.rows.end),
+            })
+            .collect();
+        Table::sliced(self.name, all, slices)
+    }
+
+    /// The table in one partition of one batch.
+    pub fn in_one_batch(&self) -> Table {
+        let rows = 0..self.all.num_rows();
+        let slices = vec![Slice { partition: 0, rows }];
+        Table::sliced(self.name, self.all.clone(), slices)
+    }
+
+    /// The table with its values `v` in `rows` set to 1.
+    pub fn with_ones(&self, rows: Range<usize>) -> Table {
+        let v = (self.all.column(2).as_any())
+            .downcast_ref::<Float64Array>()
+            .expect("v");
+        let ones: Float64Array = (0..v.len())
+            .map(|r| match rows.contains(&r) {
+                true => Some(1.0),
+                false => v.is_valid(r).then(|| v.value(r)),
+            })
+            .collect();
+        let mut columns: Vec<ArrayRef> = self.all.columns().to_vec();
+        columns[2] = Arc::new(ones);
+        let all = RecordBatch::try_new(Arc::clone(&self.schema), columns).expect("same schema");
+        Table::sliced(self.name, all, self.slices.clone())
     }
 
     pub fn dump(&self) -> String {
@@ -344,17 +420,18 @@ pub fn table(
     let schema = Arc::new(Schema::new(fields));
     let all = RecordBatch::try_new(Arc::clone(&schema), columns).expect("a valid batch");
     let parts = 1 + rng.below(3);
-    let mut partitions = vec![Vec::new(); parts];
+    let mut slices = Vec::new();
     let mut start = 0;
     while start < n {
         let len = rng.below(7).min(n - start);
-        partitions[rng.below(parts)].push(all.slice(start, len));
+        slices.push(Slice {
+            partition: rng.below(parts),
+            rows: start..start + len,
+        });
         start += len;
     }
-    Table {
-        name,
-        schema,
-        all,
-        partitions,
-    }
+    let mut t = Table::sliced(name, all, slices);
+    // Partitions the slices left empty still count.
+    t.partitions.resize(parts, Vec::new());
+    t
 }

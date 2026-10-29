@@ -53,34 +53,7 @@ use einfold_ir::{
     Weight,
 };
 use einfold_kernels::{FloatKeys, Host, Options, Relation};
-
-struct Rng(u64);
-
-impl Rng {
-    /// A generator for `seed`, scrambled by SplitMix64 so that nearby seeds
-    /// give unrelated streams, and never zero, which xorshift can't leave.
-    fn new(seed: u64) -> Self {
-        let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        Rng((z ^ (z >> 31)).max(1))
-    }
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-    fn chance(&mut self, p: f64) -> bool {
-        self.unit() < p
-    }
-    fn unit(&mut self) -> f64 {
-        ((self.next() >> 11) as f64) / ((1u64 << 53) as f64)
-    }
-}
+use einfold_testkit::Rng;
 
 /// A table of integer keys and a nullable `DOUBLE` value, as rows.
 struct Table {
@@ -569,7 +542,7 @@ async fn pipeline_matches_sql() {
     };
     for i in 0..cases {
         let seed = seed.wrapping_add(i);
-        let mut rng = Rng::new(seed);
+        let mut rng = Rng::seeded(seed, 0);
         let case = case(&mut rng);
         let fail = |what: String| panic!("seed {seed}: {what}\nSQL: {}", case.sql);
         let ours = run(&case, &mut rng);
@@ -623,7 +596,7 @@ async fn pipeline_matches_sql() {
 /// positions (16 tiles of 64) under `conditions` between `q.t` and `k.t`,
 /// checking that every average of `v.x = 1` is 1.
 fn tiles_visited(conditions: &[(Comparison, i64)]) -> (usize, usize) {
-    let mut rng = Rng::new(7);
+    let mut rng = Rng::seeded(7, 0);
     let l = 64 * 16;
     let q = Table::complete(&["t", "d"], &[l, 8], || rng.unit());
     let k = Table::complete(&["t", "d"], &[l, 8], || 0.5);
@@ -681,7 +654,7 @@ fn tiles_visited(conditions: &[(Comparison, i64)]) -> (usize, usize) {
         Normalizer::KeptGroups,
     )
     .unwrap();
-    let batches = |t: &Table| t.partitions(&mut Rng::new(1)).concat();
+    let batches = |t: &Table| t.partitions(&mut Rng::seeded(1, 0)).concat();
     let (bq, bk, bv) = (batches(&q), batches(&k), batches(&v));
     let schemas = [q.schema.as_ref(), k.schema.as_ref(), v.schema.as_ref()];
     let schema = einfold_kernels::pipeline_schema(&pipeline, &schemas).unwrap();
@@ -770,7 +743,7 @@ fn declines_a_pipeline_that_sums_its_own_dimension_away() {
         Normalizer::KeptGroups,
     )
     .unwrap();
-    let batches = |t: &Table| t.partitions(&mut Rng::new(1)).concat();
+    let batches = |t: &Table| t.partitions(&mut Rng::seeded(1, 0)).concat();
     let (bq, bk, bv) = (batches(&q), batches(&k), batches(&v));
     let schemas = [q.schema.as_ref(), k.schema.as_ref(), v.schema.as_ref()];
     let schema = einfold_kernels::pipeline_schema(&pipeline, &schemas).unwrap();
@@ -834,7 +807,7 @@ fn gives_no_rows_without_queries_or_keys() {
         Normalizer::KeptGroups,
     )
     .unwrap();
-    let batches = |t: &Table| t.partitions(&mut Rng::new(1)).concat();
+    let batches = |t: &Table| t.partitions(&mut Rng::seeded(1, 0)).concat();
     let (bq, bk, bv) = (batches(&q), batches(&k), batches(&v));
     let schemas = [q.schema.as_ref(), k.schema.as_ref(), v.schema.as_ref()];
     let schema = einfold_kernels::pipeline_schema(&pipeline, &schemas).unwrap();
@@ -918,7 +891,7 @@ fn declines_where_a_rescale_meets_an_overflowed_sum() {
             normalizer,
         )
         .unwrap();
-        let batches = |t: &Table| t.partitions(&mut Rng::new(1)).concat();
+        let batches = |t: &Table| t.partitions(&mut Rng::seeded(1, 0)).concat();
         let (bq, bk, bv) = (batches(&q), batches(&k), batches(&v));
         let schemas = [q.schema.as_ref(), k.schema.as_ref(), v.schema.as_ref()];
         let schema = einfold_kernels::pipeline_schema(&pipeline, &schemas).unwrap();

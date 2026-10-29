@@ -53,29 +53,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
-
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        Rng((z ^ (z >> 31)).max(1))
-    }
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-    fn chance(&mut self, p: f64) -> bool {
-        ((self.next() >> 11) as f64) / ((1u64 << 53) as f64) < p
-    }
-}
+use einfold_testkit::Rng;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Expect {
@@ -369,7 +347,7 @@ async fn einfold_finds_pipelines_and_changes_no_answer() {
     let (mut found, mut fused) = (0, 0);
     for i in 0..cases {
         let seed = seed.wrapping_add(i);
-        let mut rng = Rng::new(seed);
+        let mut rng = Rng::seeded(seed, 0);
         let threads = [1 + rng.below(6), 1 + rng.below(6)];
         let config = |t: usize| SessionConfig::new().with_target_partitions(t);
         let host = SessionContext::new_with_config(config(threads[0]));
@@ -465,10 +443,10 @@ async fn the_nadaraya_watson_control_fuses() {
     let host = SessionContext::new();
     let builder = SessionStateBuilder::new().with_default_features();
     let ours = SessionContext::new_with_state(einfold_datafusion::install(builder).build());
-    let mut rng = Rng::new(97);
+    let mut rng = Rng::seeded(97, 0);
     let mut unit = |n: usize| -> Vec<f64> {
         (0..n)
-            .map(|_| ((rng.next() >> 11) as f64) / ((1u64 << 53) as f64))
+            .map(|_| ((rng.next_u64() >> 11) as f64) / ((1u64 << 53) as f64))
             .collect()
     };
     let (targets, sources) = (64, 256);

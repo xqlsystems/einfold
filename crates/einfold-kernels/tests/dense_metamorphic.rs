@@ -72,30 +72,7 @@ use einfold_ir::{
     Operand, Output, RowValue,
 };
 use einfold_kernels::{Algorithm, DomainRows, FloatKeys, Host, Options, Relation};
-
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) ^ 0x00de_75e5)
-    }
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n.max(1) as u64) as usize
-    }
-    fn chance(&mut self, p: f64) -> bool {
-        ((self.next() >> 11) as f64) / ((1u64 << 53) as f64) < p
-    }
-    fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
-        xs[self.below(xs.len())]
-    }
-}
+use einfold_testkit::Rng;
 
 /// A NULL key, in a domain only.
 const NULL_KEY: i64 = i64::MIN;
@@ -155,7 +132,7 @@ fn value(rng: &mut Rng, specials: bool) -> Option<f64> {
         7 if specials => Some(f64::INFINITY),
         8..=10 => Some(-0.0),
         11..=16 => Some(if rng.chance(0.5) { 1e16 } else { -1e16 }),
-        _ => Some(((rng.next() >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 8.0),
+        _ => Some(((rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 8.0),
     }
 }
 
@@ -167,7 +144,7 @@ fn factor(rng: &mut Rng, t: usize, empty: bool) -> Vec<usize> {
     }
     let divisors: Vec<usize> = (2..t).filter(|&d| t.is_multiple_of(d)).collect();
     if !divisors.is_empty() && rng.chance(0.5) {
-        let d = rng.pick(&divisors);
+        let d = *rng.pick(&divisors);
         return vec![d, t / d];
     }
     vec![t]
@@ -223,8 +200,8 @@ fn case(rng: &mut Rng) -> Option<Case> {
         0..=2 => {
             let p = near(rng, FEW_CELLS);
             let divisors: Vec<usize> = (1..=p).filter(|&d| p.is_multiple_of(d)).collect();
-            let nx = rng.pick(&divisors);
-            (nx, p / nx, rng.pick(&Z_EDGES[..4]))
+            let nx = *rng.pick(&divisors);
+            (nx, p / nx, *rng.pick(&Z_EDGES[..4]))
         }
         3 | 4 => (near(rng, XB), 17 + rng.below(24), small(rng)),
         5 | 6 => (2 + rng.below(5), near(rng, YB), small(rng)),
@@ -234,7 +211,7 @@ fn case(rng: &mut Rng) -> Option<Case> {
                 if rng.chance(0.25) {
                     1 + rng.below(6)
                 } else {
-                    rng.pick(edges)
+                    *rng.pick(edges)
                 }
             };
             (
@@ -713,7 +690,7 @@ struct Stats {
 }
 
 fn check(seed: u64, stats: &mut Stats) -> Result<(), String> {
-    let mut rng = Rng::new(seed);
+    let mut rng = Rng::seeded(seed, 0);
     stats.seeds += 1;
     let Some(case) = case(&mut rng) else {
         stats.skipped += 1;

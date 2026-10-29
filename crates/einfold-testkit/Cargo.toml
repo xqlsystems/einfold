@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "einfold-testkit"
+description = "What einfold's property, fuzz and simulation tests share: a seeded generator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+# Only einfold's own tests use it.
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

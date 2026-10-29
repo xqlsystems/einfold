@@ -9,6 +9,7 @@ members = [
     "crates/einfold-ir",
     "crates/einfold-kernels",
     "crates/einfold-datafusion",
+    "crates/einfold-testkit",
 ]
 
 [workspace.package]
@@ -34,6 +35,7 @@ arrow = { version = "=59.3.1", default-features = false }
 
 einfold-ir = { path = "crates/einfold-ir", version = "0.0.0" }
 einfold-kernels = { path = "crates/einfold-kernels", version = "0.0.0" }
+einfold-testkit = { path = "crates/einfold-testkit" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

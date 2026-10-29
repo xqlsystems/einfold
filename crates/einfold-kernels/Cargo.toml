@@ -22,6 +22,7 @@ einfold-ir = { workspace = true }
 # The property test checks the kernels against SQL that DataFusion runs.
 datafusion = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+einfold-testkit = { workspace = true }
 
 [lints]
 workspace = true

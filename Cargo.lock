@@ -1365,8 +1365,13 @@ dependencies = [
  "arrow",
  "datafusion",
  "einfold-ir",
+ "einfold-testkit",
  "tokio",
 ]
+
+[[package]]
+name = "einfold-testkit"
+version = "0.0.0"
 
 [[package]]
 name = "either"

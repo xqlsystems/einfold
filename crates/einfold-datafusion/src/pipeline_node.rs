@@ -62,7 +62,15 @@ impl PipelineNode {
             .map(|(f, name)| f.as_ref().clone().with_name(name))
             .collect();
         let schema = Arc::new(DFSchema::try_from(Schema::new(fields))?);
-        if fallback.schema().fields().len() != schema.fields().len() {
+        // The fallback's rows stand in for the pipeline's, so each of its
+        // columns must have the type of the pipeline's, and may hold NULLs
+        // only where the pipeline's may.
+        let fallback_fields = fallback.schema().fields();
+        let fits = fallback_fields.len() == schema.fields().len()
+            && (fallback_fields.iter().zip(schema.fields())).all(|(f, ours)| {
+                f.data_type() == ours.data_type() && (ours.is_nullable() || !f.is_nullable())
+            });
+        if !fits {
             return plan_err!("a pipeline's fallback must have its columns");
         }
         Ok(PipelineNode {
@@ -94,12 +102,12 @@ impl PipelineNode {
     }
 }
 
-// The schema follows from the pipeline and the inputs, so ordering ignores
-// it.
+// The schema's types follow from the pipeline and the inputs, so ordering
+// compares only its names.
 impl PartialOrd for PipelineNode {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         fn key(n: &PipelineNode) -> impl PartialOrd + '_ {
-            (&n.pipeline, &n.inputs, &n.fallback)
+            (&n.pipeline, &n.inputs, &n.fallback, n.schema.field_names())
         }
         key(self).partial_cmp(&key(other))
     }

@@ -15,6 +15,7 @@ use datafusion::arrow::array::{Array, Float64Array, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{self, ExecutionPlan};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use einfold_datafusion::{EinFoldQueryPlanner, PipelineNode};
@@ -185,10 +186,9 @@ async fn check(missing: &[usize]) -> String {
         assert_eq!((o.0, o.1), (t.0, t.1));
         assert!((o.2 - t.2).abs() <= 1e-12, "{o:?} vs {t:?}");
     }
-    let shown =
-        datafusion::physical_plan::display::DisplayableExecutionPlan::with_metrics(plan.as_ref())
-            .indent(true)
-            .to_string();
+    let shown = DisplayableExecutionPlan::with_metrics(plan.as_ref())
+        .indent(true)
+        .to_string();
     shown
 }
 
@@ -209,4 +209,12 @@ async fn runs_the_host_plan_where_an_input_has_a_hole() {
     let shown = check(&[17]).await;
     assert!(shown.contains("host_plans=1"), "{shown}");
     assert!(!shown.contains("fused_pipelines=1"), "{shown}");
+}
+
+/// With no values at all, the SQL's inner join with `v` has no rows, and
+/// neither does the pipeline, whichever plan runs.
+#[tokio::test]
+async fn gives_no_rows_where_there_are_no_values() {
+    let every: Vec<usize> = (0..L * C).collect();
+    check(&every).await;
 }

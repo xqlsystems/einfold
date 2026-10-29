@@ -13,8 +13,12 @@
 //! replaces each with a [`FoldNode`]; [`EinFoldQueryPlanner`] applies it just
 //! before physical planning, and plans each node as [`EinFoldExec`], which
 //! runs `einfold_kernels`. A [`PipelineNode`] is a fold whose results another
-//! fold reads, such as attention's scores and the softmax-weighted average
-//! of the values; [`EinFoldExec`] computes those too, one tile at a time.
+//! fold reads: a fold of scores, then a sum of values weighted by them. One
+//! is attention, the step of a transformer (the neural network behind
+//! language models) in which each token averages the others' values,
+//! weighted by a softmax of its scores against them. [`EinFoldExec`]
+//! computes a pipeline one tile at a time, a block of the scores' rows, so
+//! that it never holds all of the scores.
 //! [`install`] adds einfold to a session. This is the only einfold crate
 //! that depends on a query engine.
 

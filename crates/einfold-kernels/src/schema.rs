@@ -2,12 +2,13 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`schema`]: the schema of a fold's result.
+//! [`schema`] and [`pipeline_schema`]: the schemas of a fold's and a
+//! pipeline's results.
 
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use einfold_ir::{ColumnIndex, Fold, Key};
+use einfold_ir::{ColumnIndex, DimensionId, Fold, Key, Pipeline};
 
 use crate::{bad, Result};
 
@@ -115,6 +116,67 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
         fields.len().to_string(),
         DataType::Float64,
         nullable,
+    ));
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// The schema of `pipeline`'s result over inputs of these schemas: its
+/// producer's two operands, then its values operand. It has one key column
+/// per output, typed as the dimension's columns are, then the average, a
+/// nullable `Float64`. Columns are named by position, as [`schema`]'s are.
+///
+/// Fails unless the producer's schema is valid (see [`schema`]), the values
+/// operand's columns exist, its factor is `Float64`, and each of its keys has
+/// the type of its dimension's other columns.
+pub fn pipeline_schema(pipeline: &Pipeline, inputs: &[&Schema; 3]) -> Result<SchemaRef> {
+    let producer = schema(pipeline.producer(), &inputs[..2], None)?;
+    let values = pipeline.values();
+    let column = |ColumnIndex(c): ColumnIndex| match inputs[2].fields().get(c) {
+        Some(f) => Ok(f.as_ref().clone()),
+        None => bad(format!(
+            "column {c} of the values operand, of {}",
+            inputs[2].fields().len()
+        )),
+    };
+    let factor = column(values.factor.expect("checked by Pipeline::try_new"))?;
+    if factor.data_type() != &DataType::Float64 {
+        return bad(format!(
+            "EinFold factors must be Float64, not {}",
+            factor.data_type()
+        ));
+    }
+    // A key's type: from the producer's output column, or the values'.
+    let key = |d: DimensionId| -> Result<Field> {
+        if let Some(o) = pipeline.producer().output_of(d) {
+            return Ok(producer.field(o).clone());
+        }
+        let c = values.column_of(d).expect("checked by Pipeline::try_new");
+        column(c)
+    };
+    for k in &values.keys {
+        let (want, got) = (key(k.dimension)?, column(k.column)?);
+        if want.data_type() != got.data_type() {
+            return bad(format!(
+                "dimension {}'s columns have types {} and {}",
+                k.dimension.0,
+                want.data_type(),
+                got.data_type()
+            ));
+        }
+    }
+    let mut fields = Vec::new();
+    for &d in pipeline.outputs() {
+        let f = key(d)?;
+        fields.push(Field::new(
+            fields.len().to_string(),
+            f.data_type().clone(),
+            f.is_nullable(),
+        ));
+    }
+    fields.push(Field::new(
+        fields.len().to_string(),
+        DataType::Float64,
+        true,
     ));
     Ok(Arc::new(Schema::new(fields)))
 }

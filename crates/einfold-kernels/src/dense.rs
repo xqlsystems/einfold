@@ -83,7 +83,7 @@ fn worth(cells: usize, rows: usize) -> bool {
 /// plus one), or `None` if it isn't an integer column, or holds a NULL, a
 /// negative key, or one too large for `i64` (an unsigned key of 2⁶³ or more),
 /// or whose extent doesn't fit (a key of `i64::MAX`).
-fn keys(column: &ArrayRef) -> Option<(Int64Array, usize)> {
+pub(crate) fn keys(column: &ArrayRef) -> Option<(Int64Array, usize)> {
     if !column.data_type().is_integer() || column.null_count() > 0 {
         return None;
     }
@@ -104,7 +104,7 @@ fn keys(column: &ArrayRef) -> Option<(Int64Array, usize)> {
 /// column at a time, in 32 bits, which the compiler vectorizes: every
 /// position fits, as the dense algorithm runs only on fewer cells than
 /// `u32::MAX`.
-fn positions(
+pub(crate) fn positions(
     keys: &[(usize, Int64Array)],
     dims: &[usize],
     extent: &[usize],

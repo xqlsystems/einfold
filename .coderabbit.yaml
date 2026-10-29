@@ -10,8 +10,12 @@ language: en-US
 reviews:
   profile: assertive
   # Approve once every finding is resolved, so that an approval means
-  # "nothing left to fix" and a pull request can merge on it.
-  request_changes_workflow: true
+  # "nothing left to fix" and a pull request can merge on it. Pull requests
+  # here are opened under the maintainer's account, agents' included, so an
+  # author can't approve with a command.
+  auto_approvals:
+    enabled: true
+    allow_author_approval: false
   # Pull requests are squash-merged with their description as the commit
   # message, so keep CodeRabbit's summary out of the description.
   high_level_summary: false
@@ -20,6 +24,9 @@ reviews:
   auto_review:
     enabled: true
     drafts: false
+    # Keep reviewing each new commit, so that fixing findings leads to an
+    # approval without asking for a review by hand.
+    auto_pause_after_reviewed_commits: 0
     # Every base branch, not only main: stacked pull requests are based on
     # the pull request below them.
     base_branches:

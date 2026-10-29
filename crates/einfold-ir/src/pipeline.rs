@@ -54,7 +54,8 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use crate::fold::{Dimension, DimensionId, Fold, InvalidFold, Operand, RowValue};
+use crate::expression::Expression;
+use crate::fold::{ColumnIndex, Dimension, DimensionId, Fold, InvalidFold, Operand, RowValue};
 
 /// How a producer group's value `p` becomes its score.
 #[derive(Clone, Copy, Debug)]
@@ -145,19 +146,41 @@ pub enum Normalizer {
     /// The sum of the weights of the joined rows of the output's own group:
     /// `SUM(w * y) / SUM(w)` in one aggregate.
     JoinedRows,
+    /// Nothing: the consumer is the weighted sum `SUM(w * y)` itself, as a
+    /// chain of two einsums such as `(q · k) · v` is.
+    None,
 }
 
-/// A fold pipeline whose consumer is a softmax-weighted average (see the
-/// [module](self)'s documentation). Its result's columns are the outputs'
-/// keys in order, then the average.
+/// How each producer group's value `p` becomes its weight.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum Weight {
+    /// A softmax's: `exp(score - shift)`, with the score `p` scaled.
+    Exp {
+        /// How `p` becomes the score.
+        scale: Scale,
+        /// What is subtracted from the score before `exp`.
+        shift: Shift,
+    },
+    /// Any row expression of `p`, which it reads as column 0 of operand 0
+    /// (see [`Expression`]): `p` itself, for a chain of einsums;
+    /// `1 / (1 + exp(-p))`, for sigmoid attention; or a Cauchy kernel's `1 /
+    /// (1 + p)` of a squared distance `p`.
+    Of(Expression),
+}
+
+/// A fold pipeline whose consumer is a weighted sum of the values, its
+/// weights a function of the producer's values, divided by a normalizer or
+/// not (see the [module](self)'s documentation). Its result's columns are
+/// the outputs' keys in order, then the sum.
 ///
 /// In SQL, with `kept` and `summed` the producer's outputs that are and aren't
 /// outputs of the pipeline:
 ///
 /// ```sql
 /// WITH p AS (<producer>),
-/// w AS (SELECT p.*, exp(<scale>(p.value) - <shift>) AS w FROM p)
-/// SELECT <outputs>, SUM(w.w * v.<factor>) / <normalizer>
+/// w AS (SELECT p.*, <weight>(p.value) AS w FROM p)
+/// SELECT <outputs>, SUM(w.w * v.<factor>) [/ <normalizer>]
 /// FROM w JOIN values v ON w.<summed and kept outputs v holds> = v.<their columns>
 /// GROUP BY <outputs>
 /// ```
@@ -170,8 +193,7 @@ pub enum Normalizer {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Pipeline {
     producer: Fold,
-    scale: Scale,
-    shift: Shift,
+    weight: Weight,
     dimensions: Vec<Dimension>,
     values: Operand,
     outputs: Vec<DimensionId>,
@@ -183,6 +205,7 @@ impl Pipeline {
     ///
     /// - the producer is a `SUM`, of products or of a row expression, with no
     ///   domain;
+    /// - a weight of an expression reads only the producer's value;
     /// - the values operand has a factor, and its keys name the producer's
     ///   outputs or the pipeline's own `dimensions`, each at most once;
     /// - it holds every one of the pipeline's own dimensions, and every
@@ -191,8 +214,7 @@ impl Pipeline {
     ///   the pipeline's own dimensions.
     pub fn try_new(
         producer: Fold,
-        scale: Scale,
-        shift: Shift,
+        weight: Weight,
         dimensions: Vec<Dimension>,
         values: Operand,
         outputs: Vec<DimensionId>,
@@ -205,6 +227,11 @@ impl Pipeline {
                 "a pipeline's producer is a SUM of products or of a row expression, with no domain"
                     .into(),
             );
+        }
+        if let Weight::Of(e) = &weight {
+            if e.columns().iter().any(|&c| c != (0, ColumnIndex(0))) {
+                return bad("a pipeline's weight reads only the producer's value".into());
+            }
         }
         if values.factor.is_none() {
             return bad("a pipeline's values operand has no factor".into());
@@ -244,8 +271,7 @@ impl Pipeline {
         }
         Ok(Pipeline {
             producer,
-            scale,
-            shift,
+            weight,
             dimensions,
             values,
             outputs,
@@ -259,16 +285,10 @@ impl Pipeline {
         &self.producer
     }
 
-    /// How a producer value becomes a score.
+    /// How a producer value becomes its weight.
     #[must_use]
-    pub fn scale(&self) -> Scale {
-        self.scale
-    }
-
-    /// What is subtracted from a score before `exp`.
-    #[must_use]
-    pub fn shift(&self) -> Shift {
-        self.shift
+    pub fn weight(&self) -> &Weight {
+        &self.weight
     }
 
     /// The pipeline's own dimensions, numbered after the producer's.
@@ -289,7 +309,7 @@ impl Pipeline {
         &self.outputs
     }
 
-    /// What the weighted sum is divided by.
+    /// What the weighted sum is divided by, if anything.
     #[must_use]
     pub fn normalizer(&self) -> Normalizer {
         self.normalizer
@@ -356,8 +376,10 @@ mod tests {
     fn attention(values: Operand, outputs: &[usize]) -> Result<Pipeline, InvalidFold> {
         Pipeline::try_new(
             scores(),
-            Scale::Over(8.0),
-            Shift::KeptMaximum,
+            Weight::Exp {
+                scale: Scale::Over(8.0),
+                shift: Shift::KeptMaximum,
+            },
             vec![EQ],
             values,
             outputs.iter().map(|&d| DimensionId(d)).collect(),
@@ -371,7 +393,10 @@ mod tests {
         let p = attention(op(&[(2, 0), (3, 1)], Some(2)), &[0, 3]).unwrap();
         assert!(p.is_summed(DimensionId(2)));
         assert!(!p.is_summed(DimensionId(0)) && !p.is_summed(DimensionId(1)));
-        assert_eq!(p.scale().apply(4.0), 0.5);
+        let Weight::Exp { scale, .. } = p.weight() else {
+            panic!("a softmax");
+        };
+        assert_eq!(scale.apply(4.0), 0.5);
         assert_eq!(Scale::Times(f64::NAN), Scale::Times(f64::NAN));
         assert_ne!(Scale::Times(2.0), Scale::Over(2.0));
     }
@@ -391,5 +416,30 @@ mod tests {
         assert!(attention(v(), &[0, 4]).is_err());
         assert!(attention(v(), &[1, 3]).is_err());
         assert!(attention(v(), &[0, 3]).is_ok());
+    }
+
+    #[test]
+    fn a_weight_of_an_expression_reads_only_the_producers_value() {
+        let with = |weight| {
+            Pipeline::try_new(
+                scores(),
+                weight,
+                vec![EQ],
+                op(&[(2, 0), (3, 1)], Some(2)),
+                vec![DimensionId(0), DimensionId(3)],
+                Normalizer::None,
+            )
+        };
+        let p = Expression::column(0, 0);
+        let sigmoid = Expression::literal(1.0).binary(
+            crate::Binary::Divide,
+            Expression::literal(1.0).binary(
+                crate::Binary::Add,
+                p.unary(crate::Unary::Negate).unary(crate::Unary::Exp),
+            ),
+        );
+        assert!(with(Weight::Of(sigmoid)).is_ok());
+        assert!(with(Weight::Of(Expression::column(0, 1))).is_err());
+        assert!(with(Weight::Of(Expression::column(1, 0))).is_err());
     }
 }

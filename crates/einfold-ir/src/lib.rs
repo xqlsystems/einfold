@@ -16,4 +16,4 @@ pub use fold::{
     Aggregate, ColumnIndex, Comparison, Condition, Dimension, DimensionId, Domain, DomainKey,
     Finish, Fold, InvalidFold, Key, KeyEquality, Monoid, Operand, Output, RowValue,
 };
-pub use pipeline::{Normalizer, Pipeline, Scale, Shift};
+pub use pipeline::{Normalizer, Pipeline, Scale, Shift, Weight};

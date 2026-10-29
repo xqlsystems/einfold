@@ -544,11 +544,7 @@ pub(crate) fn fold_over(
 /// Each largest part of `e` that reads one side only and may be computed
 /// on every row of it (see [`movable`]) becomes a column of that side's
 /// operand, appended to `values` after its `base` key columns. The rest must
-/// be operators of the closed set: `+ - * /`, negation, `abs`, `exp`, `ln`,
-/// and `power` with a positive constant exponent, on `DOUBLE`s, and `DOUBLE`
-/// literals. None of these raises an error in DataFusion on `DOUBLE`s, so
-/// computing them on the joined pairs gives what the host gives: zero to a
-/// negative power, which raises one, can't occur.
+/// be operators of the closed set (see [`closed_set`]).
 fn row_expression(
     e: &Expr,
     inputs: [&DFSchema; 2],
@@ -557,21 +553,42 @@ fn row_expression(
 ) -> Result<Option<Expression>> {
     use datafusion::logical_expr::ExprSchemable;
 
-    let e = e.clone().unalias();
-    if let Some(s) = side(&e, inputs) {
-        if e.get_type(inputs[s])? != DataType::Float64 || !movable(&e, inputs[s]) {
+    let mut leaf = |e: &Expr| -> Result<Option<Option<Expression>>> {
+        let Some(s) = side(e, inputs) else {
             return Ok(None);
+        };
+        if e.get_type(inputs[s])? != DataType::Float64 || !movable(e, inputs[s]) {
+            return Ok(Some(None));
         }
-        let i = match values[s].iter().position(|v| *v == e) {
+        let i = match values[s].iter().position(|v| v == e) {
             Some(i) => i,
             None => {
-                values[s].push(e);
+                values[s].push(e.clone());
                 values[s].len() - 1
             }
         };
-        return Ok(Some(Expression::column(s, base[s] + i)));
+        Ok(Some(Some(Expression::column(s, base[s] + i))))
+    };
+    closed_set(e, &mut leaf)
+}
+
+/// `e` as a row expression, with `leaf` deciding the expressions it treats
+/// as columns: `Some(Some(column))` for one, `Some(None)` for one it can't
+/// take, `None` for an expression to look into. The rest must be operators of
+/// the closed set: `+ - * /`, negation, `abs`, `exp`, `ln`, and `power` with
+/// a positive constant exponent, on `DOUBLE`s, and `DOUBLE` literals. None of
+/// these raises an error in DataFusion on `DOUBLE`s, so computing them on
+/// the joined pairs gives what the host gives: zero to a negative power,
+/// which raises one, can't occur.
+pub(crate) fn closed_set(
+    e: &Expr,
+    leaf: &mut impl FnMut(&Expr) -> Result<Option<Option<Expression>>>,
+) -> Result<Option<Expression>> {
+    let e = e.clone().unalias();
+    if let Some(column) = leaf(&e)? {
+        return Ok(column);
     }
-    let mut part = |e: &Expr| row_expression(e, inputs, base, values);
+    let mut part = |e: &Expr| closed_set(e, leaf);
     Ok(match &e {
         Expr::Literal(ScalarValue::Float64(Some(x)), _) => Some(Expression::literal(*x)),
         Expr::Negative(x) => part(x)?.map(|x| x.unary(Unary::Negate)),

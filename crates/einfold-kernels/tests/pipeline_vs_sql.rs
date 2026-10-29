@@ -24,8 +24,8 @@
 //! invariants:
 //!
 //! 1. **Runs when it can, and declines when it can't.** With every table
-//!    complete, and a producer that reads both of its operands, the
-//!    algorithm runs. When a table misses a row, repeats one,
+//!    complete, a producer that reads both of its operands, and no special
+//!    values, the algorithm runs; with special values it may decline. When a table misses a row, repeats one,
 //!    or holds a NULL factor, it either returns `None`, so that the caller
 //!    runs the host's plan, or (when the gap only shrinks a dimension's
 //!    range) gives SQL's result, as below.
@@ -50,6 +50,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use einfold_ir::{
     Aggregate, Binary, ColumnIndex, Comparison, Condition, Dimension, DimensionId, Expression,
     Fold, Key, KeyEquality, Normalizer, Operand, Output, Pipeline, RowValue, Scale, Shift, Unary,
+    Weight,
 };
 use einfold_kernels::{FloatKeys, Host, Options, Relation};
 
@@ -153,6 +154,9 @@ struct Case {
     complete: bool,
     /// The largest `|v.x|`, the scale of every average.
     v_scale: f64,
+    /// For a sum that nothing normalizes, SQL for each group's `Σ |w · v.x|`,
+    /// the scale of its rounding.
+    magnitudes: Option<String>,
 }
 
 /// A value: mostly in [-1, 1] times `spread`, sometimes special.
@@ -242,7 +246,8 @@ fn case(rng: &mut Rng) -> Case {
     // ones after. Rows are (t, d) in order, so row t·nd + d is (t, d).
     let at = |t: usize, d: usize| t * nd + d;
     let target = rng.below(nq);
-    match rng.below(6) {
+    let extremes = rng.below(6);
+    match extremes {
         0 => {
             q.rows[at(target, 0)].1 = Some(f64::NEG_INFINITY);
             for j in 0..nk {
@@ -377,13 +382,48 @@ fn case(rng: &mut Rng) -> Case {
         1 => (Scale::Times(-0.7), " * -0.7".to_string()),
         _ => (Scale::Over(8.0), " / 8.0".to_string()),
     };
-    let (shift, weight) = match rng.chance(0.7) {
-        true => (Shift::KeptMaximum, "exp(s - MAX(s) OVER (PARTITION BY i))"),
-        false => (Shift::None, "exp(s)"),
+    // A softmax's weight, or another expression of the score: positive, so
+    // that a normalized average stays an average, or, for a sum that
+    // nothing normalizes, the score itself, a chain of two einsums.
+    let normalizer = [
+        Normalizer::KeptGroups,
+        Normalizer::JoinedRows,
+        Normalizer::None,
+    ][rng.below(3)];
+    let lit = Expression::literal;
+    let p = || {
+        let p = Expression::column(0, 0);
+        match scale {
+            Scale::Times(c) => p.binary(Binary::Multiply, lit(c)),
+            Scale::Over(c) => p.binary(Binary::Divide, lit(c)),
+            _ => p,
+        }
     };
-    let normalizer = match rng.chance(0.5) {
-        true => Normalizer::KeptGroups,
-        false => Normalizer::JoinedRows,
+    let one_over = |e: Expression| lit(1.0).binary(Binary::Divide, lit(1.0).binary(Binary::Add, e));
+    let (weight_ir, weight) = match rng.below(5) {
+        0 => (
+            Weight::Of(one_over(p().unary(Unary::Negate).unary(Unary::Exp))),
+            "1.0 / (1.0 + exp(-s))",
+        ),
+        1 => (
+            Weight::Of(one_over(p().binary(Binary::Multiply, p()))),
+            "1.0 / (1.0 + s * s)",
+        ),
+        2 if normalizer == Normalizer::None => (Weight::Of(p()), "s"),
+        2 | 3 => (
+            Weight::Exp {
+                scale,
+                shift: Shift::KeptMaximum,
+            },
+            "exp(s - MAX(s) OVER (PARTITION BY i))",
+        ),
+        _ => (
+            Weight::Exp {
+                scale,
+                shift: Shift::None,
+            },
+            "exp(s)",
+        ),
     };
     let (values, outputs, c_col, c_group) = match channels {
         Some(_) => (
@@ -407,7 +447,7 @@ fn case(rng: &mut Rng) -> Case {
     };
     let own = if channels.is_some() { vec![EQ] } else { vec![] };
     let pipeline =
-        Pipeline::try_new(producer, scale, shift, own, values, outputs, normalizer).unwrap();
+        Pipeline::try_new(producer, weight_ir, own, values, outputs, normalizer).unwrap();
     let producer = match cross {
         true => format!(
             "SELECT q.t AS i, k.t AS j, ({row_sql}){scale_sql} AS s \
@@ -427,19 +467,32 @@ fn case(rng: &mut Rng) -> Case {
              FROM weights JOIN v ON weights.j = v.t JOIN norm ON weights.i = norm.i \
              GROUP BY weights.i{c_group}, norm.z"
         ),
-        _ => format!(
+        Normalizer::JoinedRows => format!(
             "{scores} SELECT weights.i{c_col}, SUM(weights.w * v.x) / SUM(weights.w) \
              FROM weights JOIN v ON weights.j = v.t GROUP BY weights.i{c_group}"
         ),
+        _ => format!(
+            "{scores} SELECT weights.i{c_col}, SUM(weights.w * v.x) \
+             FROM weights JOIN v ON weights.j = v.t GROUP BY weights.i{c_group}"
+        ),
     };
+    let magnitudes = (normalizer == Normalizer::None).then(|| {
+        format!(
+            "{scores} SELECT weights.i{c_col}, SUM(abs(weights.w * v.x)) \
+             FROM weights JOIN v ON weights.j = v.t GROUP BY weights.i{c_group}"
+        )
+    });
     Case {
         q,
         k,
         v,
         pipeline,
         sql,
-        complete: complete && reads_both,
+        // Special values, or the extreme scores above, may make it decline
+        // too: sums that overflow, or expression weights that aren't finite.
+        complete: complete && reads_both && !specials && extremes > 1,
         v_scale,
+        magnitudes,
     }
 }
 
@@ -544,8 +597,14 @@ async fn pipeline_matches_sql() {
         if ours.len() != theirs.len() {
             fail(format!("{} rows, SQL has {}", ours.len(), theirs.len()));
         }
-        let bound = 1e-9 * case.v_scale;
-        for ((ok, ov), (tk, tv)) in ours.iter().zip(&theirs) {
+        // An average's rounding is on the scale of the values; a sum's, of
+        // the sum of its terms' magnitudes.
+        let magnitudes = match &case.magnitudes {
+            Some(sql) => rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap()),
+            None => vec![(Vec::new(), Some(case.v_scale)); theirs.len()],
+        };
+        for (((ok, ov), (tk, tv)), (_, scale)) in ours.iter().zip(&theirs).zip(&magnitudes) {
+            let bound = 1e-9 * scale.unwrap_or(0.0);
             let same = match (ov, tv) {
                 (Some(x), Some(y)) if x.is_nan() || y.is_nan() => x.is_nan() && y.is_nan(),
                 (Some(x), Some(y)) if x.is_infinite() || y.is_infinite() => x == y,
@@ -612,8 +671,10 @@ fn tiles_visited(conditions: &[(Comparison, i64)]) -> (usize, usize) {
     };
     let pipeline = Pipeline::try_new(
         producer,
-        Scale::One,
-        Shift::KeptMaximum,
+        Weight::Exp {
+            scale: Scale::One,
+            shift: Shift::KeptMaximum,
+        },
         vec![],
         values,
         vec![DimensionId(0)],
@@ -699,8 +760,10 @@ fn declines_a_pipeline_that_sums_its_own_dimension_away() {
     // Dimension 3, `v.c`, is the pipeline's own, and not an output.
     let pipeline = Pipeline::try_new(
         producer,
-        Scale::One,
-        Shift::KeptMaximum,
+        Weight::Exp {
+            scale: Scale::One,
+            shift: Shift::KeptMaximum,
+        },
         vec![EQ],
         values,
         vec![DimensionId(0)],
@@ -761,8 +824,10 @@ fn gives_no_rows_without_queries_or_keys() {
     };
     let pipeline = Pipeline::try_new(
         producer,
-        Scale::One,
-        Shift::KeptMaximum,
+        Weight::Exp {
+            scale: Scale::One,
+            shift: Shift::KeptMaximum,
+        },
         vec![],
         values,
         vec![DimensionId(0)],
@@ -781,4 +846,96 @@ fn gives_no_rows_without_queries_or_keys() {
     let piped = einfold_kernels::pipeline(&pipeline, inputs, schema, Options::default()).unwrap();
     // Declining is right too: the caller's SQL then gives no rows.
     assert!(piped.is_none_or(|p| rows(&p.batches).is_empty()));
+}
+
+/// A row's sums overflow in its first tile of keys, then a larger score in
+/// a later tile shifts every weight before it to 0. SQL weighs each term by
+/// the final maximum, `exp(0 - 800) · 1e308 = 0`, so the average is 0; the
+/// fused algorithm's running sums would rescale infinity to NaN. It
+/// declines instead, normalized or not, so that the caller's SQL runs.
+#[test]
+fn declines_where_a_rescale_meets_an_overflowed_sum() {
+    for normalizer in [Normalizer::KeptGroups, Normalizer::None] {
+        let q = Table::complete(&["t", "d"], &[1, 1], || 1.0);
+        let mut i = 0;
+        let k = Table::complete(&["t", "d"], &[65, 1], || {
+            i += 1;
+            if i == 65 {
+                800.0
+            } else {
+                0.0
+            }
+        });
+        let mut i = 0;
+        let v = Table::complete(&["t"], &[65], || {
+            i += 1;
+            if i == 65 {
+                0.0
+            } else {
+                1e308
+            }
+        });
+        const EQ: Dimension = Dimension {
+            equality: KeyEquality::Equal,
+        };
+        let key = |d, c| Key::new(DimensionId(d), ColumnIndex(c));
+        let out = |d| Output {
+            dimension: DimensionId(d),
+            domain_key: None,
+        };
+        let ops = vec![
+            Operand {
+                keys: vec![key(0, 0), key(1, 1)],
+                factor: Some(ColumnIndex(2)),
+            },
+            Operand {
+                keys: vec![key(2, 0), key(1, 1)],
+                factor: Some(ColumnIndex(2)),
+            },
+        ];
+        let producer = Fold::try_new(
+            vec![EQ; 3],
+            ops,
+            vec![out(0), out(2)],
+            RowValue::Product,
+            Aggregate::sum(),
+            None,
+        )
+        .unwrap();
+        let values = Operand {
+            keys: vec![key(2, 0)],
+            factor: Some(ColumnIndex(1)),
+        };
+        let pipeline = Pipeline::try_new(
+            producer,
+            Weight::Exp {
+                scale: Scale::One,
+                shift: Shift::KeptMaximum,
+            },
+            vec![],
+            values,
+            vec![DimensionId(0)],
+            normalizer,
+        )
+        .unwrap();
+        let batches = |t: &Table| t.partitions(&mut Rng::new(1)).concat();
+        let (bq, bk, bv) = (batches(&q), batches(&k), batches(&v));
+        let schemas = [q.schema.as_ref(), k.schema.as_ref(), v.schema.as_ref()];
+        let schema = einfold_kernels::pipeline_schema(&pipeline, &schemas).unwrap();
+        let inputs = [
+            Relation::new(&q.schema, &bq),
+            Relation::new(&k.schema, &bk),
+            Relation::new(&v.schema, &bv),
+        ];
+        let piped =
+            einfold_kernels::pipeline(&pipeline, inputs, schema, Options::default()).unwrap();
+        // Declining is right; so would be SQL's 0.
+        if let Some(p) = piped {
+            let rows = rows(&p.batches);
+            assert!(
+                rows.iter().all(|(_, x)| *x == Some(0.0)),
+                "{normalizer:?}: {rows:?}"
+            );
+        }
+    }
 }

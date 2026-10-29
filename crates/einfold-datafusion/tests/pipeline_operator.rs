@@ -21,7 +21,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use einfold_datafusion::{EinFoldQueryPlanner, PipelineNode};
 use einfold_ir::{
     Aggregate, ColumnIndex, Comparison, Condition, Dimension, DimensionId, Fold, Key, KeyEquality,
-    Normalizer, Operand, Output, Pipeline, RowValue, Scale, Shift,
+    Normalizer, Operand, Output, Pipeline, RowValue, Scale, Shift, Weight,
 };
 
 const L: usize = 150;
@@ -123,8 +123,10 @@ fn attention() -> Pipeline {
     let outputs = vec![DimensionId(0), DimensionId(3)];
     Pipeline::try_new(
         scores,
-        Scale::Over(8.0),
-        Shift::KeptMaximum,
+        Weight::Exp {
+            scale: Scale::Over(8.0),
+            shift: Shift::KeptMaximum,
+        },
         vec![EQ],
         values,
         outputs,

@@ -56,8 +56,8 @@ use datafusion::logical_expr::{
     BinaryExpr, Expr, JoinType, LogicalPlan, Operator, Projection, WindowFunctionDefinition,
 };
 use einfold_ir::{
-    ColumnIndex, Dimension, DimensionId, Key, KeyEquality, Normalizer, Operand, Pipeline, Scale,
-    Shift,
+    Binary, ColumnIndex, Dimension, DimensionId, Expression, Key, KeyEquality, Normalizer, Operand,
+    Pipeline, Scale, Shift, Weight,
 };
 
 use crate::detect_folds::{self, Found, PREFIX};
@@ -227,12 +227,47 @@ fn same_scores(a: &Scores, b: &Scores) -> bool {
 
 /// A relation of weights: its scores, its shift, the fold output its
 /// maximum is taken per (with [`Shift::KeptMaximum`]), and, for each of its
-/// columns, the fold output it is, or `None` for the weight.
+/// columns, the fold output it is, or `None` for the weight. The weight is
+/// `exp(score - shift)`, or, with `map`, that expression of the score, which
+/// it reads as column 0 of operand 0.
 struct Weights {
     scores: Scores,
     shift: Shift,
     maximum_per: Option<usize>,
     columns: Vec<Option<usize>>,
+    map: Option<Expression>,
+}
+
+/// `e` as an expression of the score column `score` alone (see
+/// [`detect_folds::closed_set`]), reading it as column 0 of operand 0.
+fn of_score(e: &Expr, score: &Column) -> Result<Option<Expression>> {
+    let mut leaf = |e: &Expr| -> Result<Option<Option<Expression>>> {
+        Ok(match e {
+            Expr::Column(c) if c == score => Some(Some(Expression::column(0, 0))),
+            Expr::Column(_) => Some(None),
+            _ => None,
+        })
+    };
+    detect_folds::closed_set(e, &mut leaf)
+}
+
+/// `f`, an expression of the score, as one of the producer's value `p`, the
+/// score being `p` scaled by `scale`: so SQL's `f(p / 8)` is computed as it
+/// is written.
+fn of_value(f: &Expression, scale: Scale) -> Expression {
+    match f {
+        Expression::Column { .. } => {
+            let p = Expression::column(0, 0);
+            match scale {
+                Scale::Times(c) => p.binary(Binary::Multiply, Expression::literal(c)),
+                Scale::Over(c) => p.binary(Binary::Divide, Expression::literal(c)),
+                _ => p,
+            }
+        }
+        Expression::Literal(_) => f.clone(),
+        Expression::Unary(op, x) => of_value(x, scale).unary(*op),
+        Expression::Binary(op, a, b) => of_value(a, scale).binary(*op, of_value(b, scale)),
+    }
 }
 
 /// The score column of `scores`, read through `plan`'s schema.
@@ -328,8 +363,19 @@ fn weights(plan: &LogicalPlan) -> Result<Option<Weights>> {
     };
     let mut columns = Vec::new();
     let mut weight = false;
+    let mut map = None;
     for e in &p.expr {
         let e = detect_folds::resolve(e, &[])?;
+        // A weight other than a softmax's: an expression of the score, with
+        // no shift to cancel.
+        if !weight && shift_col.is_none() && !is_exp_of(&e, &score) {
+            if let Some(f) = of_score(&e, &score)? {
+                map = Some(f);
+                weight = true;
+                columns.push(None);
+                continue;
+            }
+        }
         match &e {
             Expr::Column(c) => match s_plan
                 .schema()
@@ -372,34 +418,50 @@ fn weights(plan: &LogicalPlan) -> Result<Option<Weights>> {
         shift,
         maximum_per,
         columns,
+        map,
     }))
 }
 
 /// `p` as unshifted weights merged with their scores, as DataFusion merges
 /// `SELECT i, j, exp(s) FROM (SELECT q.t AS i, k.t AS j, SUM(…) AS s …)`
-/// into one projection of `exp(SUM(…))` over the aggregate: the scores are
-/// `p` with the weight's argument in place of the weight.
+/// into one projection of `exp(SUM(…))` over the aggregate. With `exp`, the
+/// scores are `p` with the weight's argument in place of the weight; with
+/// another expression of the sum, or the sum itself, they are `p` with the
+/// sum in its place, and the weight that expression of it.
 fn merged_weights(p: &Projection) -> Result<Option<Weights>> {
-    if !matches!(p.input.as_ref(), LogicalPlan::Aggregate(_)) {
+    let LogicalPlan::Aggregate(agg) = p.input.as_ref() else {
         return Ok(None);
-    }
-    let exp = |e: &Expr| match e.clone().unalias() {
-        Expr::ScalarFunction(f) if f.name() == "exp" && f.args.len() == 1 => {
-            Some(f.args[0].clone())
-        }
-        _ => None,
+    };
+    let groups = agg.group_expr.len();
+    let sum = column_at(&p.input, groups);
+    let key = |e: &Expr| {
+        column(&e.clone().unalias())
+            .is_some_and(|c| (0..groups).any(|g| column_at(&p.input, g) == *c))
     };
     let [w] = (0..p.expr.len())
-        .filter(|&i| exp(&p.expr[i]).is_some())
+        .filter(|&i| !key(&p.expr[i]))
         .collect::<Vec<_>>()[..]
     else {
         return Ok(None);
     };
     // The weight's argument under the weight's own name, so that the
     // projection's names stay distinct: a key may be called `s`.
-    let mut exprs = p.expr.clone();
+    let weight = p.expr[w].clone().unalias();
     let name = p.schema.field(w).name().clone();
-    exprs[w] = exp(&p.expr[w]).expect("an exp").alias(name);
+    let mut exprs = p.expr.clone();
+    let map = match &weight {
+        Expr::ScalarFunction(f) if f.name() == "exp" && f.args.len() == 1 => {
+            exprs[w] = f.args[0].clone().alias(name);
+            None
+        }
+        e => {
+            let Some(f) = of_score(e, &sum)? else {
+                return Ok(None);
+            };
+            exprs[w] = Expr::Column(sum).alias(name);
+            Some(f)
+        }
+    };
     let Ok(projection) = Projection::try_new(exprs, Arc::clone(&p.input)) else {
         return Ok(None);
     };
@@ -419,6 +481,7 @@ fn merged_weights(p: &Projection) -> Result<Option<Weights>> {
         shift: Shift::None,
         maximum_per: None,
         columns,
+        map,
     }))
 }
 
@@ -446,19 +509,24 @@ fn pair_weights(p: &Projection) -> Result<Option<Weights>> {
     let mut groups = Vec::new();
     let mut columns = Vec::new();
     let mut score = None;
+    let mut map = None;
     for e in &p.expr {
         match e.clone().unalias() {
             Expr::Column(c) => {
                 columns.push(Some(groups.len()));
                 groups.push(Expr::Column(c));
             }
-            Expr::ScalarFunction(f)
-                if f.name() == "exp" && f.args.len() == 1 && score.is_none() =>
-            {
+            _ if score.is_some() => return Ok(None),
+            Expr::ScalarFunction(f) if f.name() == "exp" && f.args.len() == 1 => {
                 score = Some(f.args[0].clone());
                 columns.push(None);
             }
-            _ => return Ok(None),
+            // Any other weight is its pair's score itself.
+            other => {
+                score = Some(other);
+                map = Some(Expression::column(0, 0));
+                columns.push(None);
+            }
         }
     }
     let Some(score) = score else {
@@ -476,7 +544,27 @@ fn pair_weights(p: &Projection) -> Result<Option<Weights>> {
         shift: Shift::None,
         maximum_per: None,
         columns,
+        map,
     }))
+}
+
+/// Whether `e` is `exp` of the score `score` or of an expression shifting
+/// it, which the softmax's own forms are.
+fn is_exp_of(e: &Expr, score: &Column) -> bool {
+    match e {
+        Expr::ScalarFunction(f) if f.name() == "exp" && f.args.len() == 1 => {
+            match f.args[0].clone().unalias() {
+                Expr::Column(c) => c == *score,
+                Expr::BinaryExpr(BinaryExpr {
+                    left,
+                    op: Operator::Minus,
+                    ..
+                }) => column(&left) == Some(score),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// The fold output `partition_by` partitions by, if it is exactly one of
@@ -576,7 +664,7 @@ pub(crate) fn pipeline(p: &Projection) -> Result<Option<LogicalPlan>> {
         return Ok(None);
     };
     let group_of = |c: &Column| (0..groups).find(|&g| column_at(&p.input, g) == *c);
-    let (normalizer, weighted, z_group, inside) = match value.clone().unalias() {
+    let (mut normalizer, weighted, z_group, inside) = match value.clone().unalias() {
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::Divide,
@@ -613,11 +701,15 @@ pub(crate) fn pipeline(p: &Projection) -> Result<Option<LogicalPlan>> {
     let traced = trace(&agg.input, &sums[weighted])?;
     // With the normalizer inside the sum, `w / z * x` or `w * x / z`: the
     // product of the weight and the value, and `z`.
+    // Without one, the sum is the weighted sum itself, `SUM(w * x)`.
     let (product, z_inside) = match inside {
         false => (traced, None),
-        true => match divided(traced) {
+        true => match divided(traced.clone()) {
             Some((product, z)) => (product, Some(z)),
-            None => return Ok(None),
+            None => {
+                normalizer = Normalizer::None;
+                (traced, None)
+            }
         },
     };
     let Expr::BinaryExpr(BinaryExpr {
@@ -705,12 +797,15 @@ pub(crate) fn pipeline(p: &Projection) -> Result<Option<LogicalPlan>> {
         if !normalizes(relations[nl], &weights, kept, column(&n_key), column(&z))? {
             return Ok(None);
         }
-    } else {
+    } else if normalizer == Normalizer::JoinedRows {
         // `SUM(w)` of the same weights, over the same rows.
         let other = trace(&agg.input, &sums[1 - weighted])?;
         if column(&other) != Some(&w_col) || on.len() != 1 || relations.len() != 2 {
             return Ok(None);
         }
+    } else if on.len() != 1 || relations.len() != 2 {
+        // Unnormalized: the weights and the values, joined on the summed key.
+        return Ok(None);
     }
 
     // The outputs, in the projection's order: the kept output, and the
@@ -776,8 +871,13 @@ pub(crate) fn pipeline(p: &Projection) -> Result<Option<LogicalPlan>> {
     let values_plan = LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(v_rel.clone()))?);
     let Ok(pipeline) = Pipeline::try_new(
         fold.clone(),
-        weights.scores.scale,
-        weights.shift,
+        match &weights.map {
+            Some(f) => Weight::Of(of_value(f, weights.scores.scale)),
+            None => Weight::Exp {
+                scale: weights.scores.scale,
+                shift: weights.shift,
+            },
+        },
         own,
         values,
         outputs,

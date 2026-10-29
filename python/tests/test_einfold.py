@@ -128,6 +128,8 @@ def test_runs_queries_again_and_tables_replaced():
 
 
 def test_in_xarray_sql():
+    """einfold in xarray-sql, an XQL Systems project for querying xarray
+    datasets with SQL, whose context is a DataFusion session."""
     xr = pytest.importorskip("xarray")
     xql = pytest.importorskip("xarray_sql")
     rng = np.random.default_rng(0)
@@ -149,6 +151,8 @@ def test_in_xarray_sql():
 
 
 def test_gradients_through_ddxdb():
+    """Gradients from ddxdb, the Python package of ddx, an XQL Systems
+    project for automatic differentiation of SQL queries."""
     ddxdb = pytest.importorskip("ddxdb")
     loss = ("WITH c AS (SELECT a.s, w.o, SUM(a.val * w.val) AS z FROM a JOIN w ON a.k = w.k "
             "GROUP BY a.s, w.o), loss AS (SELECT SUM(tanh(z) * tanh(z)) AS l FROM c) ")

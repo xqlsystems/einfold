@@ -587,3 +587,66 @@ fn declines_a_pipeline_that_sums_its_own_dimension_away() {
     let piped = einfold_kernels::pipeline(&pipeline, inputs, schema, Options::default()).unwrap();
     assert!(piped.is_none());
 }
+
+/// With no queries or keys, attention has no rows, whatever the values: an
+/// empty `q` and `k` give no positions of the query or of the feature, so no
+/// rows, as SQL's inner joins give none.
+#[test]
+fn gives_no_rows_without_queries_or_keys() {
+    let q = Table::complete(&["t", "d"], &[0, 2], || 0.5);
+    let k = Table::complete(&["t", "d"], &[0, 2], || 0.25);
+    let v = Table::complete(&["t"], &[4], || 1.0);
+    const EQ: Dimension = Dimension {
+        equality: KeyEquality::Equal,
+    };
+    let key = |d, c| Key::new(DimensionId(d), ColumnIndex(c));
+    let out = |d| Output {
+        dimension: DimensionId(d),
+        domain_key: None,
+    };
+    let ops = vec![
+        Operand {
+            keys: vec![key(0, 0), key(1, 1)],
+            factor: Some(ColumnIndex(2)),
+        },
+        Operand {
+            keys: vec![key(2, 0), key(1, 1)],
+            factor: Some(ColumnIndex(2)),
+        },
+    ];
+    let producer = Fold::try_new(
+        vec![EQ; 3],
+        ops,
+        vec![out(0), out(2)],
+        RowValue::Product,
+        Aggregate::sum(),
+        None,
+    )
+    .unwrap();
+    let values = Operand {
+        keys: vec![key(2, 0)],
+        factor: Some(ColumnIndex(1)),
+    };
+    let pipeline = Pipeline::try_new(
+        producer,
+        Scale::One,
+        Shift::KeptMaximum,
+        vec![],
+        values,
+        vec![DimensionId(0)],
+        Normalizer::KeptGroups,
+    )
+    .unwrap();
+    let batches = |t: &Table| t.partitions(&mut Rng::new(1)).concat();
+    let (bq, bk, bv) = (batches(&q), batches(&k), batches(&v));
+    let schemas = [q.schema.as_ref(), k.schema.as_ref(), v.schema.as_ref()];
+    let schema = einfold_kernels::pipeline_schema(&pipeline, &schemas).unwrap();
+    let inputs = [
+        Relation::new(&q.schema, &bq),
+        Relation::new(&k.schema, &bk),
+        Relation::new(&v.schema, &bv),
+    ];
+    let piped = einfold_kernels::pipeline(&pipeline, inputs, schema, Options::default()).unwrap();
+    // Declining is right too: the caller's SQL then gives no rows.
+    assert!(piped.is_none_or(|p| rows(&p.batches).is_empty()));
+}

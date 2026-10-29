@@ -8,9 +8,13 @@
 //! It is loop fusion: the producer's loop over its groups and the consumer's
 //! loop over the values it sums share one loop over pairs of tiles. That
 //! applies to any pipeline whose producer groups pair the consumer's groups
-//! with the dimensions it sums away, whatever the query means. The names
-//! below follow attention, one such query, where they are familiar: the
-//! operands `q`, `k` and `v`, and a query, a key and a feature.
+//! with the dimensions it sums away, whatever the query means. Two such
+//! queries: attention, in which each query position averages the values at
+//! the key positions, weighted by a softmax of its dot products with the
+//! keys; and a kernel smoother, which averages values at source points,
+//! weighted by a function of their distance to each target point. The names
+//! below follow attention, where they are familiar: the operands `q`, `k`
+//! and `v`, and a query, a key and a feature.
 //!
 //! Every dimension has one of four roles:
 //!

@@ -167,7 +167,13 @@ impl QueryPlanner for Bridge {
         use datafusion::physical_planner::PhysicalPlanner;
 
         self.counts.plans.fetch_add(1, Ordering::Relaxed);
-        let plan = lean::localize(relink(plan.clone())?, session).await?;
+        // Copying the session's in-memory tables only saves time: if it
+        // fails, the plan reads them as the session would.
+        let relinked = relink(plan.clone())?;
+        let plan = match lean::localize(relinked.clone(), session).await {
+            Ok(localized) => localized,
+            Err(_) => relinked,
+        };
         let detected = DetectFolds::default().detect(plan)?;
         let nodes = einfold_nodes(&detected)?;
         if nodes.folds + nodes.pipelines > 0 {

@@ -18,7 +18,7 @@ import textwrap
 import numpy as np
 import pyarrow as pa
 import pytest
-from datafusion import SessionContext
+from datafusion import SessionContext, col
 
 from einfold.datafusion import EinFold
 
@@ -339,3 +339,21 @@ def test_tells_unnamed_tables_apart(second):
     _assert_same(off.sql(MATMUL.replace("FROM a", "FROM x a")).to_arrow_table(),
                  on.sql(MATMUL.replace("FROM a", "FROM x a")).to_arrow_table())
     assert found.plans() >= 2
+
+
+def test_tells_a_table_registered_again_apart():
+    """A DataFrame keeps the table its name named when it was made. A plan
+    joining one made before a name was registered again with one made after
+    reads both tables, though they share a name."""
+    def joined(ctx):
+        ctx.register_record_batches("t", [[pa.record_batch({"k": [0, 1], "v": [1.0, 2.0]})]])
+        before = ctx.table("t").select(col("k"), col("v").alias("before"))
+        ctx.deregister_table("t")
+        ctx.register_record_batches("t", [[pa.record_batch({"k": [0, 1], "v": [10.0, 20.0]})]])
+        after = ctx.table("t").select(col("k").alias("k2"), col("v").alias("after"))
+        rows = before.join(after, left_on="k", right_on="k2").select(col("k"), col("before"), col("after"))
+        return sorted(zip(*rows.to_pydict().values()))
+
+    off, on = SessionContext(), SessionContext()
+    _install(on)
+    assert joined(on) == joined(off) == [(0, 1.0, 10.0), (1, 2.0, 20.0)]

@@ -2,8 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Scanning a session's tables through DataFusion's FFI at about the cost of
-//! a table scan: [`Lean`] for any table, and [`localize`] for in-memory ones.
+//! Scanning a session's tables through the FFI (foreign function interface)
+//! of DataFusion, the Rust query engine on Apache Arrow that the session
+//! runs, at about the cost of a table scan: [`Lean`] for any table, and
+//! [`localize`] for in-memory ones.
 //!
 //! Every table a plan reads reaches this library as a foreign table, even an
 //! in-memory one, so each of its scans crosses the FFI. A foreign scan
@@ -24,9 +26,11 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt::{self, Formatter};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::default_table_source::{provider_as_source, source_as_provider};
 use datafusion::catalog::{CatalogProviderList, MemoryCatalogProviderList, Session, TableProvider};
@@ -47,14 +51,16 @@ use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::registry::ExtensionTypeRegistryRef;
 use datafusion::logical_expr::{
     AggregateUDF, Expr, HigherOrderUDF, LogicalPlan, ScalarUDF, TableProviderFilterPushDown,
-    TableScan, TableSource, WindowUDF, UNNAMED_TABLE,
+    TableSource, WindowUDF,
 };
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::statistics::StatisticsArgs;
 use datafusion::physical_plan::{
     self, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
+use futures::StreamExt;
 
 /// A session's table, scanned with the session's configuration only (see
 /// the module's documentation).
@@ -103,15 +109,19 @@ impl TableProvider for Lean {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // The table evaluates the filters given to it, which may name the
-        // session's functions.
-        let plan = match filters.is_empty() {
+        // session's functions: such a scan is planned, and runs, with them.
+        let (plan, functions) = match filters.is_empty() {
             true => {
                 let lean = LeanSession::new(state);
-                self.table.scan(&lean, projection, filters, limit).await?
+                let plan = self.table.scan(&lean, projection, filters, limit).await?;
+                (plan, Functions::Without)
             }
-            false => self.table.scan(state, projection, filters, limit).await?,
+            false => {
+                let plan = self.table.scan(state, projection, filters, limit).await?;
+                (plan, Functions::Kept)
+            }
         };
-        Ok(Arc::new(LeanExec::new(plan)))
+        Ok(Arc::new(LeanExec::new(plan, functions)))
     }
 
     fn supports_filters_pushdown(
@@ -137,27 +147,39 @@ impl TableProvider for Lean {
     }
 }
 
+/// Whether a scan runs with the session's functions.
+#[derive(Clone, Copy, Debug)]
+enum Functions {
+    /// With the session's configuration only: a scan without filters.
+    Without,
+    /// With everything the session's task context has: a scan whose table
+    /// evaluates filters, which may name functions.
+    Kept,
+}
+
 /// A foreign scan, run in a task context with the session's configuration
-/// only, and shown to the planner as a leaf: the planner can't change a
-/// foreign plan's nodes anyway.
+/// only unless it evaluates filters, and shown to the planner as a leaf: the
+/// planner can't change a foreign plan's nodes anyway.
 #[derive(Debug)]
 struct LeanExec {
     plan: Arc<dyn ExecutionPlan>,
+    functions: Functions,
     statistics: OnceLock<Arc<Statistics>>,
 }
 
 impl LeanExec {
-    fn new(plan: Arc<dyn ExecutionPlan>) -> Self {
+    fn new(plan: Arc<dyn ExecutionPlan>, functions: Functions) -> Self {
         LeanExec {
             plan,
+            functions,
             statistics: OnceLock::new(),
         }
     }
 }
 
 impl DisplayAs for LeanExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        self.plan.fmt_as(t, f)
+    fn fmt_as(&self, format: DisplayFormatType, formatter: &mut Formatter) -> fmt::Result {
+        self.plan.fmt_as(format, formatter)
     }
 }
 
@@ -190,7 +212,7 @@ impl ExecutionPlan for LeanExec {
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
         let plan = physical_plan::execution_plan::reset_plan_states(Arc::clone(&self.plan))?;
-        Ok(Arc::new(LeanExec::new(plan)))
+        Ok(Arc::new(LeanExec::new(plan, self.functions)))
     }
 
     fn execute(
@@ -198,7 +220,11 @@ impl ExecutionPlan for LeanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        self.plan.execute(partition, lean_task(&context))
+        let context = match self.functions {
+            Functions::Without => lean_task(&context),
+            Functions::Kept => context,
+        };
+        self.plan.execute(partition, context)
     }
 
     /// The foreign scan's statistics, which it computes from nothing below
@@ -212,14 +238,14 @@ impl ExecutionPlan for LeanExec {
         if args.partition().is_some() {
             return self.plan.statistics_from_inputs(input_stats, args);
         }
-        if let Some(s) = self.statistics.get() {
-            return Ok(Arc::clone(s));
+        if let Some(statistics) = self.statistics.get() {
+            return Ok(Arc::clone(statistics));
         }
-        let s = self.plan.statistics_from_inputs(input_stats, args)?;
-        Ok(Arc::clone(self.statistics.get_or_init(|| s)))
+        let statistics = self.plan.statistics_from_inputs(input_stats, args)?;
+        Ok(Arc::clone(self.statistics.get_or_init(|| statistics)))
     }
 
-    fn metrics(&self) -> Option<physical_plan::metrics::MetricsSet> {
+    fn metrics(&self) -> Option<MetricsSet> {
         self.plan.metrics()
     }
 }
@@ -332,98 +358,175 @@ impl Session for LeanSession<'_> {
 /// keeps a dataset as an in-memory table.
 const COPIED_BYTES: usize = 64 << 20;
 
-/// Which table a scan reads, as far as a plan says.
+/// What a scan of a small in-memory table reads, as far as this library can
+/// tell. Each scan reaches this library as a foreign table of its own, which
+/// says nothing of the table behind it, and a name doesn't say either: a
+/// plan may join a DataFrame made before a name was registered again with
+/// one made after, and every unnamed table, such as a DataFrame's cached
+/// result (`DataFrame.cache()`), is called `?table?`. But a foreign scan of
+/// an in-memory table hands over the table's own buffers, so two scans read
+/// the same table when they have the same name, schema and number of rows,
+/// and every column of their first batch is the same slice of the same
+/// buffers. Columns alone can coincide: two cached results of one table
+/// share the buffers of each column neither changed.
 #[derive(Debug, PartialEq, Eq, Hash)]
-enum Table {
-    /// A table named in the session's catalogs: within one plan, every scan
-    /// of a name reads the same table.
-    Named(TableReference),
-    /// An unnamed table, such as a DataFrame's cached result
-    /// (`DataFrame.cache()`), whose scans are all called `?table?`: the scan's
-    /// own source, by its address, since another unnamed table may be
-    /// scanned in the same plan.
-    Unnamed(usize),
+struct Data {
+    name: TableReference,
+    schema: SchemaRef,
+    rows: usize,
+    /// Each column of the first batch with rows, empty if there's none.
+    first: Vec<Slice>,
 }
 
-impl Table {
-    fn of(scan: &TableScan) -> Self {
-        match scan.table_name.table() == UNNAMED_TABLE && scan.table_name.schema().is_none() {
-            true => Table::Unnamed(Arc::as_ptr(&scan.source) as *const () as usize),
-            false => Table::Named(scan.table_name.clone()),
+/// Where a column's values are: its buffers' addresses, and its offset and
+/// length in them.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Slice {
+    buffers: Vec<usize>,
+    offset: usize,
+    len: usize,
+}
+
+/// Where each of `batch`'s columns is.
+fn slices(batch: &RecordBatch) -> Vec<Slice> {
+    (batch.columns().iter())
+        .map(|column| {
+            let data = column.to_data();
+            let buffers = (data.buffers().iter())
+                .chain(data.nulls().map(|nulls| nulls.buffer()))
+                .map(|buffer| buffer.as_ptr() as usize)
+                .collect();
+            Slice {
+                buffers,
+                offset: data.offset(),
+                len: data.len(),
+            }
+        })
+        .collect()
+}
+
+/// Where each column of `scan`'s first batch with rows is.
+async fn first_of(scan: &Arc<dyn ExecutionPlan>, context: &Arc<TaskContext>) -> Result<Vec<Slice>> {
+    let partitions = scan.properties().output_partitioning().partition_count();
+    for partition in 0..partitions {
+        let mut stream = scan.execute(partition, Arc::clone(context))?;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            if batch.num_rows() > 0 {
+                return Ok(slices(&batch));
+            }
         }
+    }
+    Ok(Vec::new())
+}
+
+/// `table`'s rows, and a scan of them, if it's a small in-memory table: one
+/// DataFusion's own data source scans, as it does an in-memory table, whose
+/// statistics say it holds at most [`COPIED_BYTES`].
+async fn small_scan(
+    table: &Lean,
+    session: &dyn Session,
+) -> Result<Option<(usize, Arc<dyn ExecutionPlan>)>> {
+    let scan = (table.table)
+        .scan(&LeanSession::new(session), None, &[], None)
+        .await?;
+    let statistics = scan.statistics_from_inputs(&[], &StatisticsArgs::new())?;
+    let (Precision::Exact(rows), Precision::Exact(bytes)) =
+        (statistics.num_rows, statistics.total_byte_size)
+    else {
+        return Ok(None);
+    };
+    match scan.name() == "DataSourceExec" && bytes <= COPIED_BYTES {
+        true => Ok(Some((rows, scan))),
+        false => Ok(None),
     }
 }
 
-/// `plan` with each in-memory table it reads replaced by this library's own
-/// copy of it, which shares the table's buffers, so that no scan of it
-/// crosses the FFI: one scan of each crosses it, here, once.
+/// `plan` with each small in-memory table it reads replaced by this
+/// library's own copy of it, which shares the table's buffers, so that no
+/// scan of it crosses the FFI as the query runs. Each table crosses it here,
+/// once, and each scan once more, to tell which table it reads (see
+/// [`Data`]).
 ///
-/// Within one plan, a table's name names one table, so every scan of a name
-/// reads the copy; each scan of an unnamed table reads a copy of its own. A
-/// table is copied only when DataFusion's own data source
-/// scans it, as it does an in-memory table, and the scan's statistics say
-/// it holds at most [`COPIED_BYTES`]. Another source, such as xarray-sql's
-/// lazily loaded datasets, would be read whole here, rather than streamed as
-/// the query runs; a small file, read here, is read once rather than at each
-/// scan. A table given filters to evaluate in its scan keeps its own scans,
-/// since the copy doesn't evaluate them.
+/// A table is copied only when it's small and in memory (see
+/// [`small_scan`]). Another source, such as xarray-sql's lazily loaded
+/// datasets, would be read whole here, rather than streamed as the query
+/// runs. A scan given filters to evaluate keeps its own table, since the
+/// copy doesn't evaluate them.
 pub(crate) async fn localize(plan: LogicalPlan, session: &dyn Session) -> Result<LogicalPlan> {
-    // Each table, unless one of its scans has filters.
-    let mut tables: HashMap<Table, Option<Arc<dyn TableProvider>>> = HashMap::new();
+    // Each scan's table and name, unless the scan has filters.
+    let mut scans: Vec<(Arc<dyn TableSource>, TableReference)> = Vec::new();
     plan.apply_with_subqueries(|node| {
         if let LogicalPlan::TableScan(scan) = node {
-            let provider = source_as_provider(&scan.source)?;
-            let lean = provider.downcast_ref::<Lean>().is_some() && scan.filters.is_empty();
-            let entry = tables
-                .entry(Table::of(scan))
-                .or_insert(Some(provider));
-            if !lean {
-                *entry = None;
+            if scan.filters.is_empty() {
+                scans.push((Arc::clone(&scan.source), scan.table_name.clone()));
             }
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
-    let mut copies: HashMap<Table, Arc<dyn TableSource>> = HashMap::new();
-    let mut context = None;
-    for (name, provider) in tables {
-        let Some(lean) = provider.as_deref().and_then(|p| p.downcast_ref::<Lean>()) else {
+    let address = |source: &Arc<dyn TableSource>| Arc::as_ptr(source) as *const () as usize;
+    let context = lean_task(&session.task_ctx());
+    let mut copies: HashMap<Data, Arc<dyn TableSource>> = HashMap::new();
+    let mut chosen: HashMap<usize, Arc<dyn TableSource>> = HashMap::new();
+    for (source, name) in scans {
+        if chosen.contains_key(&address(&source)) {
+            continue;
+        }
+        let provider = source_as_provider(&source)?;
+        let Some(lean) = provider.downcast_ref::<Lean>() else {
             continue;
         };
-        let scan = lean
-            .table
-            .scan(&LeanSession::new(session), None, &[], None)
-            .await?;
-        let statistics = scan.statistics_from_inputs(&[], &StatisticsArgs::new())?;
-        let small = matches!(statistics.num_rows, Precision::Exact(_))
-            && matches!(statistics.total_byte_size, Precision::Exact(b) if b <= COPIED_BYTES);
-        if scan.name() != "DataSourceExec" || !small {
+        let Some((rows, scan)) = small_scan(lean, session).await? else {
             continue;
-        }
-        let context = context.get_or_insert_with(|| lean_task(&session.task_ctx()));
-        let read = crate::bridge::runtime().spawn(physical_plan::collect_partitioned(
-            scan,
-            Arc::clone(context),
-        ));
-        let partitions = read
+        };
+        // Read on this library's runtime, where the foreign scan's streams
+        // are polled.
+        let task_context = Arc::clone(&context);
+        let probe = Arc::clone(&scan);
+        let first = crate::bridge::runtime()
+            .spawn(async move { first_of(&probe, &task_context).await })
             .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))??;
-        let mut copy = MemTable::try_new(lean.schema(), partitions)?;
-        if let Some(c) = lean.constraints() {
-            copy = copy.with_constraints(c.clone());
-        }
-        copies.insert(name, provider_as_source(Arc::new(copy)));
+            .map_err(|error| DataFusionError::External(Box::new(error)))??;
+        let data = Data {
+            name,
+            schema: lean.schema(),
+            rows,
+            first,
+        };
+        let copy = match copies.get(&data) {
+            Some(copy) => Arc::clone(copy),
+            None => {
+                let read = crate::bridge::runtime().spawn(physical_plan::collect_partitioned(
+                    scan,
+                    Arc::clone(&context),
+                ));
+                let partitions = read
+                    .await
+                    .map_err(|error| DataFusionError::External(Box::new(error)))??;
+                let mut table = MemTable::try_new(lean.schema(), partitions)?;
+                if let Some(constraints) = lean.constraints() {
+                    table = table.with_constraints(constraints.clone());
+                }
+                let copy = provider_as_source(Arc::new(table));
+                copies.insert(data, Arc::clone(&copy));
+                copy
+            }
+        };
+        chosen.insert(address(&source), copy);
     }
-    if copies.is_empty() {
+    if chosen.is_empty() {
         return Ok(plan);
     }
     let copied = plan.transform_up_with_subqueries(|node| match node {
-        LogicalPlan::TableScan(mut scan) => match copies.get(&Table::of(&scan)) {
-            Some(copy) => {
-                scan.source = Arc::clone(copy);
-                Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+        LogicalPlan::TableScan(mut scan) if scan.filters.is_empty() => {
+            match chosen.get(&address(&scan.source)) {
+                Some(copy) => {
+                    scan.source = Arc::clone(copy);
+                    Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+                }
+                None => Ok(Transformed::no(LogicalPlan::TableScan(scan))),
             }
-            None => Ok(Transformed::no(LogicalPlan::TableScan(scan))),
-        },
+        }
         node => Ok(Transformed::no(node)),
     })?;
     Ok(copied.data)

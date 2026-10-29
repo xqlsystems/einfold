@@ -492,11 +492,17 @@ impl ExecutionPlan for EinFoldExec {
                 _ => Precision::Absent,
             },
         };
-        let width: usize = (self.schema().fields().iter())
-            .map(|f| f.data_type().primitive_width().unwrap_or(16))
+        // A row's bytes, where every column's type has a fixed width; the
+        // size is left unknown otherwise, as for text keys, and DataFusion's
+        // join planning goes by the rows.
+        let width: Option<usize> = (self.schema().fields().iter())
+            .map(|f| f.data_type().primitive_width())
             .sum();
         let mut statistics = Statistics::new_unknown(&self.schema());
-        statistics.total_byte_size = num_rows.map(|n| n.saturating_mul(width));
+        statistics.total_byte_size = match width {
+            Some(width) => num_rows.map(|n| n.saturating_mul(width)),
+            None => Precision::Absent,
+        };
         statistics.num_rows = num_rows;
         Ok(Arc::clone(
             self.statistics.get_or_init(|| Arc::new(statistics)),

@@ -245,6 +245,8 @@ struct Rows {
     null_keys: bool,
     /// Whether factors may be NaN or infinite.
     specials: bool,
+    /// Whether factors may be NULL.
+    null_factors: bool,
 }
 
 const MESSY: Rows = Rows {
@@ -252,6 +254,7 @@ const MESSY: Rows = Rows {
     duplicates: true,
     null_keys: true,
     specials: true,
+    null_factors: true,
 };
 
 /// A table with `keys` (one column per dimension, of its type, named
@@ -299,7 +302,8 @@ fn table(
             for (k, v) in keys.iter_mut().zip(&tuple) {
                 k.push(v.clone());
             }
-            values.push(factor(rng, how.specials));
+            let f = factor(rng, how.specials);
+            values.push(if how.null_factors { f } else { f.or(Some(0.5)) });
         }
     }
     let mut columns: Vec<ArrayRef> = keys
@@ -391,19 +395,23 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
     for i in (1..outputs.len()).rev() {
         outputs.swap(i, rng.below(i + 1));
     }
-    // [`BATCHED`]'s tables are complete, so that the dense algorithm runs.
     let how = |rng: &mut Rng| match dense {
-        true if batched => Rows {
+        // A large case is there to cross the dense algorithm's block edges,
+        // so its rows are ones the algorithm takes whatever the fold's
+        // default: every tuple once, with a factor that isn't NULL.
+        true if large.is_some() => Rows {
             present: 1.0,
             duplicates: false,
             null_keys: false,
             specials: rng.chance(0.5),
+            null_factors: false,
         },
         true => Rows {
             present: if rng.chance(0.6) { 1.0 } else { 0.75 },
             duplicates: rng.chance(0.2),
             null_keys: false,
             specials: rng.chance(0.5),
+            null_factors: true,
         },
         false => MESSY,
     };
@@ -869,6 +877,9 @@ async fn fold_matches_sql() {
         check_budget(&case, &mut rng, fail);
         dense_family += usize::from(dense);
         dense_ran += usize::from(ran == Algorithm::Dense);
+        if large.is_some() && ran != Algorithm::Dense {
+            fail(format!("a large case of shape {large:?} ran {ran:?}"));
+        }
         let [op_a, op_b] = case.fold.operands() else {
             unreachable!("two operands")
         };

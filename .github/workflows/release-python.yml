@@ -133,6 +133,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=${GITHUB_REF_NAME#python-v}
-          prerelease=$([[ "$version" =~ [a-z] ]] && echo --prerelease || true)
+          flags=()
+          if [[ "$version" =~ [a-z] ]]; then flags+=(--prerelease); fi
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
-            --title "einfold for Python $version" --generate-notes $prerelease
+            --title "einfold for Python $version" --generate-notes "${flags[@]}"

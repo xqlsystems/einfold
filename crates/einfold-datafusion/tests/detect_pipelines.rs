@@ -40,7 +40,7 @@
 //! `1e-9` of its, and the same NaNs and infinities; a pipeline found exactly
 //! where the query is one (where a key column is nullable, only that none is
 //! found in a look-alike); and the fused algorithm run whenever every key
-//! has one row.
+//! has one row and every value is finite.
 //!
 //! Reproduce a failure with `EINFOLD_SEED=<seed printed>`; search longer with
 //! `EINFOLD_CASES=<n>`.
@@ -266,10 +266,11 @@ impl Damage {
         }
     }
 
-    /// Whether every key has exactly one row, so that the fused algorithm
-    /// must run.
+    /// Whether the fused algorithm must run: every key has exactly one row,
+    /// and every value is finite. With a NaN or an infinity it may decline,
+    /// as it does where unnormalized or expression weights meet one (#116).
     fn complete(self) -> bool {
-        matches!(self, Damage::None | Damage::Special(..))
+        matches!(self, Damage::None)
     }
 }
 

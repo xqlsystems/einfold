@@ -286,8 +286,11 @@ fn weights(plan: &LogicalPlan) -> Result<Option<Weights>> {
                     return Ok(None);
                 };
                 let kept = maximum.kept;
+                // An `=` join: one that matched NULL kept keys would join a
+                // NULL group's scores to its maximum, which SQL's `=` doesn't.
                 if !same_scores(&sc, &maximum.scores)
                     || j.join_type != JoinType::Inner
+                    || j.null_equality != NullEquality::NullEqualsNothing
                     || j.filter.is_some()
                 {
                     return Ok(None);

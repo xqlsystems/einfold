@@ -7,9 +7,11 @@
 //! Nothing in this crate depends on a query engine, so every engine
 //! integration can share it.
 
+pub mod expression;
 pub mod fold;
 pub mod pipeline;
 
+pub use expression::{Binary, Constant, Expression, Unary};
 pub use fold::{
     Aggregate, ColumnIndex, Comparison, Condition, Dimension, DimensionId, Domain, DomainKey,
     Finish, Fold, InvalidFold, Key, KeyEquality, Monoid, Operand, Output, RowValue,

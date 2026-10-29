@@ -313,7 +313,7 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
         fold.dimensions().to_vec(),
         fold.operands().to_vec(),
         outputs,
-        fold.row(),
+        fold.row().clone(),
         fold.aggregate().clone(),
         Some(Domain {
             carry: (0..width).map(ColumnIndex).collect(),

@@ -867,7 +867,7 @@ fn from_domain(p: &Projection, fallback: Fallback) -> Result<Option<LogicalPlan>
         fold.dimensions().to_vec(),
         fold.operands().to_vec(),
         outputs,
-        fold.row(),
+        fold.row().clone(),
         fold.aggregate().clone(),
         Some(spec),
     )

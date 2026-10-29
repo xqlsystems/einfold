@@ -53,6 +53,8 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use crate::expression::Expression;
+
 /// A dimension of a fold: an index into [`Fold::dimensions`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DimensionId(pub usize);
@@ -230,11 +232,15 @@ pub struct Output {
 }
 
 /// What each joined row contributes to its group.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum RowValue {
     /// The product of the operands' factors, NULL when any factor is.
     Product,
+    /// An expression of the joined row's columns (see [`Expression`]). The
+    /// operands' factors play no part: an operand without one still holds
+    /// the columns the expression reads.
+    Expression(Expression),
 }
 
 /// A commutative monoid that folds row values into one part of a group's
@@ -402,7 +408,8 @@ impl Fold {
     ///   supported);
     /// - every dimension is held by some operand;
     /// - no dimension is output twice;
-    /// - some operand has a factor;
+    /// - with a product for the row value, some operand has a factor, and
+    ///   with an expression, it reads only the fold's operands;
     /// - the aggregate's final function names one of its parts;
     /// - with a domain, every output has a domain key, and without one, none
     ///   does.
@@ -439,8 +446,20 @@ impl Fold {
                 return bad(format!("no operand holds dimension {d}"));
             }
         }
-        if operands.iter().all(|op| op.factor.is_none()) {
-            return bad("no operand has a factor".into());
+        match &row {
+            RowValue::Product => {
+                if operands.iter().all(|op| op.factor.is_none()) {
+                    return bad("no operand has a factor".into());
+                }
+            }
+            RowValue::Expression(e) => {
+                if let Some((o, _)) = e.columns().into_iter().find(|&(o, _)| o >= operands.len()) {
+                    return bad(format!(
+                        "the row expression reads operand {o}, of {}",
+                        operands.len()
+                    ));
+                }
+            }
         }
         let mut seen = vec![false; n];
         for o in &outputs {
@@ -533,8 +552,8 @@ impl Fold {
 
     /// What each joined row contributes.
     #[must_use]
-    pub fn row(&self) -> RowValue {
-        self.row
+    pub fn row(&self) -> &RowValue {
+        &self.row
     }
 
     /// How joined rows combine into each group's value.
@@ -572,7 +591,7 @@ impl Fold {
     /// semiring. Derived from the row value and the aggregate, never declared.
     #[must_use]
     pub fn is_einsum(&self) -> bool {
-        self.row == RowValue::Product && self.aggregate.is_sum()
+        matches!(self.row, RowValue::Product) && self.aggregate.is_sum()
     }
 }
 

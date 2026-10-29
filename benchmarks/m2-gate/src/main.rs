@@ -2,11 +2,15 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! einfold's second milestone, measured: demo 1's causal attention, written
-//! in plain SQL, on DataFusion with einfold off and on, and on DuckDB.
+//! einfold's second milestone, measured: one head of causal self-attention,
+//! written in plain SQL, on DataFusion with einfold off and on, and on
+//! DuckDB. The milestone's demonstration is that einfold plans this query as
+//! FlashAttention does, tile by tile with an online softmax, without being
+//! told it is attention.
 //!
 //! The tables are `q`, `k` and `v`, each `(t, d, x)`: token, feature, value,
-//! with 64 features. The query is demo 1's (`docs/demos.md`), in its two
+//! with 64 features. The query is the softmax of the scaled scores
+//! `q · k / 8` under the causal mask `q.t >= k.t`, averaging `v`, in two
 //! spellings: the maximum as a window, and as `GROUP BY` joined back, as ddx,
 //! an XQL Systems project for automatic differentiation of SQL queries,
 //! writes it.
@@ -51,7 +55,7 @@ fn dense(name: &str, l: usize) -> Vec<f64> {
     (0..l * D).map(|r| value(name, r)).collect()
 }
 
-/// Demo 1's query.
+/// The attention query, in `form`'s spelling.
 fn sql(form: &str) -> String {
     let scores = "scores AS (SELECT q.t AS i, k.t AS j, SUM(q.x * k.x) / 8.0 AS s \
                   FROM q JOIN k ON q.d = k.d WHERE q.t >= k.t GROUP BY q.t, k.t)";

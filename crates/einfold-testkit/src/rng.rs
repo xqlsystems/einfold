@@ -54,3 +54,37 @@ impl Rng {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Rng;
+
+    /// A seed means the same case forever: seed 0, unsalted, starts
+    /// SplitMix64 from 0, whose first outputs are the reference
+    /// implementation's.
+    #[test]
+    fn seed_zero_gives_splitmix64s_reference_outputs() {
+        let mut rng = Rng::seeded(0, 0);
+        let first: Vec<u64> = (0..4).map(|_| rng.next_u64()).collect();
+        assert_eq!(
+            first,
+            [
+                0xe220_a839_7b1d_cdaf,
+                0x6e78_9e6a_a1b9_65f4,
+                0x06c4_5d18_8009_454f,
+                0xf88b_b8a8_724c_81ec,
+            ]
+        );
+    }
+
+    /// One seed and salt give one stream, and another salt another.
+    #[test]
+    fn a_seed_and_salt_give_one_stream() {
+        let draw = |salt| {
+            let mut rng = Rng::seeded(0x5eed, salt);
+            (0..8).map(|_| rng.next_u64()).collect::<Vec<_>>()
+        };
+        assert_eq!(draw(1), draw(1));
+        assert_ne!(draw(1), draw(2));
+    }
+}

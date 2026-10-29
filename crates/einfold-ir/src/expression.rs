@@ -72,6 +72,7 @@ pub enum Unary {
 impl Unary {
     /// The operator applied to `x`.
     #[must_use]
+    #[inline]
     pub fn apply(self, x: f64) -> f64 {
         match self {
             Unary::Negate => -x,
@@ -101,6 +102,7 @@ pub enum Binary {
 impl Binary {
     /// The operator applied to `a` and `b`.
     #[must_use]
+    #[inline]
     pub fn apply(self, a: f64, b: f64) -> f64 {
         match self {
             Binary::Add => a + b,

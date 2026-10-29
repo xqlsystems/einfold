@@ -76,7 +76,7 @@ Rust code follows [Google's Rust style guide](https://google.github.io/styleguid
 1. **Fork** the repository on GitHub, and create a branch for your change.
 2. **Keep it small.** A pull request that does one thing is much easier to review than one that does several. If your change grows large, split it into several pull requests, each building on the one before. It's fine to open a follow-up issue for part of the work that can wait.
 3. **Open a pull request** against `main`, and describe what you changed and why. Draft pull requests are welcome if you'd like early feedback.
-4. **Review.** CodeRabbit, an automated reviewer, reviews every pull request, and a maintainer or code owner (see [`.github/CODEOWNERS`](.github/CODEOWNERS)) approves it. A maintainer may approve a defined set of pull requests in advance, such as a stack or everything up to a release; each still merges only once CodeRabbit approves it and CI is green. Pull requests are squash-merged, so your branch's commit history doesn't need to be tidy.
+4. **Review.** CodeRabbit, an automated reviewer, reviews every pull request once it isn't a draft, and a maintainer or code owner (see [`.github/CODEOWNERS`](.github/CODEOWNERS)) approves it. A maintainer may approve a defined set of pull requests in advance, such as a stack or everything up to a release; each still merges only once CodeRabbit approves it and CI is green. Pull requests are squash-merged, so your branch's commit history doesn't need to be tidy.
 
 Don't worry about getting everything right the first time. Reviewers will help.
 

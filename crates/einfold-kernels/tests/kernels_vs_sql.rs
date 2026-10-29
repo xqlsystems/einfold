@@ -809,7 +809,7 @@ fn check_unique_domain(case: &Case, rng: &mut Rng, fail: impl Fn(String)) -> boo
         fold.dimensions().to_vec(),
         fold.operands().to_vec(),
         outputs,
-        fold.row(),
+        fold.row().clone(),
         fold.aggregate().clone(),
         None,
     )

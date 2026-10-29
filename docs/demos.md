@@ -121,7 +121,7 @@ Spike S27 ([`spikes/s27-fused-attention`](spikes/s27-fused-attention/README.md))
 
 ### Success criteria
 
-- **Memory.** The plan never stores the `N×N` scores. Peak memory beyond the inputs and the output is at most one dense copy of the inputs' values, which the fused kernel reads its tiles from, and a constant number of tiles per thread. So it grows linearly in `N`, never quadratically. Reading the tiles from the inputs in place, without the copy, would need the inputs' rows to arrive in position order; it is left for later.
+- **Memory.** The plan never stores the `N×N` scores. Peak memory beyond the inputs and the output is at most one dense copy of the inputs' values (each value written once more, into an array indexed by its keys' positions), which the fused kernel reads its tiles from, and a constant number of tiles per thread. So, for a fixed number of features `d`, it grows linearly in `N`, never quadratically: it is `O(N·d)`. Reading the tiles from the inputs in place, without the copy, would need the inputs' rows to arrive in position order (sorted by their keys, as the array is); it is left for later.
 - **Masks.** With the causal mask, about half the key tiles are never visited.
 - **Correct.**
   - Results are within the error bound of design §8.6 for this accumulator: the summation bound, plus one rounding of `exp` per rescaling. This is tested on ill-conditioned scores.

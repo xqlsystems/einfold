@@ -27,7 +27,7 @@ const L: usize = 150;
 const D: usize = 8;
 const C: usize = 4;
 
-/// The SQL the pipeline stands for: demo 1's causal attention.
+/// The SQL the pipeline stands for: causal attention.
 const SQL: &str = "WITH scores AS (\
       SELECT q.t AS i, k.t AS j, SUM(q.x * k.x) / 8.0 AS s \
       FROM q JOIN k ON q.d = k.d WHERE q.t >= k.t GROUP BY q.t, k.t), \

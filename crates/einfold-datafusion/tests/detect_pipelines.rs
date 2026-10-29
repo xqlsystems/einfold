@@ -408,9 +408,10 @@ async fn einfold_finds_pipelines_and_changes_no_answer() {
     }
 }
 
-/// Demo 1's control, the Nadaraya–Watson estimator, exactly as issue #97
-/// reports it: a Gaussian kernel of the distance between target and source
-/// points in two coordinates, `x` and `y`, averaging the sources' `v`. It is
+/// The Nadaraya–Watson estimator, a kernel smoother used in regridding, as
+/// written for points in two coordinates `x` and `y`: a Gaussian kernel of
+/// the distance between each target and each source point, averaging the
+/// sources' `v`. It is
 /// found as a pipeline, fused, and gives DataFusion's averages.
 #[tokio::test]
 async fn the_nadaraya_watson_control_fuses() {

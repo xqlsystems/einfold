@@ -20,14 +20,20 @@ The design matters for planning, but code must not depend on it: comments and do
 2. **Sketch first** when the work picks a direction: a new public API, a change of scope, or a choice between approaches. Put the sketch (the options, the one you recommend, and why) in an issue or a design-doc pull request, and wait for a maintainer before building on it.
 3. **Branch** per pull request, named `<milestone>/<topic>`, such as `m1/hash-kernel`.
 4. **Ready for review** once CI is green.
-5. **Approval and merge.** Automated review checks the code: CodeRabbit, an automated reviewer configured in [`.coderabbit.yaml`](.coderabbit.yaml), reviews every pull request that isn't a draft, stacked ones included, and approves once its findings are resolved. A maintainer or code owner ([`.github/CODEOWNERS`](.github/CODEOWNERS)) reads every description, and reviews sketches, public APIs (the Python package, SQL behavior, `EXPLAIN` output, errors) and performance claims. A maintainer approves each pull request, or approves a set of them in advance (such as a stack, or everything up to a release) and lets an agent merge each once CodeRabbit approves and CI is green.
+5. **Approval and merge.** Automated review checks the code: CodeRabbit, an automated reviewer configured in [`.coderabbit.yaml`](.coderabbit.yaml), reviews every pull request that isn't a draft, stacked ones included, and approves once its findings are resolved. A maintainer or code owner ([`.github/CODEOWNERS`](.github/CODEOWNERS)) reads every description, and reviews sketches, public APIs (the Python package, SQL behavior, `EXPLAIN` output, errors) and performance claims. A maintainer approves each pull request, or approves a set of them in advance (such as a stack, or everything up to a release) and lets an agent merge each once it passes the merge gate:
+   - CI is green;
+   - every CodeRabbit finding is fixed, or answered with a reason;
+   - every Major or Critical finding, and every finding about performance, is fixed, never deferred;
+   - a Minor finding or nitpick may be deferred to an issue, linked from the reply.
+
+   CodeRabbit's approval passes the gate on its own. Resolve the threads you fix, and reply only where you don't: CodeRabbit answers a limited number of replies an hour.
 6. **Releases.** Python pre-releases are acceptance-tested by their users, such as [xarray-sql](https://github.com/xqlsystems/xarray-sql) (an XQL Systems project that queries Xarray datasets, the labeled N-dimensional arrays of scientific Python, with SQL). Their findings, not the claims in a pull request, decide whether a release is ready.
 
 ## Size
 
-Aim for about **400 changed lines of non-test code** per pull request. When work is bigger:
+A pull request is one coherent change that a reviewer can follow from its description: often a few hundred lines of non-test code, sometimes more. Split work that does several things. When work is bigger than one change:
 
-- **split it into stacked pull requests,** each coherent and reviewable on its own. This is the default;
+- **stack pull requests,** each coherent on its own, but keep stacks shallow, three or four deep, and merge the bottom before building far above it: a fix low in a deep stack conflicts with everything above it;
 - **or open a follow-up issue** for the part that can genuinely wait, and link it from the pull request.
 
 ## Identities

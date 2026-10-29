@@ -47,8 +47,7 @@ use datafusion::common::tree_node::Transformed;
 use datafusion::common::{Column, DFSchema, NullEquality, Result, ScalarValue};
 use datafusion::functions_aggregate::sum::Sum;
 use datafusion::logical_expr::{
-    Aggregate, Between, BinaryExpr, Expr, ExprSchemable, Join, JoinType, LogicalPlan, Operator,
-    Projection,
+    Aggregate, Between, BinaryExpr, Expr, Join, JoinType, LogicalPlan, Operator, Projection,
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use einfold_ir::{
@@ -589,6 +588,8 @@ fn comparisons(
         let key = keys[s].iter().find(|k| k.column == ColumnIndex(c))?;
         Some((s, key.dimension))
     };
+    use datafusion::logical_expr::ExprSchemable;
+
     // `left - right <op> 0`, as signed terms and a constant.
     let mut sum = Linear::default();
     sum.add(left, 1, &dimension)?;
@@ -599,29 +600,39 @@ fn comparisons(
         arithmetic,
     } = sum;
     // `a - b + constant <op> 0` is `a <op> b - constant`.
-    let ((l, ls, le), (r, rs, re)) = match terms[..] {
-        [(1, s, d, e), (-1, t, f, g)] => ((d, s, e), (f, t, g)),
-        [(-1, t, f, g), (1, s, d, e)] => ((d, s, e), (f, t, g)),
+    let (plus, minus) = match &terms[..] {
+        [a, b] if (a.sign, b.sign) == (1, -1) => (a, b),
+        [b, a] if (a.sign, b.sign) == (1, -1) => (a, b),
         _ => return None,
     };
-    let int64 = |e: &Expr, s: usize| e.get_type(inputs[s]).ok() == Some(DataType::Int64);
-    if ls == rs || l == r || (arithmetic && !(int64(le, ls) && int64(re, rs))) {
+    let int64 = |t: &Term| t.expression.get_type(inputs[t.side]).ok() == Some(DataType::Int64);
+    let crosses = plus.side != minus.side && plus.dimension != minus.dimension;
+    if !crosses || (arithmetic && !(int64(plus) && int64(minus))) {
         return None;
     }
     Some(vec![Condition {
-        left: l,
+        left: plus.dimension,
         comparison,
-        right: r,
+        right: minus.dimension,
         offset: i64::try_from(-constant).ok()?,
     }])
 }
 
-/// An integer expression of keys as a sum: signed key terms, each with its
-/// side of the join, dimension and expression, plus a constant; and whether
-/// it did any arithmetic.
+/// A key in a [`Linear`] sum.
+struct Term<'a> {
+    /// `1` or `-1`.
+    sign: i8,
+    /// Which side of the join the key is on.
+    side: usize,
+    dimension: DimensionId,
+    expression: &'a Expr,
+}
+
+/// An integer expression of keys as a sum: signed key terms, plus a
+/// constant; and whether it did any arithmetic.
 #[derive(Default)]
 struct Linear<'a> {
-    terms: Vec<(i8, usize, DimensionId, &'a Expr)>,
+    terms: Vec<Term<'a>>,
     constant: i128,
     arithmetic: bool,
 }
@@ -654,8 +665,13 @@ impl<'a> Linear<'a> {
                 Some(())
             }
             e => {
-                let (s, d) = dimension(e)?;
-                self.terms.push((sign, s, d, e));
+                let (side, dimension) = dimension(e)?;
+                self.terms.push(Term {
+                    sign,
+                    side,
+                    dimension,
+                    expression: e,
+                });
                 Some(())
             }
         }

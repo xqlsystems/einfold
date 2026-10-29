@@ -167,7 +167,7 @@ pub(crate) fn pipeline(
             },
             _ => return Ok(None),
         };
-        mask.push((condition.comparison, condition.offset));
+        mask.push(condition);
     }
 
     // Each batch's keys as positions, and each dimension's extent.
@@ -250,9 +250,9 @@ pub(crate) fn pipeline(
         let x = i128::try_from(x).expect("a position fits in i128");
         let n = i128::try_from(nj).expect("an extent fits in i128");
         let (mut lo, mut hi) = (0i128, n);
-        for &(comparison, offset) in &mask {
-            let bound = x - i128::from(offset);
-            match comparison {
+        for condition in &mask {
+            let bound = x - i128::from(condition.offset);
+            match condition.comparison {
                 Comparison::GreaterOrEqual => hi = hi.min(bound + 1),
                 Comparison::Greater => hi = hi.min(bound),
                 Comparison::LessOrEqual => lo = lo.max(bound),

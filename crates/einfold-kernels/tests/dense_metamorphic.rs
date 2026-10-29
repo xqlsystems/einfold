@@ -61,8 +61,17 @@
 //! seeds from `EINFOLD_SEED` and skipping shapes too large for the oracle,
 //! and asserts that each regime and each edge was reached. Reproduce a
 //! failure with `EINFOLD_SEED=<seed> EINFOLD_CASES=1`.
+//!
+//! A failing case is shrunk before it's reported: the test drops its domain,
+//! removes ranges of its rows, sets its factors to 1 and renumbers its keys
+//! from 0, keeping each change after which the case still fails the same
+//! property, and reports the smallest case it found. It stops after
+//! `EINFOLD_SHRINK_TRIES` tries (default 400; 0 turns shrinking off) or
+//! `EINFOLD_SHRINK_SECS` seconds (default 60). Shrinking is deterministic, so
+//! the seed reproduces the shrunk case too.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, UInt32Array};
@@ -72,30 +81,8 @@ use einfold_ir::{
     Operand, Output, RowValue,
 };
 use einfold_kernels::{Algorithm, DomainRows, FloatKeys, Host, Options, Relation};
-
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) ^ 0x00de_75e5)
-    }
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n.max(1) as u64) as usize
-    }
-    fn chance(&mut self, p: f64) -> bool {
-        ((self.next() >> 11) as f64) / ((1u64 << 53) as f64) < p
-    }
-    fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
-        xs[self.below(xs.len())]
-    }
-}
+use einfold_testkit::shrink::{self, Budget, Shrink};
+use einfold_testkit::Rng;
 
 /// A NULL key, in a domain only.
 const NULL_KEY: i64 = i64::MIN;
@@ -146,6 +133,161 @@ impl Case {
     fn cells(&self, dims: &[usize]) -> usize {
         dims.iter().map(|&d| self.extent[d]).product()
     }
+
+    /// The case with each dimension's extent its largest key in either
+    /// operand, plus one, as the dense algorithm finds it.
+    fn fitted(mut self) -> Case {
+        self.extent.fill(0);
+        for rel in [&self.a, &self.b] {
+            for row in &rel.keys {
+                for (&d, &k) in rel.dims.iter().zip(row) {
+                    self.extent[d] = self.extent[d].max(k as usize + 1);
+                }
+            }
+        }
+        self
+    }
+
+    /// The case with the keys of each of `dims` replaced by their ranks
+    /// among that dimension's keys in every table, in order, or `None` if
+    /// that changes no key. Order is kept, so each cell's terms are added in
+    /// the same order of `z`.
+    fn compacted(&self, dims: &[usize]) -> Option<Case> {
+        let mut rels: Vec<&Rel> = vec![&self.a, &self.b];
+        rels.extend(self.domain.as_ref().map(|d| &d.rel));
+        let mut ranks: Vec<BTreeMap<i64, i64>> = vec![BTreeMap::new(); self.extent.len()];
+        for rel in &rels {
+            for row in &rel.keys {
+                for (&d, &k) in rel.dims.iter().zip(row) {
+                    if k != NULL_KEY && dims.contains(&d) {
+                        ranks[d].insert(k, 0);
+                    }
+                }
+            }
+        }
+        for keys in &mut ranks {
+            for (i, rank) in keys.values_mut().enumerate() {
+                *rank = i as i64;
+            }
+        }
+        if (ranks.iter()).all(|keys| keys.iter().all(|(k, rank)| k == rank)) {
+            return None;
+        }
+        let rank = |rel: &mut Rel| {
+            for row in &mut rel.keys {
+                for (&d, k) in rel.dims.iter().zip(row.iter_mut()) {
+                    if *k != NULL_KEY && dims.contains(&d) {
+                        *k = ranks[d][k];
+                    }
+                }
+            }
+        };
+        let mut c = self.clone();
+        rank(&mut c.a);
+        rank(&mut c.b);
+        if let Some(d) = c.domain.as_mut() {
+            rank(&mut d.rel);
+        }
+        Some(c.fitted())
+    }
+
+    /// The case's dimensions and tables, for a failure report.
+    fn dump(&self) -> String {
+        let mut s = format!(
+            "  xs {:?}, zs {:?}, ys {:?}, outputs {:?}, extents {:?}{}\n",
+            self.xs,
+            self.zs,
+            self.ys,
+            self.outputs,
+            self.extent,
+            if self.sparse { ", sparse" } else { "" }
+        );
+        let mut table = |name: &str, rel: &Rel| {
+            s += &format!("  {name} over {:?}, {} rows:\n", rel.dims, rel.keys.len());
+            for (k, v) in rel.keys.iter().zip(&rel.values).take(24) {
+                s += &format!("    {k:?} {v:?}\n");
+            }
+            if rel.keys.len() > 24 {
+                s += &format!("    … and {} more\n", rel.keys.len() - 24);
+            }
+        };
+        table("a", &self.a);
+        table("b", &self.b);
+        if let Some(d) = &self.domain {
+            table(
+                &format!("domain ({:?}, default {:?})", d.equality, d.missing),
+                &d.rel,
+            );
+        }
+        s
+    }
+}
+
+impl Rel {
+    fn without(&self, rows: Range<usize>) -> Rel {
+        Rel {
+            dims: self.dims.clone(),
+            keys: shrink::without(&self.keys, rows.clone()),
+            values: shrink::without(&self.values, rows),
+        }
+    }
+}
+
+/// Simpler cases, the biggest simplifications first: without the domain;
+/// without ranges of a's, b's or the domain's rows; with ranges of factors
+/// 1; with compacted keys, in every dimension and then in each. A sparse case keeps its rows and keys, since the
+/// property it checks is that its sparseness declines the dense algorithm.
+impl Shrink for Case {
+    fn candidates(&self) -> Box<dyn Iterator<Item = Case> + '_> {
+        let undomained = (self.domain.is_some()).then(|| Case {
+            domain: None,
+            ..self.clone()
+        });
+        let rows = |pick: fn(&mut Case) -> &mut Rel| {
+            let n = pick(&mut self.clone()).keys.len();
+            shrink::removals(n).map(move |r| {
+                let mut c = self.clone();
+                let rel = pick(&mut c);
+                *rel = rel.without(r);
+                c.fitted()
+            })
+        };
+        let removed = (!self.sparse)
+            .then(|| {
+                let domain = (self.domain.is_some())
+                    .then(|| rows(|c| &mut c.domain.as_mut().expect("a domain").rel))
+                    .into_iter()
+                    .flatten();
+                rows(|c| &mut c.a).chain(rows(|c| &mut c.b)).chain(domain)
+            })
+            .into_iter()
+            .flatten();
+        let ones = |pick: fn(&mut Case) -> &mut Rel| {
+            let n = pick(&mut self.clone()).values.len();
+            shrink::removals(n).filter_map(move |r| {
+                let mut c = self.clone();
+                let values = &mut pick(&mut c).values[r];
+                let changes = values.iter().any(|&v| v != Some(1.0));
+                values.fill(Some(1.0));
+                changes.then_some(c)
+            })
+        };
+        let all: Vec<usize> = (0..self.extent.len()).collect();
+        let compacted = (!self.sparse)
+            .then(|| {
+                let each = (0..self.extent.len()).filter_map(|d| self.compacted(&[d]));
+                self.compacted(&all).into_iter().chain(each)
+            })
+            .into_iter()
+            .flatten();
+        Box::new(
+            (undomained.into_iter())
+                .chain(removed)
+                .chain(ones(|c| &mut c.a))
+                .chain(ones(|c| &mut c.b))
+                .chain(compacted),
+        )
+    }
 }
 
 fn value(rng: &mut Rng, specials: bool) -> Option<f64> {
@@ -155,7 +297,7 @@ fn value(rng: &mut Rng, specials: bool) -> Option<f64> {
         7 if specials => Some(f64::INFINITY),
         8..=10 => Some(-0.0),
         11..=16 => Some(if rng.chance(0.5) { 1e16 } else { -1e16 }),
-        _ => Some(((rng.next() >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 8.0),
+        _ => Some((rng.unit() - 0.5) * 8.0),
     }
 }
 
@@ -167,7 +309,7 @@ fn factor(rng: &mut Rng, t: usize, empty: bool) -> Vec<usize> {
     }
     let divisors: Vec<usize> = (2..t).filter(|&d| t.is_multiple_of(d)).collect();
     if !divisors.is_empty() && rng.chance(0.5) {
-        let d = rng.pick(&divisors);
+        let d = *rng.pick(&divisors);
         return vec![d, t / d];
     }
     vec![t]
@@ -223,8 +365,8 @@ fn case(rng: &mut Rng) -> Option<Case> {
         0..=2 => {
             let p = near(rng, FEW_CELLS);
             let divisors: Vec<usize> = (1..=p).filter(|&d| p.is_multiple_of(d)).collect();
-            let nx = rng.pick(&divisors);
-            (nx, p / nx, rng.pick(&Z_EDGES[..4]))
+            let nx = *rng.pick(&divisors);
+            (nx, p / nx, *rng.pick(&Z_EDGES[..4]))
         }
         3 | 4 => (near(rng, XB), 17 + rng.below(24), small(rng)),
         5 | 6 => (2 + rng.below(5), near(rng, YB), small(rng)),
@@ -234,7 +376,7 @@ fn case(rng: &mut Rng) -> Option<Case> {
                 if rng.chance(0.25) {
                     1 + rng.below(6)
                 } else {
-                    rng.pick(edges)
+                    *rng.pick(edges)
                 }
             };
             (
@@ -711,19 +853,49 @@ struct Stats {
     sparse: usize,
 }
 
+/// The salts of a seed's two streams: one draws the case, the other the
+/// threads, batching and permutations its properties run with. Apart, a
+/// shrunk case runs with the same stream as the case it came from.
+const CASE_SALT: u64 = 0x00de_75e5;
+const RUN_SALT: u64 = 0x0005_eed5;
+
+/// Draws `seed`'s case and checks its properties; a failing case is shrunk,
+/// and reported with the smallest case found that fails the same way.
 fn check(seed: u64, stats: &mut Stats) -> Result<(), String> {
-    let mut rng = Rng::new(seed);
     stats.seeds += 1;
-    let Some(case) = case(&mut rng) else {
+    let Some(case) = case(&mut Rng::seeded(seed, CASE_SALT)) else {
         stats.skipped += 1;
         return Ok(());
     };
     stats.cases += 1;
+    let Some(failure) = shrink::failure_of(|| properties(&case, seed, stats)) else {
+        return Ok(());
+    };
+    let shrunk = shrink::shrink(case, failure.clone(), Budget::from_env(400, 60), |c| {
+        shrink::failure_of(|| properties(c, seed, &mut Stats::default()))
+    });
+    let budget = if shrunk.exhausted {
+        ", where the budget ran out"
+    } else {
+        ""
+    };
+    Err(format!(
+        "{failure}\n  shrunk in {} steps ({} tries{budget}) to: {}\n{}",
+        shrunk.steps,
+        shrunk.tries,
+        shrunk.failure,
+        shrunk.case.dump()
+    ))
+}
+
+/// Checks `case`'s properties, tallying what they reached in `stats`.
+fn properties(case: &Case, seed: u64, stats: &mut Stats) -> Result<(), String> {
+    let mut rng = Rng::seeded(seed, RUN_SALT);
     let keys = case.outputs.len();
     let int64 = DataType::Int64;
-    let first = run(&case, &mut rng, &int64, false, true, Mode::Best).expect("runs");
+    let first = run(case, &mut rng, &int64, false, true, Mode::Best).expect("runs");
     let ours = rows(&first.batches, keys);
-    let want = expected(&case, true);
+    let want = expected(case, true);
     matches("oracle", &ours, &want)?;
     if case
         .domain
@@ -760,19 +932,19 @@ fn check(seed: u64, stats: &mut Stats) -> Result<(), String> {
     }
 
     // [threads]
-    let again = run(&case, &mut rng, &int64, false, true, Mode::Best).expect("runs");
+    let again = run(case, &mut rng, &int64, false, true, Mode::Best).expect("runs");
     if bits(&rows(&again.batches, keys)) != bits(&ours) {
         return Err("[threads] other threads and batches changed the bits".into());
     }
 
     // [scale]: doubling and negating a's factors, without a domain, whose
     // default doesn't scale.
-    let base = run(&case, &mut rng, &int64, false, false, Mode::Best).expect("runs");
+    let base = run(case, &mut rng, &int64, false, false, Mode::Best).expect("runs");
     let base_rows = rows(&base.batches, keys);
     type Map = fn(f64) -> f64;
     let maps: [(&str, Map); 2] = [("doubling", |v| v * 2.0), ("negating", |v| -v)];
     for (tag, f) in maps {
-        let mapped = map_a(&case, f);
+        let mapped = map_a(case, f);
         let r = run(&mapped, &mut rng, &int64, false, false, Mode::Best).expect("runs");
         if r.algorithm != base.algorithm {
             continue;
@@ -847,7 +1019,7 @@ fn check(seed: u64, stats: &mut Stats) -> Result<(), String> {
     let fits =
         |r: &Rel| (r.keys.iter().flatten()).all(|&k| k == NULL_KEY || (0..32_000).contains(&k));
     if fits(&case.a) && fits(&case.b) && case.domain.as_ref().is_none_or(|d| fits(&d.rel)) {
-        let narrow = run(&case, &mut rng, &ty, false, true, Mode::Best).expect("runs");
+        let narrow = run(case, &mut rng, &ty, false, true, Mode::Best).expect("runs");
         if narrow.algorithm == first.algorithm && bits(&rows(&narrow.batches, keys)) != bits(&ours)
         {
             return Err(format!("[key-type] {ty} keys changed the bits"));
@@ -880,9 +1052,9 @@ fn check(seed: u64, stats: &mut Stats) -> Result<(), String> {
             .filter(|k| in_range(k))
             .any(|k| !seen.insert(k.clone()));
         let any = Mode::Dense(DomainRows::Any);
-        let unchecked = run(&case, &mut rng, &int64, false, true, any);
+        let unchecked = run(case, &mut rng, &int64, false, true, any);
         let unique = Mode::Dense(DomainRows::UniqueKeys);
-        let checked = run(&case, &mut rng, &int64, false, true, unique);
+        let checked = run(case, &mut rng, &int64, false, true, unique);
         match (unchecked, checked) {
             (Some(_), Some(_)) if repeated => {
                 return Err("[unique] accepted two domain rows that share a cell".into())
@@ -912,13 +1084,14 @@ fn check(seed: u64, stats: &mut Stats) -> Result<(), String> {
     matches("hash", &rows(&hashed.batches, keys), &want)?;
 
     // [duplicates]: a repeated row of a or b.
-    if dense {
-        let mut dup = case.clone();
-        let side = if rng.chance(0.5) {
-            &mut dup.a
-        } else {
-            &mut dup.b
-        };
+    let mut dup = case.clone();
+    let side = if rng.chance(0.5) {
+        &mut dup.a
+    } else {
+        &mut dup.b
+    };
+    // A shrunk case can have an empty side, with no row to repeat.
+    if dense && !side.keys.is_empty() {
         let r = rng.below(side.keys.len());
         side.keys.push(side.keys[r].clone());
         side.values.push(Some(0.5));
@@ -936,7 +1109,7 @@ fn check(seed: u64, stats: &mut Stats) -> Result<(), String> {
 
     // [swap]
     if case.domain.is_none() {
-        let swapped = run(&case, &mut rng, &int64, true, true, Mode::Best).expect("runs");
+        let swapped = run(case, &mut rng, &int64, true, true, Mode::Best).expect("runs");
         matches("swap", &rows(&swapped.batches, keys), &want)?;
     }
     Ok(())

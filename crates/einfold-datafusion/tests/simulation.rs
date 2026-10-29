@@ -137,6 +137,12 @@ enum Known {
     /// repartition, on a first run as on a rerun: no repartitioning, and no
     /// `[rerun]`, with a pool (einfold#71, upstream).
     ResetRerunUnderPool,
+    /// DataFusion's `EliminateCrossJoin` makes an `=` in the WHERE clause a
+    /// key of the join below it, and gives it that join's NULL equality: over
+    /// an `IS NOT DISTINCT FROM` join, NULL then equals NULL. No
+    /// `[partition]` where a mask's `=` is over such a join (einfold#21,
+    /// upstream).
+    WhereEqualityNullsEqual,
 }
 
 const KNOWN: &[Known] = &[
@@ -145,6 +151,7 @@ const KNOWN: &[Known] = &[
     Known::SortMergeSignedZeros,
     Known::SortMergeFilterProjection,
     Known::ResetRerunUnderPool,
+    Known::WhereEqualityNullsEqual,
 ];
 
 impl check::Settings {
@@ -569,7 +576,10 @@ async fn run_case(case: &Case) -> Outcome {
     // case are, between them, exactly the unmasked fold's, with the same
     // values.
     if let (Some(m), Values::Exact) = (&case.query.mask, case.values) {
-        if m.partitions {
+        let nulls_equal = m.condition.contains(" = ")
+            && case.query.sql.contains("IS NOT DISTINCT FROM")
+            && avoids(Known::WhereEqualityNullsEqual);
+        if m.partitions && !nulls_equal {
             trace("einfold, partition");
             let with = |c: &str| m.template.replace("{MASK}", c);
             let all = check::run(&host, &with("TRUE")).await.result;

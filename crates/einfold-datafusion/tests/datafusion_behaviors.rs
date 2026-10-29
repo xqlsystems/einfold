@@ -16,7 +16,8 @@
 //!
 //! **NULL equality in join chains** (einfold issues #21 and #22). A join on
 //! `=` and one on `IS NOT DISTINCT FROM` in the same chain can share one
-//! setting for whether NULL matches NULL, so one of them answers wrongly.
+//! setting for whether NULL matches NULL, so one of them answers wrongly. An
+//! `=` in the WHERE clause over an `IS NOT DISTINCT FROM` join does too.
 //!
 //! **TopK over signed zeros** (einfold issue #63). `ORDER BY … LIMIT` over a
 //! float column holding `-0.0` and `0.0` gives answers that depend on
@@ -201,6 +202,25 @@ async fn mixed_null_equality_in_a_join_chain_matches_null_with_equals() {
                  JOIN c ON (c.column1 IS NOT DISTINCT FROM a.column1)";
     assert_eq!(count(&ctx, equals).await, 0);
     assert_eq!(count(&ctx, mixed).await, 1, "wrong: should be 0");
+}
+
+/// Issue #21 again, with one join: the `=` in the WHERE clause becomes a
+/// second key of the IS NOT DISTINCT FROM join, and matches NULL to NULL
+/// with it. l.a and r.b are NULL, so `l.a = r.b` is NULL and the answer is
+/// no rows, as it is with the same condition in ON. Fails once fixed.
+#[tokio::test]
+async fn where_equality_on_a_not_distinct_join_matches_null_with_equals() {
+    let ctx = SessionContext::new();
+    for sql in [
+        "CREATE TABLE l (a BIGINT, b BIGINT) AS VALUES (NULL, 2)",
+        "CREATE TABLE r (a BIGINT, b BIGINT) AS VALUES (2, NULL)",
+    ] {
+        run(&ctx, sql).await;
+    }
+    let on = "SELECT l.a FROM r JOIN l ON (l.b IS NOT DISTINCT FROM r.a) AND (l.a = r.b)";
+    let filtered = "SELECT l.a FROM r JOIN l ON (l.b IS NOT DISTINCT FROM r.a) WHERE (l.a = r.b)";
+    assert_eq!(count(&ctx, on).await, 0);
+    assert_eq!(count(&ctx, filtered).await, 1, "wrong: should be 0");
 }
 
 /// Issue #22. NULL IS NOT DISTINCT FROM NULL, so the join keeps a's row, and

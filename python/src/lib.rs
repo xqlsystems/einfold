@@ -32,6 +32,7 @@ use datafusion_ffi::execution::FFI_TaskContextProvider;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::proto::physical_extension_codec::FFI_PhysicalExtensionCodec;
 use datafusion_ffi::query_planner::FFI_QueryPlanner;
+use mimalloc::MiMalloc;
 use pyo3::exceptions::PyImportError;
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyDict};
@@ -43,7 +44,7 @@ mod stack;
 
 /// mimalloc, the allocator datafusion-python uses (see `Cargo.toml`).
 #[global_allocator]
-static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOCATOR: MiMalloc = MiMalloc;
 
 use bridge::{Bridge, Counts};
 use codec::ByReference;

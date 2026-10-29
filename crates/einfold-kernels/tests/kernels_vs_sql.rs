@@ -419,7 +419,9 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
     };
     let domain = with_domain.then(|| Domain {
         carry: (0..outputs.len()).map(ColumnIndex).collect(),
-        // The dense family leans to 0.0, the default ddx's gradients use, and
+        // The dense family leans to 0.0, the default that gradients from ddx
+        // (an XQL Systems project for automatic differentiation of SQL
+        // queries) use, and
         // the one that lets the dense path ignore which groups exist.
         missing: match rng.below(if dense { 5 } else { 3 }) {
             0 => None,

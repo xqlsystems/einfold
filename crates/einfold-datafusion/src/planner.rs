@@ -63,8 +63,9 @@ impl ExtensionPlanner for EinFoldPlanner {
 /// `SessionStateBuilder::with_query_planner`, or use [`install`](crate::install).
 ///
 /// Detecting here, rather than among the optimizer's rules, keeps `Fold`
-/// nodes out of optimized logical plans, which other code reads: ddx, for
-/// one, turns them into Substrait to differentiate them, and Substrait can't
+/// nodes out of optimized logical plans, which other code reads: ddx, an XQL
+/// Systems project for automatic differentiation of SQL queries, turns them
+/// into Substrait to differentiate them, and Substrait can't
 /// encode a `Fold`. Only the plan that runs has them. It is also where a host
 /// that can't add optimizer rules from outside, such as DataFusion's Python
 /// bindings, can take a query planner.

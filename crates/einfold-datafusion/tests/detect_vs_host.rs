@@ -16,8 +16,10 @@
 //! - **folds** (`SUM` of a product over an inner equi-join, grouped by columns
 //!   of either side, with `=` or `IS NOT DISTINCT FROM`, factors that are
 //!   expressions, aliases), which the rule must replace;
-//! - **folds from a domain** (ddx's left join from `d` onto a fold, with its
-//!   `CASE`), which the rule must turn into a fold with `d` as its domain;
+//! - **folds from a domain** (the left join from `d` onto a fold, with its
+//!   `CASE`, that ddx, an XQL Systems project for automatic differentiation
+//!   of SQL queries, writes for a gradient), which the rule must turn into a
+//!   fold with `d` as its domain;
 //! - **look-alikes** it must leave alone: a mask (`AND l.a >= r.b`), no
 //!   `GROUP BY`, `AVG` rather than `SUM`, and a sum that isn't a product;
 //!   and look-alikes of a fold from a domain, in which it must find the fold

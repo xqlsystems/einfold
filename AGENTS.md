@@ -17,9 +17,11 @@ The design matters for planning, but code must not depend on it: comments and do
 ## From request to merge
 
 1. **Start** from a maintainer's request, a milestone in the design, or an issue. An issue states goals, constraints and motivation, not an API: the design of the code is the implementer's to judge.
-2. **Branch** per pull request, named `<milestone>/<topic>`, such as `m1/hash-kernel`.
-3. **Ready for review** once CI is green.
-4. **Approval and merge** by a maintainer or code owner ([`.github/CODEOWNERS`](.github/CODEOWNERS)).
+2. **Sketch first** when the work picks a direction: a new public API, a change of scope, or a choice between approaches. Put the sketch (the options, the one you recommend, and why) in an issue or a design-doc pull request, and wait for a maintainer before building on it.
+3. **Branch** per pull request, named `<milestone>/<topic>`, such as `m1/hash-kernel`.
+4. **Ready for review** once CI is green.
+5. **Approval and merge.** Automated review checks the code: CodeRabbit, an automated reviewer configured in [`.coderabbit.yaml`](.coderabbit.yaml), reviews every pull request, stacked ones included, and approves once its findings are resolved. A maintainer or code owner ([`.github/CODEOWNERS`](.github/CODEOWNERS)) reads every description, and reviews sketches, public APIs (the Python package, SQL behavior, `EXPLAIN` output, errors) and performance claims. A maintainer may let an agent merge once CodeRabbit approves and CI is green.
+6. **Releases.** Python pre-releases are acceptance-tested by their users, such as xarray-sql (a project that queries Xarray datasets, the labeled N-dimensional arrays of scientific Python, with SQL). Their findings, not the claims in a pull request, decide whether a release is ready.
 
 ## Size
 
@@ -38,6 +40,7 @@ Pull requests are squash-merged, and the squash commit's message is the pull req
 
 - the **title** is the commit subject, in the imperative mood ("Add the EinFold hash kernel");
 - the **description** is the commit body: plain prose saying what changed and why. Keep checklists inside HTML comments, and edit the description as the pull request evolves;
+- a maintainer reads the description rather than the diff, so follow the [template](.github/pull_request_template.md): lead with what changes for a user, list the **decisions to review**, each linked to the code, with the alternative you didn't take, then the invariants the tests check. Keep it short; a long description hides the decisions;
 - every commit an agent writes carries a `Co-Authored-By:` trailer naming its model. GitHub carries these into the squash commit.
 
 ## Code comments
@@ -47,6 +50,17 @@ A maintainer must be able to understand a file without the design doc. So:
 - **Never cite the design doc from code** (no "design §8.3"). Instead, explain the concept where it is used: what a partial aggregate is, why NULL keys matter, why an order is fixed.
 - **Say what the code means in SQL terms** where that helps: which query it is equivalent to, and how NULLs and duplicates behave.
 - **Keep comments true.** Update them with the code.
+
+## Rust style
+
+einfold's Rust follows [Google's Rust style guide](https://google.github.io/styleguide/rustguide.html), and CodeRabbit checks it. In particular:
+
+- call functions through their module (`compute::cast`) and import types unqualified; import a trait inside the one function that uses it;
+- prefer named-field structs to tuples, enums to `bool` parameters, and functions to macros; don't abbreviate names;
+- use `expect` or patterns rather than `unwrap` outside tests, and mark pure public functions `#[must_use]`;
+- name each file after its primary item, and keep crate roots to modules and re-exports.
+
+Exceptions: `Arc` where Arrow or DataFusion require it, and rustfmt options that need nightly Rust, which are followed by hand.
 
 ## Introduce every reference
 

@@ -69,6 +69,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+Rust code follows [Google's Rust style guide](https://google.github.io/styleguide/rustguide.html). CodeRabbit, the automated reviewer, points out where it doesn't.
+
 ## Making a change
 
 1. **Fork** the repository on GitHub, and create a branch for your change.

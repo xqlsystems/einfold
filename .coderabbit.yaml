@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# CodeRabbit, the automated reviewer, reviews every pull request, including
+# stacked ones, so findings arrive while the pull requests above can still
+# absorb them. Schema: https://docs.coderabbit.ai/reference/configuration
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+reviews:
+  profile: assertive
+  # Approve once every finding is resolved, so that an approval means
+  # "nothing left to fix" and a pull request can merge on it.
+  request_changes_workflow: true
+  # Pull requests are squash-merged with their description as the commit
+  # message, so keep CodeRabbit's summary out of the description.
+  high_level_summary: false
+  high_level_summary_in_walkthrough: true
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+    # Every base branch, not only main: stacked pull requests are based on
+    # the pull request below them.
+    base_branches:
+      - ".*"
+  path_instructions:
+    - path: "**/*.rs"
+      instructions: |
+        Check the code against Google's Rust style guide
+        (https://google.github.io/styleguide/rustguide.html) and the rules
+        einfold applies from it: call functions through their module
+        (`compute::cast`, not a bare `cast`), import types unqualified,
+        import a trait inside the one function that uses it, prefer
+        named-field structs to tuples and enums to bool parameters, avoid
+        abbreviations in names, prefer a function to a macro, use `expect`
+        or patterns rather than `unwrap` outside tests, mark pure public
+        functions `#[must_use]`, name each file after its primary item, and
+        keep crate roots to modules and re-exports.
+        Comments must be understandable without the design doc: flag any
+        citation of it ("design §8.3"), and any project, paper, tool or term
+        used without saying what it is the first time it appears in a file.
+        einfold rewrites other engines' query plans, so above all check that
+        a rewrite can't change a query's answer: NULLs, NaNs, duplicate keys,
+        empty groups and overflow.
+    - path: "**/tests/**"
+      instructions: |
+        Property-based, fuzz and simulation tests matter most: check that
+        each states an invariant and searches inputs that could break it,
+        including NULLs, NaNs, duplicates and empty inputs. Hand tests only
+        need to be readable.
+    - path: "docs/**"
+      instructions: |
+        Introduce every project, paper, tool or term the first time it
+        appears, and check that a claim about measured performance names
+        the benchmark and the conditions it was measured under.

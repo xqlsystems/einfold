@@ -903,47 +903,100 @@ fn host_plan_runs_where_there_is_no_tokio_runtime() {
 /// add nothing, by einfold's kernels and with the host's plan as fallback.
 #[tokio::test]
 async fn masked_folds_keep_their_mask_under_a_domain() {
-    let setup = [
-        "CREATE TABLE l (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,2.0),(1,0,3.0),(1,1,4.0)",
-        "CREATE TABLE r (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,10.0),(0,2,5.0),(1,0,100.0),(1,1,1000.0),(1,2,7.0)",
-        // Groups (0, 2) and (1, 2) have joined rows, summing to 19 and 43 unmasked, but
-        // the mask `l.a >= r.b` excludes them, so they're 0 from the domain.
-        "CREATE TABLE d (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,NULL),(0,2,1.0),(1,0,1.0),(1,1,1.0),(1,2,1.0)",
-    ];
-    let masked = "SELECT l.a AS g0, r.b AS g1, SUM(l.v * r.v) AS v FROM l JOIN r \
-                  ON l.b = r.a AND l.a >= r.b GROUP BY l.a, r.b";
-    let from_domain = format!(
-        "SELECT d.a, d.b, CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 \
-         ELSE s.v END AS v FROM d LEFT JOIN ({masked}) s ON d.a = s.g0 AND d.b = s.g1"
-    );
-    let joined_back = format!(
-        "SELECT d.a, d.b, d.v AS w, COALESCE(s.v, 0.0) AS v FROM d LEFT JOIN ( \
-           SELECT d2.a AS a, d2.b AS b, SUM(f.v) AS v \
-           FROM d d2 JOIN ({masked}) f ON d2.a = f.g0 AND d2.b = f.g1 \
-           GROUP BY d2.a, d2.b) s \
-         ON d.a = s.a AND d.b = s.b"
-    );
-    for sql in [&from_domain, &joined_back] {
-        for fallback in [false, true] {
-            let (plain, with) = (host(4), einfold(4, fallback));
-            for ctx in [&plain, &with] {
-                for s in setup {
-                    ctx.sql(s).await.unwrap().collect().await.unwrap();
+    // With BIGINT keys the dense algorithm runs; with text keys it declines,
+    // and the host's plan, which must keep the mask too, runs where the
+    // session allows it.
+    for text in [false, true] {
+        let key = |x: i64| match text {
+            true => format!("'{x}'"),
+            false => x.to_string(),
+        };
+        let table = |name: &str, rows: &[(i64, i64, &str)]| {
+            let ty = if text { "VARCHAR" } else { "BIGINT" };
+            let values: Vec<String> = (rows.iter())
+                .map(|(a, b, v)| format!("({},{},{v})", key(*a), key(*b)))
+                .collect();
+            format!(
+                "CREATE TABLE {name} (a {ty}, b {ty}, v DOUBLE) AS VALUES {}",
+                values.join(",")
+            )
+        };
+        let setup = [
+            table(
+                "l",
+                &[(0, 0, "1.0"), (0, 1, "2.0"), (1, 0, "3.0"), (1, 1, "4.0")],
+            ),
+            table(
+                "r",
+                &[
+                    (0, 0, "1.0"),
+                    (0, 1, "10.0"),
+                    (0, 2, "5.0"),
+                    (1, 0, "100.0"),
+                    (1, 1, "1000.0"),
+                    (1, 2, "7.0"),
+                ],
+            ),
+            // Groups (0, 2) and (1, 2) have joined rows, summing to 19 and 43
+            // unmasked, but the mask `l.a >= r.b` excludes them, so they're 0
+            // from the domain.
+            table(
+                "d",
+                &[
+                    (0, 0, "1.0"),
+                    (0, 1, "NULL"),
+                    (0, 2, "1.0"),
+                    (1, 0, "1.0"),
+                    (1, 1, "1.0"),
+                    (1, 2, "1.0"),
+                ],
+            ),
+        ];
+        let masked = "SELECT l.a AS g0, r.b AS g1, SUM(l.v * r.v) AS v FROM l JOIN r \
+                      ON l.b = r.a AND l.a >= r.b GROUP BY l.a, r.b";
+        let from_domain = format!(
+            "SELECT d.a, d.b, CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 \
+             ELSE s.v END AS v FROM d LEFT JOIN ({masked}) s ON d.a = s.g0 AND d.b = s.g1"
+        );
+        let joined_back = format!(
+            "SELECT d.a, d.b, d.v AS w, COALESCE(s.v, 0.0) AS v FROM d LEFT JOIN ( \
+               SELECT d2.a AS a, d2.b AS b, SUM(f.v) AS v \
+               FROM d d2 JOIN ({masked}) f ON d2.a = f.g0 AND d2.b = f.g1 \
+               GROUP BY d2.a, d2.b) s \
+             ON d.a = s.a AND d.b = s.b"
+        );
+        for sql in [&from_domain, &joined_back] {
+            for fallback in [false, true] {
+                let (plain, with) = (host(4), einfold(4, fallback));
+                for ctx in [&plain, &with] {
+                    for s in &setup {
+                        ctx.sql(s).await.unwrap().collect().await.unwrap();
+                    }
+                }
+                let expected = rows(&plain.sql(sql).await.unwrap().collect().await.unwrap());
+                let frame = with.sql(sql).await.unwrap();
+                let state = Arc::new(frame.task_ctx());
+                let plan = frame.create_physical_plan().await.unwrap();
+                let (found, domains) = exec_folds(&plan);
+                assert!(
+                    found > 0 && domains > 0,
+                    "einfold finds the fold from d (text keys: {text})\n{sql}"
+                );
+                let got = datafusion::physical_plan::collect(Arc::clone(&plan), state)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    rows(&got),
+                    expected,
+                    "text keys: {text}, fallback {fallback}\n{sql}"
+                );
+                if text && fallback {
+                    let shown = DisplayableExecutionPlan::with_metrics(plan.as_ref())
+                        .indent(true)
+                        .to_string();
+                    assert!(shown.contains("host_plans=1"), "{shown}");
                 }
             }
-            let expected = rows(&plain.sql(sql).await.unwrap().collect().await.unwrap());
-            let frame = with.sql(sql).await.unwrap();
-            let state = Arc::new(frame.task_ctx());
-            let plan = frame.create_physical_plan().await.unwrap();
-            let (found, domains) = exec_folds(&plan);
-            assert!(
-                found > 0 && domains > 0,
-                "einfold finds the fold from d\n{sql}"
-            );
-            let got = datafusion::physical_plan::collect(plan, state)
-                .await
-                .unwrap();
-            assert_eq!(rows(&got), expected, "fallback {fallback}\n{sql}");
         }
     }
 }

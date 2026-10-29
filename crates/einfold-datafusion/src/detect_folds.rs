@@ -307,8 +307,9 @@ pub(crate) struct Found {
 }
 
 /// `agg` as a fold, if it is one: a [`FoldNode`] under a projection giving it
-/// `agg`'s schema. A fold whose join has a condition, a mask, is left alone:
-/// the fold kernels don't compute masks yet.
+/// `agg`'s schema. A fold whose join has a condition, a mask, always keeps
+/// the plan it replaced: the dense algorithm computes masks between outputs,
+/// and the discrimination algorithm none.
 fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
     let Some(Found {
         fold: spec,
@@ -317,9 +318,7 @@ fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
     else {
         return Ok(None);
     };
-    if !spec.conditions().is_empty() {
-        return Ok(None);
-    }
+    let masked = !spec.conditions().is_empty();
     let original = LogicalPlan::Aggregate(agg.clone());
     let names: Vec<String> = (0..agg.group_expr.len())
         .map(|i| format!("{PREFIX}o{i}"))
@@ -328,9 +327,9 @@ fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
     let Ok(node) = FoldNode::try_new(spec, plans, None, names.clone()) else {
         return Ok(None);
     };
-    let node = match fallback {
-        Fallback::HostPlan => node.with_fallback(original),
-        Fallback::Kernels => node.marked_found(),
+    let node = match (fallback, masked) {
+        (Fallback::HostPlan, _) | (_, true) => node.with_fallback(original),
+        (Fallback::Kernels, false) => node.marked_found(),
     }
     .into_plan();
     // Give the node the aggregate's schema: its names, qualifiers, types
@@ -700,14 +699,17 @@ fn from_domain(p: &Projection, fallback: Fallback) -> Result<Option<LogicalPlan>
             ..*o
         })
         .collect();
-    let Ok(with_domain) = Fold::try_new(
+    let with_domain = Fold::try_new(
         fold.dimensions().to_vec(),
         fold.operands().to_vec(),
         outputs,
         fold.row(),
         fold.aggregate().clone(),
         Some(spec),
-    ) else {
+    )
+    // The inner fold's conditions, such as a causal mask, hold here too.
+    .and_then(|f| f.with_conditions(fold.conditions().to_vec()));
+    let Ok(with_domain) = with_domain else {
         return Ok(None);
     };
     // The plan it replaces: the join, as the domain's columns and the sum.
@@ -735,9 +737,12 @@ fn from_domain(p: &Projection, fallback: Fallback) -> Result<Option<LogicalPlan>
     ) else {
         return Ok(None);
     };
-    let new = match fallback {
-        Fallback::HostPlan => new.with_fallback(original.clone()),
-        Fallback::Kernels => new.marked_found(),
+    // A mask needs the host's plan where the dense algorithm declines, as
+    // the inner fold did.
+    let masked = !fold.conditions().is_empty();
+    let new = match (fallback, masked) {
+        (Fallback::HostPlan, _) | (_, true) => new.with_fallback(original.clone()),
+        (Fallback::Kernels, false) => new.marked_found(),
     }
     .into_plan();
     // Rename the node's columns to the join's, so `p` reads them as before.

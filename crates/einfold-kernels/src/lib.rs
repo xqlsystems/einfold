@@ -30,6 +30,7 @@ use arrow::error::ArrowError;
 mod algorithm;
 mod dense;
 mod discriminate;
+mod expression;
 mod fused;
 mod gemm;
 mod keys;

@@ -7,7 +7,10 @@
 //! attention-shaped pipelines over random tables.
 //!
 //! Each case draws tables `q(t, d, x)`, `k(t, d, x)` and `v(t, [c,] x)` with
-//! random extents, and a pipeline: scores `SUM(q.x * k.x)`, scaled by a
+//! random extents, and a pipeline: scores `SUM(q.x * k.x)`, or the sum of a
+//! row expression of `q.x` and `k.x`, such as a Gaussian kernel's
+//! `-power(q.x - k.x, 2)`, either over `d` or, without it, over a `CROSS
+//! JOIN`'s one row per pair; scaled by a
 //! random constant or not, under none, one or two random conditions between
 //! `q.t` and `k.t`, `q.t <op> k.t + c` (either way round, any of `<`, `<=`,
 //! `>`, `>=`, with a small offset `c` or none), two of which may make a band
@@ -44,8 +47,8 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use einfold_ir::{
-    Aggregate, ColumnIndex, Comparison, Condition, Dimension, DimensionId, Fold, Key, KeyEquality,
-    Normalizer, Operand, Output, Pipeline, RowValue, Scale, Shift,
+    Aggregate, Binary, ColumnIndex, Comparison, Condition, Dimension, DimensionId, Expression,
+    Fold, Key, KeyEquality, Normalizer, Operand, Output, Pipeline, RowValue, Scale, Shift, Unary,
 };
 use einfold_kernels::{FloatKeys, Host, Options, Relation};
 
@@ -159,13 +162,57 @@ fn value(rng: &mut Rng, spread: f64, specials: bool) -> f64 {
     (2.0 * rng.unit() - 1.0) * spread
 }
 
+/// A producer's row value, as the IR and as SQL over `q.x` and `k.x`: a
+/// product, or one of several row expressions, kernels of a distance among
+/// them, with `x` operand `q`'s and `k`'s value column.
+fn row_value(rng: &mut Rng, x: usize) -> (RowValue, &'static str) {
+    let (q, k) = (Expression::column(0, x), Expression::column(1, x));
+    let lit = Expression::literal;
+    let d = || q.clone().binary(Binary::Subtract, k.clone());
+    match rng.below(6) {
+        0 | 1 => (RowValue::Product, "q.x * k.x"),
+        2 => (
+            RowValue::Expression(d().binary(Binary::Power, lit(2.0)).unary(Unary::Negate)),
+            "-power(q.x - k.x, 2.0)",
+        ),
+        3 => (
+            RowValue::Expression(d().unary(Unary::Abs).unary(Unary::Negate)),
+            "-abs(q.x - k.x)",
+        ),
+        4 => (
+            RowValue::Expression(q.clone().binary(Binary::Multiply, k.clone())),
+            "q.x * k.x",
+        ),
+        _ => (
+            RowValue::Expression(
+                q.clone()
+                    .binary(
+                        Binary::Multiply,
+                        k.clone().binary(Binary::Divide, lit(4.0)).unary(Unary::Exp),
+                    )
+                    .binary(Binary::Add, lit(0.5)),
+            ),
+            "q.x * exp(k.x / 4.0) + 0.5",
+        ),
+    }
+}
+
 fn case(rng: &mut Rng) -> Case {
-    let (nq, nk, nd) = (1 + rng.below(150), 1 + rng.below(150), 1 + rng.below(6));
+    // A producer with a row expression and nothing to sum, the pair's one
+    // row of a `CROSS JOIN`, as a Gaussian kernel's over points; or summed
+    // over a feature dimension `d`, as attention's.
+    let cross = rng.chance(0.25);
+    let (nq, nk) = (1 + rng.below(150), 1 + rng.below(150));
+    let nd = if cross { 1 } else { 1 + rng.below(6) };
     let channels = (rng.chance(0.6)).then(|| 1 + rng.below(4));
     let specials = rng.chance(0.3);
     let spread = [1.0, 4.0, 12.0][rng.below(3)];
-    let mut q = Table::complete(&["t", "d"], &[nq, nd], || 0.0);
-    let mut k = Table::complete(&["t", "d"], &[nk, nd], || 0.0);
+    let (keys, extents): (&[&str], _) = match cross {
+        true => (&["t"], ([nq].to_vec(), [nk].to_vec())),
+        false => (&["t", "d"], ([nq, nd].to_vec(), [nk, nd].to_vec())),
+    };
+    let mut q = Table::complete(keys, &extents.0, || 0.0);
+    let mut k = Table::complete(keys, &extents.1, || 0.0);
     for r in q.rows.iter_mut().chain(k.rows.iter_mut()) {
         r.1 = Some(value(rng, spread, specials));
     }
@@ -218,7 +265,20 @@ fn case(rng: &mut Rng) -> Case {
         .filter(|x| x.is_finite())
         .fold(0.0f64, |m, x| m.max(x.abs()));
 
-    // Dimensions: 0 = i (q.t), 1 = e (d), 2 = j (k.t), then 3 = c (v.c).
+    // Dimensions: 0 = i (q.t), 1 = e (d), 2 = j (k.t), then 3 = c (v.c);
+    // without d, 0 = i, 1 = j, 2 = c.
+    let (di, dj, dc) = if cross { (0, 1, 2) } else { (0, 2, 3) };
+    let x = keys.len();
+    let (row, row_sql) = match cross {
+        // A product over a CROSS JOIN is an einsum the kernel doesn't take.
+        true => loop {
+            let r = row_value(rng, x);
+            if matches!(r.0, RowValue::Expression(_)) {
+                break r;
+            }
+        },
+        false => row_value(rng, x),
+    };
     const EQ: Dimension = Dimension {
         equality: KeyEquality::Equal,
     };
@@ -227,21 +287,33 @@ fn case(rng: &mut Rng) -> Case {
         dimension: DimensionId(d),
         domain_key: None,
     };
-    let ops = vec![
-        Operand {
-            keys: vec![key(0, 0), key(1, 1)],
-            factor: Some(ColumnIndex(2)),
-        },
-        Operand {
-            keys: vec![key(2, 0), key(1, 1)],
-            factor: Some(ColumnIndex(2)),
-        },
-    ];
+    let ops = match cross {
+        true => vec![
+            Operand {
+                keys: vec![key(di, 0)],
+                factor: Some(ColumnIndex(1)),
+            },
+            Operand {
+                keys: vec![key(dj, 0)],
+                factor: Some(ColumnIndex(1)),
+            },
+        ],
+        false => vec![
+            Operand {
+                keys: vec![key(di, 0), key(1, 1)],
+                factor: Some(ColumnIndex(2)),
+            },
+            Operand {
+                keys: vec![key(dj, 0), key(1, 1)],
+                factor: Some(ColumnIndex(2)),
+            },
+        ],
+    };
     let mut producer = Fold::try_new(
-        vec![EQ; 3],
+        vec![EQ; if cross { 2 } else { 3 }],
         ops,
-        vec![out(0), out(2)],
-        RowValue::Product,
+        vec![out(di), out(dj)],
+        row,
         Aggregate::sum(),
         None,
     )
@@ -265,8 +337,8 @@ fn case(rng: &mut Rng) -> Case {
             false => rng.below(81) as i64 - 40,
         };
         let (left, right, l, r) = match rng.chance(0.5) {
-            true => (0, 2, "q.t", "k.t"),
-            false => (2, 0, "k.t", "q.t"),
+            true => (di, dj, "q.t", "k.t"),
+            false => (dj, di, "k.t", "q.t"),
         };
         condition += &format!(" AND {l} {op} {r} + {offset}");
         conditions.push(Condition {
@@ -293,19 +365,19 @@ fn case(rng: &mut Rng) -> Case {
     let (values, outputs, c_col, c_group) = match channels {
         Some(_) => (
             Operand {
-                keys: vec![key(2, 0), key(3, 1)],
+                keys: vec![key(dj, 0), key(dc, 1)],
                 factor: Some(ColumnIndex(2)),
             },
-            vec![DimensionId(0), DimensionId(3)],
+            vec![DimensionId(di), DimensionId(dc)],
             ", v.c",
             ", v.c",
         ),
         None => (
             Operand {
-                keys: vec![key(2, 0)],
+                keys: vec![key(dj, 0)],
                 factor: Some(ColumnIndex(1)),
             },
-            vec![DimensionId(0)],
+            vec![DimensionId(di)],
             "",
             "",
         ),
@@ -313,11 +385,18 @@ fn case(rng: &mut Rng) -> Case {
     let own = if channels.is_some() { vec![EQ] } else { vec![] };
     let pipeline =
         Pipeline::try_new(producer, scale, shift, own, values, outputs, normalizer).unwrap();
-    let scores = format!(
-        "WITH scores AS (SELECT q.t AS i, k.t AS j, SUM(q.x * k.x){scale_sql} AS s \
-         FROM q JOIN k ON q.d = k.d{condition} GROUP BY q.t, k.t), \
-         weights AS (SELECT i, j, {weight} AS w FROM scores)"
-    );
+    let producer = match cross {
+        true => format!(
+            "SELECT q.t AS i, k.t AS j, ({row_sql}){scale_sql} AS s \
+             FROM q CROSS JOIN k WHERE TRUE{condition}"
+        ),
+        false => format!(
+            "SELECT q.t AS i, k.t AS j, SUM({row_sql}){scale_sql} AS s \
+             FROM q JOIN k ON q.d = k.d{condition} GROUP BY q.t, k.t"
+        ),
+    };
+    let scores =
+        format!("WITH scores AS ({producer}), weights AS (SELECT i, j, {weight} AS w FROM scores)");
     let sql = match normalizer {
         Normalizer::KeptGroups => format!(
             "{scores}, norm AS (SELECT i, SUM(w) AS z FROM weights GROUP BY i) \

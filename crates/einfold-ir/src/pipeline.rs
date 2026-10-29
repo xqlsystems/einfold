@@ -35,8 +35,10 @@
 //! - a kernel smoother, such as the Nadaraya–Watson estimator used in
 //!   regridding (resampling values from one set of points onto another),
 //!   where the score is `-dist²/h²` between a target and a
-//!   source point, and the average is of the sources' values (its producer
-//!   isn't a sum of products, which [`Pipeline::try_new`] requires);
+//!   source point, and the average is of the sources' values. Its producer
+//!   computes `-dist²` as a row expression of the two points (see
+//!   [`RowValue::Expression`]), over a `CROSS JOIN` with nothing to sum but
+//!   the pair's one row;
 //! - a softmax over a recommender's scores, averaging items' features.
 //!
 //! **Dimensions.** A pipeline's dimensions are its producer's, then its
@@ -52,7 +54,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use crate::fold::{Dimension, DimensionId, Fold, InvalidFold, Operand};
+use crate::fold::{Dimension, DimensionId, Fold, InvalidFold, Operand, RowValue};
 
 /// How a producer group's value `p` becomes its score.
 #[derive(Clone, Copy, Debug)]
@@ -179,7 +181,8 @@ pub struct Pipeline {
 impl Pipeline {
     /// A pipeline, if its description is consistent:
     ///
-    /// - the producer is a `SUM` of products with no domain;
+    /// - the producer is a `SUM`, of products or of a row expression, with no
+    ///   domain;
     /// - the values operand has a factor, and its keys name the producer's
     ///   outputs or the pipeline's own `dimensions`, each at most once;
     /// - it holds every one of the pipeline's own dimensions, and every
@@ -196,8 +199,12 @@ impl Pipeline {
         normalizer: Normalizer,
     ) -> Result<Self, InvalidFold> {
         let bad = |why: String| Err(InvalidFold(why));
-        if !producer.is_einsum() || producer.domain().is_some() {
-            return bad("a pipeline's producer is a SUM of products with no domain".into());
+        let summable = matches!(producer.row(), RowValue::Product | RowValue::Expression(_));
+        if !summable || !producer.aggregate().is_sum() || producer.domain().is_some() {
+            return bad(
+                "a pipeline's producer is a SUM of products or of a row expression, with no domain"
+                    .into(),
+            );
         }
         if values.factor.is_none() {
             return bad("a pipeline's values operand has no factor".into());

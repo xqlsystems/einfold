@@ -154,6 +154,7 @@ def main(cases: list[str]) -> None:
     cases = cases or [c for c in CASES if gpt or not c.startswith("gpt")]
     print("| case | einfold off | einfold on |")
     print("|---|---:|---:|")
+    failed = False
     for case in cases:
         cells = []
         for on in (False, True):
@@ -161,11 +162,17 @@ def main(cases: list[str]) -> None:
                 [sys.executable, __file__, "--one", case, "on" if on else "off"],
                 capture_output=True, text=True)
             if done.returncode != 0:
+                # The table goes on; the error goes to stderr, and the run fails.
+                failed = True
+                print(f"{case}, einfold {'on' if on else 'off'}:\n{done.stderr}",
+                      file=sys.stderr, flush=True)
                 cells.append(f"failed ({done.returncode})")
                 continue
             m = json.loads(done.stdout.strip().splitlines()[-1])
             cells.append(f"{m['seconds'] * 1e3:,.0f} ms, {m['peak_mb']:,.0f} MB")
         print(f"| {case} | {cells[0]} | {cells[1]} |", flush=True)
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -30,6 +30,9 @@ pub struct FoldNode {
     /// The plan this node replaced, if it replaced one: its columns are the
     /// node's, in order, though their names may differ.
     fallback: Option<LogicalPlan>,
+    /// Whether the fallback runs wherever the dense algorithm declines, or
+    /// only where memory runs short.
+    host_on_decline: bool,
     /// Whether [`DetectFolds`](crate::DetectFolds) made this node.
     found: bool,
     /// Whether the node computes its fold only when no two domain rows reach
@@ -78,6 +81,7 @@ impl FoldNode {
             inputs,
             schema,
             fallback: None,
+            host_on_decline: false,
             found: false,
             domain_rows: DomainRows::Any,
             null_when: None,
@@ -87,12 +91,34 @@ impl FoldNode {
     /// This node, keeping `plan` as the plan it replaced. When the dense
     /// algorithm doesn't apply, [`EinFoldExec`](crate::EinFoldExec) runs
     /// `plan` instead of the discrimination algorithm, so the host's own plan is the
-    /// slowest the fold can be.
+    /// slowest the fold can be. It runs `plan` too where the session's
+    /// memory pool can't give it what it needs.
     #[must_use]
     pub fn with_fallback(mut self, plan: LogicalPlan) -> Self {
         self.fallback = Some(plan);
+        self.host_on_decline = true;
         self.found = true;
         self
+    }
+
+    /// This node, keeping `plan` as the plan it replaced, which
+    /// [`EinFoldExec`](crate::EinFoldExec) runs only where the session's
+    /// memory pool can't give it what it needs: the host's plan can spill to
+    /// disk, and einfold's kernels can't.
+    #[must_use]
+    pub fn with_memory_fallback(mut self, plan: LogicalPlan) -> Self {
+        self.fallback = Some(plan);
+        self.host_on_decline = false;
+        self.found = true;
+        self
+    }
+
+    /// Whether the node runs its fallback wherever the dense algorithm
+    /// declines (see [`FoldNode::with_fallback`]), and not only where memory
+    /// runs short.
+    #[must_use]
+    pub fn host_on_decline(&self) -> bool {
+        self.host_on_decline
     }
 
     /// This node, computing its fold only when no two of its domain's rows
@@ -125,13 +151,6 @@ impl FoldNode {
     #[must_use]
     pub fn null_when(&self) -> Option<ColumnIndex> {
         self.null_when
-    }
-
-    /// This node, marked as made by [`DetectFolds`](crate::DetectFolds)
-    /// without a fallback.
-    pub(crate) fn marked_found(mut self) -> Self {
-        self.found = true;
-        self
     }
 
     /// Whether [`DetectFolds`](crate::DetectFolds) made this node.
@@ -174,6 +193,7 @@ impl PartialOrd for FoldNode {
                 &n.fold,
                 &n.inputs,
                 &n.fallback,
+                n.host_on_decline,
                 n.found,
                 n.domain_rows,
                 n.null_when,
@@ -222,6 +242,7 @@ impl UserDefinedLogicalNodeCore for FoldNode {
         let node = FoldNode::try_new(self.fold.clone(), operands, domain, names.collect())?;
         Ok(FoldNode {
             fallback: self.fallback.clone(),
+            host_on_decline: self.host_on_decline,
             found: self.found,
             domain_rows: self.domain_rows,
             null_when: self.null_when,

@@ -62,7 +62,7 @@ use arrow::compute;
 use arrow::datatypes::{DataType, SchemaRef};
 use einfold_ir::{ColumnIndex, DimensionId, Domain, Fold, Operand};
 
-use crate::options::DomainRows;
+use crate::options::{DomainRows, Options};
 use crate::Result;
 
 /// Output rows per block, when the output has at least [`FEW_CELLS`] cells.
@@ -179,16 +179,20 @@ pub(crate) fn fold(
     b: &[RecordBatch],
     domain: Option<&[RecordBatch]>,
     schema: SchemaRef,
-    threads: usize,
-    domain_rows: DomainRows,
+    options: &Options,
 ) -> Result<Option<Vec<RecordBatch>>> {
     let [op_a, op_b] = fold.operands() else {
         return Ok(None);
     };
+    let domain_rows = options.domain_rows;
     let inputs: usize = (a.iter().chain(b).chain(domain.unwrap_or_default()))
         .map(RecordBatch::num_rows)
         .sum();
-    let threads = if inputs < FEW_ROWS { 1 } else { threads };
+    let threads = if inputs < FEW_ROWS {
+        1
+    } else {
+        options.threads.max(1)
+    };
     // The roles: W, X and Y in output order, Z in dimension order. Here a
     // dimension is its index, which indexes the extents too.
     let (mut ws, mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -225,6 +229,20 @@ pub(crate) fn fold(
     // Each batch's key columns as non-negative i64, cast once, with their
     // extents, batches in parallel; then each dimension's extent, its largest
     // key in either operand, plus one.
+    let rows = |batches: &[RecordBatch]| batches.iter().map(|b| b.num_rows()).sum::<usize>();
+    // Keys that aren't integers are declined below; declined before asking
+    // for memory, so that they don't spend the budget.
+    let integers = |op: &Operand, batches: &[RecordBatch]| {
+        (batches.first()).is_none_or(|batch| {
+            (op.keys.iter()).all(|key| batch.column(key.column.0).data_type().is_integer())
+        })
+    };
+    if !integers(op_a, a) || !integers(op_b, b) {
+        return Ok(None);
+    }
+    // The keys, cast: 8 bytes a key.
+    let cast = rows(a) * op_a.keys.len() + rows(b) * op_b.keys.len();
+    options.reserve(cast.saturating_mul(8), "the dense algorithm's keys")?;
     let cast_keys = |op: &Operand, batches: &[RecordBatch]| {
         let batch_keys = par_tasks(batches.len(), threads, |i| {
             (op.keys.iter())
@@ -251,7 +269,6 @@ pub(crate) fn fold(
                 .collect()
         };
     let (a_keys, b_keys) = (strip(a_keys), strip(b_keys));
-    let rows = |batches: &[RecordBatch]| batches.iter().map(|b| b.num_rows()).sum::<usize>();
     let size = |dims: &[usize]| {
         dims.iter()
             .try_fold(1usize, |n, &d| n.checked_mul(extent[d]))
@@ -273,6 +290,26 @@ pub(crate) fn fold(
     {
         return Ok(None);
     }
+    // What the algorithm allocates from here on: a's matrix, at 9 bytes a
+    // cell, and its rows' flags; b's matrices, likewise; each row's two
+    // positions, at 4 bytes each; the output as it is accumulated, and its
+    // copy; and the output's columns, 8 bytes each, with each domain row's
+    // cell.
+    let (na, nb) = (
+        nx.saturating_mul(nz),
+        nw.saturating_mul(nz).saturating_mul(ny),
+    );
+    let out_columns = fold.outputs().len() + 1 + usize::from(domain.is_some());
+    let working = [
+        na.saturating_mul(9),
+        nx.saturating_mul(2),
+        nb.saturating_mul(9),
+        (rows(a) + rows(b)).saturating_mul(8),
+        nx.saturating_mul(ny).saturating_mul(16),
+        out_rows.saturating_mul(out_columns).saturating_mul(8),
+    ];
+    let working = working.into_iter().fold(0usize, usize::saturating_add);
+    options.reserve(working, "the dense algorithm's matrices")?;
     let factors = |op: &Operand, batch: &'_ RecordBatch| {
         op.factor
             .and_then(|c| batch.column(c.0).as_any().downcast_ref::<Float64Array>())

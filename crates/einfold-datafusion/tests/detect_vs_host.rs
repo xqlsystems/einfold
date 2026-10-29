@@ -376,6 +376,28 @@ fn einfold(threads: usize, fallback: bool) -> SessionContext {
     SessionContext::new_with_state(state)
 }
 
+/// DataFusion, with einfold or without, under a memory pool of `bytes`
+/// shared fairly among the operators that can spill and given first come,
+/// first served to those that can't, as DataFusion's `FairSpillPool` does.
+fn pooled(threads: usize, with_einfold: Option<DetectFolds>, bytes: usize) -> SessionContext {
+    use datafusion::execution::memory_pool::FairSpillPool;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    let config = SessionConfig::new().with_target_partitions(threads);
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(FairSpillPool::new(bytes)))
+        .build_arc()
+        .unwrap();
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_config(config)
+        .with_runtime_env(runtime);
+    let state = match with_einfold {
+        Some(rule) => state.with_query_planner(Arc::new(EinFoldQueryPlanner::detecting(rule))),
+        None => state,
+    };
+    SessionContext::new_with_state(state.build())
+}
+
 /// How many `EinFoldExec`s a physical plan has, and how many of them have a
 /// domain.
 fn exec_folds(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> (usize, usize) {
@@ -1096,4 +1118,102 @@ async fn masked_folds_over_heads_run_dense() {
         .to_string();
     assert!(shown.contains("dense_folds=1"), "{shown}");
     assert!(!shown.contains("host_plans=1"), "{shown}");
+}
+
+/// Property: under a small memory pool, einfold runs out of memory no more
+/// often than the host does. Each case runs a random query of the sweep's
+/// spellings with einfold, by its kernels or with the host's plan as
+/// fallback, and without, each under its own pool of the same size. Where
+/// both answer, they answer the same rows; neither fails but for memory.
+/// einfold reserves what it reads and what its kernels allocate, and where
+/// the pool refuses, runs the host's plan, whose operators can spill. The
+/// operators above einfold's can still differ from the host's, as einfold's
+/// estimates of its output differ from the host's, so a case can run short
+/// of memory in one plan and not the other, either way.
+#[tokio::test]
+async fn einfold_runs_short_of_memory_only_where_the_host_does() {
+    let seed: u64 = std::env::var("EINFOLD_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0x5_9001);
+    let cases: u64 = match std::env::var("EINFOLD_CASES") {
+        Ok(n) => n.parse().unwrap(),
+        Err(_) if std::env::var("EINFOLD_SEED").is_ok() => 1,
+        Err(_) => 300,
+    };
+    let short = |e: &datafusion::error::DataFusionError| {
+        e.to_string().contains("Resources exhausted") || e.to_string().contains("budget")
+    };
+    let (mut both_short, mut host_short, mut ours_short, mut fell_back) = (0, 0, 0, 0);
+    for i in 0..cases {
+        let seed = seed.wrapping_add(i);
+        let mut rng = Rng::new(seed);
+        let keys = [Keys::Dense, Keys::Dense, Keys::Wild, Keys::Text][rng.below(4)];
+        let messy = !matches!(keys, Keys::Dense) || rng.chance(0.4);
+        let rule = match rng.chance(0.5) {
+            true => DetectFolds::with_host_fallback(),
+            false => DetectFolds::default(),
+        };
+        let bytes = [2 << 10, 4 << 10, 8 << 10, 16 << 10, 64 << 10, 256 << 10][rng.below(6)];
+        let threads = 1 + rng.below(4);
+        let (ours, theirs) = (
+            pooled(threads, Some(rule), bytes),
+            pooled(threads, None, bytes),
+        );
+        let ctxs = [&ours, &theirs];
+        let ext = |rng: &mut Rng| 1 + rng.below(6);
+        let (ea, eb, ec) = (ext(&mut rng), ext(&mut rng), ext(&mut rng));
+        table(&mut rng, &ctxs, "l", [ea, eb], keys, messy);
+        table(&mut rng, &ctxs, "r", [eb, ec], keys, messy);
+        let d_messy = messy || rng.chance(0.3);
+        table(&mut rng, &ctxs, "d", [ea + 1, ec + 1], keys, d_messy);
+        let joined_back = rng.chance(0.2);
+        let (sql, _) = query(&mut rng, joined_back);
+        let fail =
+            |what: String| panic!("seed {seed}, a pool of {bytes} bytes: {what}\nSQL: {sql}");
+        let want = match theirs.sql(&sql).await.unwrap().collect().await {
+            Ok(want) => Some(rows(&want)),
+            Err(e) if short(&e) => None,
+            Err(e) => {
+                fail(format!("the host failed: {e}"));
+                None
+            }
+        };
+        let df = ours.sql(&sql).await.unwrap();
+        let physical = df.create_physical_plan().await.unwrap();
+        let got = datafusion::physical_plan::collect(Arc::clone(&physical), ours.task_ctx()).await;
+        let shown = DisplayableExecutionPlan::with_metrics(physical.as_ref())
+            .indent(true)
+            .to_string();
+        fell_back += usize::from(shown.contains("memory_fallbacks=1"));
+        match (got, want) {
+            (Ok(got), Some(want)) if rows(&got) == want => {}
+            (Ok(got), Some(want)) => {
+                let got = rows(&got);
+                fail(format!("einfold gave\n{got:#?}\nthe host gave\n{want:#?}"));
+            }
+            (Err(e), Some(_)) if short(&e) => ours_short += 1,
+            (Err(e), Some(_)) => {
+                fail(format!("einfold failed where the host answers: {e}"));
+            }
+            (Err(e), None) if short(&e) => both_short += 1,
+            (Err(e), None) => {
+                fail(format!("einfold failed: {e}"));
+            }
+            (Ok(_), None) => host_short += 1,
+        }
+    }
+    eprintln!(
+        "out of memory in both {both_short}, in einfold only {ours_short}, in the host only \
+         {host_short}; einfold ran the host's plan for memory in {fell_back} of {cases} cases"
+    );
+    // Both are claims about many cases: one case, replayed from its seed,
+    // may run short in either.
+    if cases >= 100 {
+        assert!(
+            ours_short <= host_short,
+            "einfold alone ran out of memory in {ours_short} cases, the host alone in {host_short}"
+        );
+        assert!(fell_back > 0, "einfold never ran short of memory");
+    }
 }

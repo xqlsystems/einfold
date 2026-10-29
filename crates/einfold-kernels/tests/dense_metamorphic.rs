@@ -517,6 +517,7 @@ fn run(
                 host,
                 threads,
                 domain_rows,
+                budget: None,
             };
             let f =
                 einfold_kernels::fold_dense(&fold, a, b, domain, schema, options).expect("runs");

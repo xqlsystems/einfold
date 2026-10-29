@@ -31,11 +31,13 @@
 //! below the join, and keeps every plan's schema exactly: names, qualifiers,
 //! types and nullability. [`EinFoldExec`](crate::EinFoldExec) runs each
 //! node by the dense algorithm where its keys and rows allow, and by the
-//! discrimination algorithm otherwise. A node that can be computed only under
-//! a condition known when it runs, such as a fold joined back to its domain,
-//! keeps the plan it replaced and runs that where the condition fails. With
-//! [`DetectFolds::with_host_fallback`], every node keeps it, and runs it
-//! wherever the dense algorithm doesn't apply.
+//! discrimination algorithm otherwise. Every node keeps the plan it
+//! replaced, the host's own, and runs it where the session's memory pool
+//! can't give einfold what it needs: the host's operators can spill to disk.
+//! A node that can be computed only under a condition known when it runs,
+//! such as a fold joined back to its domain, also runs it where the
+//! condition fails. With [`DetectFolds::with_host_fallback`], every node
+//! runs it wherever the dense algorithm doesn't apply.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -73,7 +75,7 @@ pub struct DetectFolds {
 }
 
 /// What the nodes [`DetectFolds`] makes run where the dense algorithm
-/// doesn't apply.
+/// doesn't apply. Where memory runs short, they all run the host's plan.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Fallback {
     /// The plan each node replaced, so a detected fold is never slower than
@@ -329,7 +331,7 @@ fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
     };
     let node = match (fallback, masked) {
         (Fallback::HostPlan, _) | (_, true) => node.with_fallback(original),
-        (Fallback::Kernels, false) => node.marked_found(),
+        (Fallback::Kernels, false) => node.with_memory_fallback(original),
     }
     .into_plan();
     // Give the node the aggregate's schema: its names, qualifiers, types
@@ -742,7 +744,7 @@ fn from_domain(p: &Projection, fallback: Fallback) -> Result<Option<LogicalPlan>
     let masked = !fold.conditions().is_empty();
     let new = match (fallback, masked) {
         (Fallback::HostPlan, _) | (_, true) => new.with_fallback(original.clone()),
-        (Fallback::Kernels, false) => new.marked_found(),
+        (Fallback::Kernels, false) => new.with_memory_fallback(original.clone()),
     }
     .into_plan();
     // Rename the node's columns to the join's, so `p` reads them as before.

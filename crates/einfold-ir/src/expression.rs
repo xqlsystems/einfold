@@ -10,8 +10,8 @@
 //! [`Expression`] is such a value: a tree over the joined row's columns, in a
 //! small, closed set of `DOUBLE` operators. Each has SQL's NULL rule (NULL in
 //! any argument gives NULL), and is defined as one IEEE operation or one call
-//! of Rust's `f64` function of that name, which is also what DataFusion
-//! computes, so an evaluator that follows [`Expression::evaluate`] gives the
+//! of Rust's `f64` function of that name, which is also what DataFusion, the
+//! SQL engine einfold extends, computes, so an evaluator that follows [`Expression::evaluate`] gives the
 //! host's bits.
 //!
 //! Which inputs a host raises an error on is the host's business: a detector

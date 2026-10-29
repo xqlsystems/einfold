@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Property: a row expression's value, as [`Expression::evaluate`] defines
-//! it, is DataFusion's for the same SQL, bit for bit.
+//! it, is the one DataFusion, the SQL engine einfold extends, computes for
+//! the same SQL, bit for bit.
 //!
 //! Each case draws two tables `a(i, x, y)` and `b(j, x, y)` of `DOUBLE`
 //! values, among them NULL, NaN, ±inf, ±0, negatives, and values large and
@@ -164,8 +165,9 @@ async fn row_expressions_compute_what_datafusion_does() {
         let seed = seed.wrapping_add(i);
         let mut rng = Rng::new(seed);
         let ctx = SessionContext::new();
-        let a = table(&ctx, "a", 1 + rng.below(8), &mut rng);
-        let b = table(&ctx, "b", 1 + rng.below(8), &mut rng);
+        // Either table may be empty, and so the cross join.
+        let a = table(&ctx, "a", rng.below(9), &mut rng);
+        let b = table(&ctx, "b", rng.below(9), &mut rng);
         let (e, sql) = expression(&mut rng, 5);
         let query = format!("SELECT a.k, b.k, {sql} AS v FROM a CROSS JOIN b");
         let fail =
@@ -207,5 +209,78 @@ async fn row_expressions_compute_what_datafusion_does() {
         if pairs != a.len() * b.len() {
             fail(format!("{pairs} pairs, of {}", a.len() * b.len()));
         }
+    }
+}
+
+/// `power` of every pair of special values, base and exponent, gives
+/// DataFusion's bits: NULL, NaN, ±inf, ±0, a negative, 0.5 and 2. DataFusion
+/// raises an error for a zero base with a negative exponent, which no
+/// detector gives einfold, and only there.
+#[tokio::test]
+async fn power_of_special_values_is_datafusions() {
+    let specials = [
+        None,
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        Some(f64::NEG_INFINITY),
+        Some(0.0),
+        Some(-0.0),
+        Some(-2.0),
+        Some(0.5),
+        Some(2.0),
+    ];
+    let pairs: Vec<[Option<f64>; 2]> = (specials.iter())
+        .flat_map(|&base| specials.iter().map(move |&exponent| [base, exponent]))
+        .collect();
+    let ctx = SessionContext::new();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("x", DataType::Float64, true),
+        Field::new("y", DataType::Float64, true),
+    ]));
+    let column = |c: usize| Float64Array::from(pairs.iter().map(|p| p[c]).collect::<Vec<_>>());
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..pairs.len() as i64)),
+            Arc::new(column(0)),
+            Arc::new(column(1)),
+        ],
+    )
+    .unwrap();
+    let mem = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+    ctx.register_table("p", Arc::new(mem)).unwrap();
+    let power = Expression::column(0, 1).binary(Binary::Power, Expression::column(0, 2));
+    for (k, &[base, exponent]) in pairs.iter().enumerate() {
+        let sql = format!("SELECT power(p.x, p.y) AS v FROM p WHERE p.k = {k}");
+        let result = match ctx.sql(&sql).await {
+            Ok(frame) => frame.collect().await,
+            Err(err) => Err(err),
+        };
+        let raises = base.is_some_and(|b| b == 0.0) && exponent.is_some_and(|e| e < 0.0);
+        let batches = match (result, raises) {
+            (Ok(batches), false) => batches,
+            (Err(_), true) => continue,
+            (Ok(_), true) => panic!("power({base:?}, {exponent:?}) didn't raise an error"),
+            (Err(err), false) => panic!("power({base:?}, {exponent:?}) failed: {err}"),
+        };
+        let v = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .clone();
+        let theirs = v.is_valid(0).then(|| v.value(0));
+        let ours = power.evaluate(&|_, ColumnIndex(c)| [base, exponent][c - 1]);
+        let same = match (ours, theirs) {
+            (Some(x), Some(y)) if x.is_nan() || y.is_nan() => x.is_nan() && y.is_nan(),
+            (Some(x), Some(y)) => x.to_bits() == y.to_bits(),
+            (None, None) => true,
+            _ => false,
+        };
+        assert!(
+            same,
+            "power({base:?}, {exponent:?}): einfold gives {ours:?}, DataFusion {theirs:?}"
+        );
     }
 }

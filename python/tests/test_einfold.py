@@ -58,12 +58,21 @@ def _rows(table: pa.Table):
     return sorted(zip(*columns), key=lambda r: tuple(map(str, r[:-1])))
 
 
+def _same_value(w, g) -> bool:
+    """Whether two values agree: both NULL, both NaN, or close."""
+    if w is None or g is None:
+        return w is None and g is None
+    if math.isnan(w) or math.isnan(g):
+        return math.isnan(w) and math.isnan(g)
+    return math.isclose(w, g, rel_tol=1e-12, abs_tol=1e-12)
+
+
 def _assert_same(want: pa.Table, got: pa.Table):
     want, got = _rows(want), _rows(got)
     assert len(want) == len(got)
     for w, g in zip(want, got):
         assert w[:-1] == g[:-1]
-        assert math.isclose(w[-1], g[-1], rel_tol=1e-12, abs_tol=1e-12), (w, g)
+        assert _same_value(w[-1], g[-1]), (w, g)
 
 
 def _install(ctx) -> EinFold:
@@ -92,6 +101,24 @@ def test_runs_causal_attention_as_a_pipeline():
     off, on, found = _pair(_attention_tables)
     _assert_same(off.sql(ATTENTION).to_arrow_table(), on.sql(ATTENTION).to_arrow_table())
     assert found.plans_with_pipelines() >= 1
+
+
+def test_gives_sqls_nulls_and_nans():
+    """A matrix product over a NaN and a NULL factor gives SQL's NaNs, and
+    skips the NULL as `SUM` does."""
+    def tables(ctx):
+        _tables(ctx)
+        ctx.deregister_table("w")
+        r = np.arange(16 * 8)
+        val = pa.array(np.cos(r * 0.3)).to_pylist()
+        val[3], val[10] = float("nan"), None
+        ctx.register_record_batches("w", [[pa.record_batch(
+            {"k": r // 8, "o": r % 8, "val": pa.array(val, pa.float64())})]])
+
+    off, on, _ = _pair(tables)
+    want, got = off.sql(MATMUL).to_arrow_table(), on.sql(MATMUL).to_arrow_table()
+    assert any(math.isnan(v) for v in want.column("v").to_pylist())
+    _assert_same(want, got)
 
 
 def test_leaves_other_queries_alone():

@@ -2,8 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`Bridge`]: the query planner einfold installs in a datafusion-python
-//! session, and what it needs to run plans there.
+//! [`Bridge`]: the query planner einfold installs in a session of
+//! datafusion-python, DataFusion's Python bindings, and what it needs to run
+//! plans there. Plans cross DataFusion's FFI (foreign function interface)
+//! as protobuf, the Protocol Buffers serialization format.
 
 use std::any::Any;
 use std::collections::HashMap;

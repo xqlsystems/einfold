@@ -23,8 +23,8 @@
 //! - `accuracy <L> <scale>`: einfold and DataFusion against a compensated
 //!   reference, with `q` scaled to spread the scores, and einfold's bits on
 //!   1, 2, 5 and 12 threads;
-//! - `edges`: NaN and infinities in every input, and a row whose scores are
-//!   all `-inf`, einfold against DataFusion.
+//! - `edges`: a NaN or an infinity in one of the inputs, a huge value in
+//!   `k`, and a row whose scores are all `-inf`, einfold against DataFusion.
 
 use std::env;
 use std::sync::Arc;
@@ -41,7 +41,9 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 
 const D: usize = 64;
 
-/// Values of table `name` at row `r = t·D + d`, as spike S27 drew them.
+/// Values of table `name` at row `r = t·D + d`: `sin(0.7·r + phase)`, with
+/// a phase per table, so that inputs are deterministic, spread over
+/// `[-1, 1]`, and differ between `q`, `k` and `v`.
 fn value(name: &str, r: usize) -> f64 {
     let phase = match name {
         "q" => 0.0,
@@ -78,21 +80,35 @@ fn sql(form: &str) -> String {
     )
 }
 
-/// A DataFusion session, with einfold or not, on `threads` threads, with a
-/// 6 GB memory pool, and the tables.
-fn context(l: usize, tables: &[(&str, Vec<f64>)], einfold: bool, threads: usize) -> SessionContext {
+/// Which planner a session uses.
+#[derive(Clone, Copy, PartialEq)]
+enum Planner {
+    /// DataFusion's own.
+    DataFusion,
+    /// DataFusion's, with einfold installed.
+    EinFold,
+}
+
+/// A DataFusion session with `planner` on `threads` threads, with a 6 GB
+/// memory pool, and the tables.
+fn context(
+    l: usize,
+    tables: &[(&str, Vec<f64>)],
+    planner: Planner,
+    threads: usize,
+) -> SessionContext {
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_limit(6 << 30, 1.0)
         .with_max_temp_directory_size(4 << 30)
         .build_arc()
-        .unwrap();
+        .expect("a runtime with a memory pool");
     let builder = SessionStateBuilder::new()
         .with_default_features()
         .with_config(SessionConfig::new().with_target_partitions(threads))
         .with_runtime_env(runtime);
-    let builder = match einfold {
-        true => einfold_datafusion::install(builder),
-        false => builder,
+    let builder = match planner {
+        Planner::EinFold => einfold_datafusion::install(builder),
+        Planner::DataFusion => builder,
     };
     let ctx = SessionContext::new_with_state(builder.build());
     let schema = Arc::new(Schema::new(vec![
@@ -117,11 +133,12 @@ fn context(l: usize, tables: &[(&str, Vec<f64>)], einfold: bool, threads: usize)
                     Arc::new(Float64Array::from(vals[start..end].to_vec())),
                 ],
             )
-            .unwrap();
+            .expect("a batch of the schema's columns");
             parts[i % 12].push(batch);
         }
-        let table = MemTable::try_new(Arc::clone(&schema), parts).unwrap();
-        ctx.register_table(*name, Arc::new(table)).unwrap();
+        let table = MemTable::try_new(Arc::clone(&schema), parts).expect("a table of batches");
+        ctx.register_table(*name, Arc::new(table))
+            .expect("a new table name");
     }
     ctx
 }
@@ -129,18 +146,24 @@ fn context(l: usize, tables: &[(&str, Vec<f64>)], einfold: bool, threads: usize)
 /// The query's rows, `x[t·D + d]`, NaN where a row is missing or NULL, and
 /// what `EXPLAIN ANALYZE` shows of the plan.
 async fn run(ctx: &SessionContext, form: &str, l: usize) -> (Vec<f64>, usize, String) {
-    let frame = ctx.sql(&sql(form)).await.unwrap();
+    let frame = ctx.sql(&sql(form)).await.expect("the query plans");
     let task = Arc::new(frame.task_ctx());
-    let plan = frame.create_physical_plan().await.unwrap();
+    let plan = frame
+        .create_physical_plan()
+        .await
+        .expect("the query has a physical plan");
     let batches = datafusion::physical_plan::collect(Arc::clone(&plan), task)
         .await
-        .unwrap();
+        .expect("the query runs");
     let mut out = vec![f64::NAN; l * D];
     let mut rows = 0;
     for b in &batches {
-        let t = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let d = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-        let x = b.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+        let column = |c: usize| b.column(c).as_any();
+        let t = column(0).downcast_ref::<Int64Array>().expect("t is Int64");
+        let d = column(1).downcast_ref::<Int64Array>().expect("d is Int64");
+        let x = column(2)
+            .downcast_ref::<Float64Array>()
+            .expect("x is Float64");
         for r in 0..b.num_rows() {
             rows += 1;
             if x.is_valid(r) {
@@ -205,6 +228,13 @@ fn arg(i: usize) -> String {
     env::args().nth(i).unwrap_or_default()
 }
 
+/// Argument `i`, a number.
+fn number<T: std::str::FromStr>(i: usize) -> T {
+    arg(i)
+        .parse()
+        .unwrap_or_else(|_| panic!("argument {i} must be a number"))
+}
+
 fn checksum(xs: &[f64]) -> f64 {
     xs.iter().map(|x| x.abs()).sum()
 }
@@ -213,10 +243,14 @@ fn checksum(xs: &[f64]) -> f64 {
 async fn main() {
     match arg(1).as_str() {
         "df" => {
-            let (form, l, on) = (arg(2), arg(3).parse::<usize>().unwrap(), arg(4) == "on");
+            let planner = match arg(4).as_str() {
+                "on" => Planner::EinFold,
+                _ => Planner::DataFusion,
+            };
+            let (form, l) = (arg(2), number::<usize>(3));
             let tables: Vec<(&str, Vec<f64>)> =
                 ["q", "k", "v"].iter().map(|n| (*n, dense(n, l))).collect();
-            let ctx = context(l, &tables, on, 12);
+            let ctx = context(l, &tables, planner, 12);
             let t = Instant::now();
             let (out, rows, shown) = run(&ctx, &form, l).await;
             let ms = t.elapsed().as_secs_f64() * 1e3;
@@ -234,7 +268,7 @@ async fn main() {
             );
         }
         "duck-sql" => {
-            let (form, l) = (arg(2), arg(3).parse::<usize>().unwrap());
+            let (form, l) = (arg(2), number::<usize>(3));
             println!("SET threads = 12;\nSET memory_limit = '6GB';\nSET max_temp_directory_size = '4GB';");
             for (i, name) in ["q", "k", "v"].iter().enumerate() {
                 let phase = [0.0, 0.5, 1.0][i];
@@ -251,36 +285,46 @@ async fn main() {
             println!("SELECT count(*), sum(abs(x)) FROM out;");
         }
         "accuracy" => {
-            let l = arg(2).parse::<usize>().unwrap();
+            let l = number::<usize>(2);
             let qs = arg(3).parse::<f64>().unwrap_or(1.0);
             let q: Vec<f64> = dense("q", l).iter().map(|x| x * qs).collect();
             let (k, v) = (dense("k", l), dense("v", l));
             let truth = reference(&q, &k, &v, l);
             let scale = truth.iter().fold(0.0f64, |a, x| a.max(x.abs()));
             let tables = [("q", q.clone()), ("k", k.clone()), ("v", v.clone())];
+            // The largest error relative to the largest output, infinite
+            // where an output isn't finite and the reference is, which
+            // `f64::max` would otherwise skip.
             let err = |xs: &[f64]| {
                 xs.iter()
                     .zip(&truth)
-                    .map(|(a, b)| (a - b).abs())
+                    .map(|(a, b)| match a.is_finite() {
+                        true => (a - b).abs(),
+                        false => f64::INFINITY,
+                    })
                     .fold(0.0, f64::max)
                     / scale
             };
-            let (host, _, _) = run(&context(l, &tables, false, 12), "window", l).await;
-            let mut bits = Vec::new();
-            let mut ours = Vec::new();
-            for threads in [1, 2, 5, 12] {
-                let (out, _, shown) = run(&context(l, &tables, true, threads), "window", l).await;
-                assert!(shown.contains("fused_pipelines=1"), "{shown}");
-                bits.push(out.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
-                ours = out;
+            let (host, _, _) =
+                run(&context(l, &tables, Planner::DataFusion, 12), "window", l).await;
+            for form in ["window", "groupby"] {
+                let mut bits = Vec::new();
+                let mut ours = Vec::new();
+                for threads in [1, 2, 5, 12] {
+                    let ctx = context(l, &tables, Planner::EinFold, threads);
+                    let (out, _, shown) = run(&ctx, form, l).await;
+                    assert!(shown.contains("fused_pipelines=1"), "{shown}");
+                    bits.push(out.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+                    ours = out;
+                }
+                let same_bits = bits.windows(2).all(|w| w[0] == w[1]);
+                println!(
+                    "L={l} q_scale={qs} form={form} max|out|={scale:.3e} einfold_err={:.2e} \
+                     datafusion_window_err={:.2e} einfold_same_bits_1_2_5_12_threads={same_bits}",
+                    err(&ours),
+                    err(&host)
+                );
             }
-            let same_bits = bits.windows(2).all(|w| w[0] == w[1]);
-            println!(
-                "L={l} q_scale={qs} max|out|={scale:.3e} einfold_err={:.2e} datafusion_err={:.2e} \
-                 einfold_same_bits_1_2_5_12_threads={same_bits}",
-                err(&ours),
-                err(&host)
-            );
         }
         "edges" => {
             let l = 128;
@@ -294,14 +338,17 @@ async fn main() {
                 ("row 100's scores all -inf", "q", 100 * D, f64::NEG_INFINITY),
             ];
             println!(
-                "| case | rows | NaN in DataFusion | NaN in einfold | rows that differ | fused |"
+                "| case | rows in DataFusion | rows in einfold | NaN in DataFusion | NaN in einfold | rows that differ | fused |"
             );
-            println!("|---|---:|---:|---:|---:|---|");
+            println!("|---|---:|---:|---:|---:|---:|---|");
             for (label, table, at, x) in cases {
                 let mut t: Vec<(&str, Vec<f64>)> =
                     ["q", "k", "v"].iter().map(|n| (*n, dense(n, l))).collect();
                 if label != "none" {
-                    t.iter_mut().find(|(n, _)| *n == table).unwrap().1[at] = x;
+                    t.iter_mut()
+                        .find(|(n, _)| *n == table)
+                        .expect("one of q, k and v")
+                        .1[at] = x;
                 }
                 if label.starts_with("row 100") {
                     // k(j, 0) = 1 for every j, so every score of row 100 is -inf.
@@ -309,8 +356,10 @@ async fn main() {
                         t[1].1[j * D] = 1.0;
                     }
                 }
-                let (host, rows, _) = run(&context(l, &t, false, 4), "window", l).await;
-                let (ours, _, shown) = run(&context(l, &t, true, 4), "window", l).await;
+                let (host, host_rows, _) =
+                    run(&context(l, &t, Planner::DataFusion, 4), "window", l).await;
+                let (ours, our_rows, shown) =
+                    run(&context(l, &t, Planner::EinFold, 4), "window", l).await;
                 let same = |a: f64, b: f64| {
                     (a.is_nan() && b.is_nan()) || a == b || (a - b).abs() <= 1e-12 * (1.0 + b.abs())
                 };
@@ -321,7 +370,7 @@ async fn main() {
                     .count();
                 let nan = |xs: &[f64]| xs.iter().filter(|x| x.is_nan()).count();
                 println!(
-                    "| {label} | {rows} | {} | {} | {differ} | {} |",
+                    "| {label} | {host_rows} | {our_rows} | {} | {} | {differ} | {} |",
                     nan(&host),
                     nan(&ours),
                     shown.contains("fused_pipelines=1")

@@ -9,19 +9,28 @@
 # on the PATH (or in TIME) and a Python with the `duckdb` package (PYTHON):
 #   PYTHON=python3 ./run.sh
 set -u
-BIN=${BIN:-${CARGO_TARGET_DIR:-target}/release/m2-gate}
+BIN=$(realpath "${BIN:-${CARGO_TARGET_DIR:-target}/release/m2-gate}")
 TIME=${TIME:-$(type -P time)}
 PYTHON=${PYTHON:-python3}
 HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
+# Prints the label, the measurement, and the exit status when it isn't 0:
+# 124 for the timeout, or the command's own, such as DuckDB's after it runs
+# out of memory.
 run() { # label, command...
   local label=$1
   shift
-  local out
+  local out status
   out=$(cd "$WORK" && timeout 900 "$TIME" -f "maxrss_kb=%M" "$@" 2>&1)
-  echo "$label | $(echo "$out" | grep -E 'ms=|Run Time|maxrss|^[0-9]+,|rror|xhausted|Killed' | tr '\n' ' ' | cut -c1-400)"
+  status=$?
+  local shown
+  shown=$(echo "$out" | grep -E 'ms=|Run Time|maxrss|^[0-9]+,|rror|xhausted|Killed|panicked' | tr '\n' ' ' | cut -c1-400)
+  if [ "$status" -ne 0 ]; then
+    shown="$shown exit=$status"
+  fi
+  echo "$label | $shown"
 }
 
 for form in window groupby; do

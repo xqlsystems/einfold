@@ -26,7 +26,7 @@ for statement in script.split(";\n"):
         elapsed = time.perf_counter() - start
     except duckdb.Error as e:
         print(f"error: {str(e)[:200]}")
-        sys.exit(0)
+        sys.exit(1)
     if statement.startswith("CREATE TEMP TABLE out"):
         print(f"Run Time (s): real {elapsed:.3f}")
     elif statement.startswith("SELECT count"):

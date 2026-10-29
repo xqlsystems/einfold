@@ -12,7 +12,7 @@ Run with `cargo build --release`, then `./run.sh` (see its header for GNU `time`
 
 ## Result
 
-2026-10-27. Intel Core i7-8700 (6 cores, 12 threads), 15 GB RAM, Rust 1.99, DataFusion 55.2.0, DuckDB 1.5.6 (the latest 1.x, through its Python package), einfold at the commit that last changed this file. Times are from SQL to Arrow rows, one run each; peak memory is the process's.
+2026-10-27. Intel Core i7-8700 (6 cores, 12 threads), 15 GB RAM, Rust 1.99, DataFusion 55.2.0, DuckDB 1.5.6 (the latest 1.x, through its Python package), einfold at the commit that last changed this file. One run each. DataFusion's times, with einfold and without, are from SQL to Arrow rows. DuckDB's time is its query into a temporary table, `CREATE TEMP TABLE out AS …`, without converting the rows to Arrow, which favors DuckDB slightly. Peak memory is the process's.
 
 **Window spelling**
 
@@ -34,18 +34,18 @@ Run with `cargo build --release`, then `./run.sh` (see its header for GNU `time`
 | 16,384 | | out of memory | 0.39 s, 0.21 GB | — |
 | 65,536 | | | 5.6 s, 0.68 GB | — |
 
-All three agree on every output row's checksum wherever they finish.
+Wherever they finish, all three give the same number of rows and the same checksum, the sum of `|x|` over every row. The rows aren't compared one by one here; `tests/detect_pipelines.rs` does that, on smaller tables.
 
 ## Against demo 1's criteria
 
 - **Found, not told: both spellings, yes.** The plan has one `EinFoldExec` computing the pipeline, `a,b * c,b -> a,c where a >= c; softmax(/ 8, shifted) * c,d -> a,d`, which `PipelineNode` detection (#72) found in the SQL.
 - **Masks: yes.** The causal mask leaves exactly the tiles on and below the diagonal: 136 of 256 pairs at L = 1,024, 524,800 of 1,048,576 at 65,536.
-- **Fast: yes.** 41–412× faster than the faster host wherever one finishes, and it runs at L = 16,384 and 65,536, where both have run out of memory.
+- **Fast: yes.** 41–412× faster than the faster host wherever one finishes. DuckDB runs out of memory at L = 16,384, and DataFusion's window spelling at 8,192, so neither is run beyond; einfold runs at 16,384 and 65,536.
 - **Memory: no `N²` term.** Peak memory rises from 70 MB at L = 1,024 to 690 MB at 65,536, while the inputs and output alone, as Arrow rows, are about 400 MB at 65,536. What is left over grows with the inputs: their dense copies and the output's key columns. The `N²` scores never exist; one 64 × 64 tile of them is held per thread.
 - **Correct.**
-  - Within the error bound, and more accurate than DataFusion. Against a compensated reference at L = 2,048, with the queries scaled 1×, 10× and 40× to spread the scores, einfold's largest error is 0.8, 3.7 and 5.1e-15 of the largest output. DataFusion's is 6.6, 22 and 61e-15.
-  - The same bits on 1, 2, 5 and 12 threads.
-  - Exactly SQL's results on special values. At L = 128, with a NaN in `q` or `v`, `±∞` in `q`, `1e300` in `k`, or a row whose scores are all `−∞`: the same NaN rows as DataFusion (64, 123, 64, 64, 0 and 64), and no row that differs.
+  - Within the error bound, and more accurate than DataFusion. Against a compensated reference at L = 2,048, with the queries scaled 1×, 10× and 40× to spread the scores, einfold's largest error is 0.8, 3.7 and 5.1e-15 of the largest output, in both spellings. DataFusion's, in the window spelling, is 6.4, 17 and 87e-15; its sums' order varies from run to run, and so does its error.
+  - The same bits on 1, 2, 5 and 12 threads, in both spellings.
+  - SQL's results on special values. At L = 128, with a NaN in `q` or `v`, `±∞` in `q`, `1e300` in `k`, or a row whose scores are all `−∞`: the same number of rows as DataFusion, the same number of NaNs (64, 123, 64, 64, 0 and 64), and every other value within `1e-12`, relative, of DataFusion's at the same `(t, d)`. This check doesn't tell a NULL from a NaN or a missing row; `tests/detect_pipelines.rs` does.
 - **Not yet:**
   - **ddx's attention program,** which normalizes before the product with `V`, `a = ex / z` then `SUM(a * v)`. Detection doesn't match that spelling yet.
   - **A Gaussian-kernel weighted average,** `SUM(exp(-dist² / h²) * y) / SUM(exp(-dist² / h²))`, the same rules on a query that isn't attention. Its producer, `Σ (t − s)²`, isn't a sum of products. The rule's `SUM(w * y) / SUM(w)` form is tested on other queries in `tests/detect_pipelines.rs`.

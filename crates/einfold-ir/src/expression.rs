@@ -210,25 +210,19 @@ impl fmt::Display for Expression {
         match self {
             Expression::Column { operand, column } => write!(f, "#{operand}.{}", column.0),
             Expression::Literal(Constant(x)) => write!(f, "{x}"),
-            Expression::Unary(Unary::Negate, x) => write!(f, "-({x})"),
-            Expression::Unary(op, x) => {
-                let name = match op {
-                    Unary::Abs => "abs",
-                    Unary::Exp => "exp",
-                    _ => "ln",
-                };
-                write!(f, "{name}({x})")
-            }
-            Expression::Binary(Binary::Power, a, b) => write!(f, "power({a}, {b})"),
-            Expression::Binary(op, a, b) => {
-                let sign = match op {
-                    Binary::Add => "+",
-                    Binary::Subtract => "-",
-                    Binary::Multiply => "*",
-                    _ => "/",
-                };
-                write!(f, "({a} {sign} {b})")
-            }
+            Expression::Unary(op, x) => match op {
+                Unary::Negate => write!(f, "-({x})"),
+                Unary::Abs => write!(f, "abs({x})"),
+                Unary::Exp => write!(f, "exp({x})"),
+                Unary::Ln => write!(f, "ln({x})"),
+            },
+            Expression::Binary(op, a, b) => match op {
+                Binary::Add => write!(f, "({a} + {b})"),
+                Binary::Subtract => write!(f, "({a} - {b})"),
+                Binary::Multiply => write!(f, "({a} * {b})"),
+                Binary::Divide => write!(f, "({a} / {b})"),
+                Binary::Power => write!(f, "power({a}, {b})"),
+            },
         }
     }
 }

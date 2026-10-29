@@ -395,9 +395,15 @@ fn merged_weights(p: &Projection) -> Result<Option<Weights>> {
     else {
         return Ok(None);
     };
+    // The weight's argument under the weight's own name, so that the
+    // projection's names stay distinct: a key may be called `s`.
     let mut exprs = p.expr.clone();
-    exprs[w] = exp(&p.expr[w]).expect("an exp").alias("s");
-    let plan = LogicalPlan::Projection(Projection::try_new(exprs, Arc::clone(&p.input))?);
+    let name = p.schema.field(w).name().clone();
+    exprs[w] = exp(&p.expr[w]).expect("an exp").alias(name);
+    let Ok(projection) = Projection::try_new(exprs, Arc::clone(&p.input)) else {
+        return Ok(None);
+    };
+    let plan = LogicalPlan::Projection(projection);
     let Some(scores) = scores(&plan)? else {
         return Ok(None);
     };

@@ -172,6 +172,15 @@ fn query(rng: &mut Rng) -> (String, Expect) {
                 let other = "SELECT i, SUM(exp(2.0 * w)) AS z FROM weights GROUP BY i";
                 (average(window, other), Expect::Decline)
             }
+            // A key named `s`, beside the weights merged with their scores.
+            false if rng.chance(0.5) => (
+                format!(
+                    "WITH {scores}, weights AS (SELECT i AS s, j, exp(s) AS w FROM scores) \
+                     SELECT weights.s AS t, v.c, SUM(weights.w * v.x) / SUM(weights.w) AS x \
+                     FROM weights JOIN v ON weights.j = v.t GROUP BY weights.s, v.c"
+                ),
+                Expect::Pipeline,
+            ),
             // The scores and their weights side by side, the scores summed
             // with the values: DataFusion merges the projections, and the
             // raw score is no weight.

@@ -20,7 +20,8 @@
 //!   `CASE`, that ddx, an XQL Systems project for automatic differentiation
 //!   of SQL queries, writes for a gradient), which the rule must turn into a
 //!   fold with `d` as its domain;
-//! - **masked folds** (`AND l.a >= r.b`), a fold where both masked columns
+//! - **masked folds** (`AND l.a >= r.b`, or with dense keys a band with
+//!   offsets, such as `abs(l.a - r.b) <= 1`), a fold where both masked columns
 //!   are group keys and a look-alike otherwise, alone, from a domain and
 //!   joined back;
 //! - **look-alikes** it must leave alone: no
@@ -190,7 +191,9 @@ enum Expect {
 
 /// A random query over `l`, `r` and `d`, and whether the rule must fire;
 /// with `joined_back`, always a fold joined back to `d` or a look-alike.
-fn query(rng: &mut Rng, joined_back: bool) -> (String, Expect) {
+/// With `small_integers`, keys whose differences SQL computes without
+/// overflow, masks may be bands with offsets.
+fn query(rng: &mut Rng, joined_back: bool, small_integers: bool) -> (String, Expect) {
     let eq = |x: &str, y: &str, safe: bool| match safe {
         true => format!("({x} IS NOT DISTINCT FROM {y})"),
         false => format!("{x} = {y}"),
@@ -228,8 +231,19 @@ fn query(rng: &mut Rng, joined_back: bool) -> (String, Expect) {
         select.reverse();
     }
     let group = groups.join(", ");
+    // A mask between the two group keys: causal, or with offsets, a band, or
+    // one beyond every key, which leaves no group.
+    let mask_sql = match small_integers && rng.chance(0.5) {
+        true => [
+            " AND l.a - r.b < 2",
+            " AND l.a BETWEEN r.b - 1 AND r.b + 1",
+            " AND abs(l.a - r.b) <= 1",
+            " AND l.a >= r.b + 100",
+        ][rng.below(4)],
+        false => " AND l.a >= r.b",
+    };
     let fold = |aggregate: &str, mask: bool| {
-        let mask = if mask { " AND l.a >= r.b" } else { "" };
+        let mask = if mask { mask_sql } else { "" };
         format!(
             "SELECT {}, {aggregate} AS v FROM l JOIN r ON {}{mask} GROUP BY {group}",
             select.join(", "),
@@ -541,7 +555,7 @@ async fn sweep(default_seed: u64, joined_back: bool) -> Ran {
         // keys meets operands the dense algorithm can take.
         let d_messy = messy || rng.chance(if joined_back { 0.5 } else { 0.3 });
         table(&mut rng, &ctxs, "d", [ea + 1, ec + 1], keys, d_messy);
-        let (sql, expect) = query(&mut rng, joined_back);
+        let (sql, expect) = query(&mut rng, joined_back, matches!(keys, Keys::Dense));
         let fail = |what: String| panic!("seed {seed}: {what}\nSQL: {sql}");
 
         let df = ours.sql(&sql).await.unwrap();
@@ -1168,7 +1182,7 @@ async fn einfold_runs_short_of_memory_only_where_the_host_does() {
         let d_messy = messy || rng.chance(0.3);
         table(&mut rng, &ctxs, "d", [ea + 1, ec + 1], keys, d_messy);
         let joined_back = rng.chance(0.2);
-        let (sql, _) = query(&mut rng, joined_back);
+        let (sql, _) = query(&mut rng, joined_back, matches!(keys, Keys::Dense));
         let fail =
             |what: String| panic!("seed {seed}, a pool of {bytes} bytes: {what}\nSQL: {sql}");
         let want = match theirs.sql(&sql).await.unwrap().collect().await {

@@ -456,8 +456,8 @@ pub(crate) fn fold(
     // doesn't exist.
     let allowed = |x: usize, y: usize| -> bool {
         (fold.conditions().iter()).all(|c| {
-            let (l, r) = (key_at(c.left.0, x, y), key_at(c.right.0, x, y));
-            c.comparison.holds(l, r)
+            let key = |d: DimensionId| i64::try_from(key_at(d.0, x, y)).expect("a key fits in i64");
+            c.holds(key(c.left), key(c.right))
         })
     };
     let masked = !fold.conditions().is_empty();

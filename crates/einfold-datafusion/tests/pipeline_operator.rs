@@ -106,6 +106,7 @@ fn attention() -> Pipeline {
         left: DimensionId(0),
         comparison: Comparison::GreaterOrEqual,
         right: DimensionId(2),
+        offset: 0,
     };
     let scores = Fold::try_new(
         vec![EQ; 3],

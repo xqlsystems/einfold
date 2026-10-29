@@ -15,9 +15,11 @@
 //! - **causal attention**, the maximum as a window (`MAX(s) OVER
 //!   (PARTITION BY i)`) or as `MAX(s) … GROUP BY i` joined back, the scores
 //!   divided or multiplied by a constant or neither, with the causal mask
-//!   either way round or none, normalized by `norm.z`, either the sum or,
-//!   as ddx (an XQL Systems project for automatic differentiation of SQL
-//!   queries) writes it, each term (`SUM(w / norm.z * v.x)`);
+//!   either way round, a band such as a sliding window's (`q.t - k.t < 5`,
+//!   `k.t BETWEEN q.t - 4 AND q.t`, `abs(q.t - k.t) < 4`), an offset alone,
+//!   or none, normalized by `norm.z`, either the sum or, as ddx (an XQL
+//!   Systems project for automatic differentiation of SQL queries) writes
+//!   it, each term (`SUM(w / norm.z * v.x)`);
 //! - **a weighted average over joined rows**, `SUM(exp(s) * v.x) / SUM(exp(s))`
 //!   with no shift, as a recommender or kernel smoother writes it;
 //! - **look-alikes** it must leave alone: a maximum partitioned by the summed
@@ -77,7 +79,20 @@ enum Expect {
 /// A query and whether it is a pipeline.
 fn query(rng: &mut Rng) -> (String, Expect) {
     let scale = [" / 8.0", " * 0.5", ""][rng.below(3)];
-    let mask = [" AND q.t >= k.t", " AND k.t <= q.t", " AND q.t > k.t", ""][rng.below(4)];
+    let mask = [
+        " AND q.t >= k.t",
+        " AND k.t <= q.t",
+        " AND q.t > k.t",
+        "",
+        // Bands: a sliding window, spelled as a difference, a sum or a
+        // `BETWEEN`, and an offset on its own.
+        " AND q.t >= k.t AND q.t - k.t < 5",
+        " AND k.t BETWEEN q.t - 4 AND q.t",
+        " AND k.t >= q.t - 7 AND q.t + 2 >= k.t",
+        " AND q.t < k.t + 3",
+        " AND abs(q.t - k.t) < 4",
+        " AND 3 >= abs(k.t - q.t)",
+    ][rng.below(10)];
     let scores = format!(
         "scores AS (SELECT q.t AS i, k.t AS j, SUM(q.x * k.x){scale} AS s \
          FROM q JOIN k ON q.d = k.d{mask} GROUP BY q.t, k.t)"

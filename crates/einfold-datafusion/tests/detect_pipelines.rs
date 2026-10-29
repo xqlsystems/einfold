@@ -7,8 +7,10 @@
 //! finds a fold pipeline in each spelling it claims to, and in none of the
 //! look-alikes.
 //!
-//! Each case draws tables `q(t, d, x)`, `k(t, d, x)` and `v(t, c, x)`,
-//! complete or with a row missing, and a query:
+//! Each case draws tables `q(t, d, x)`, `k(t, d, x)` and `v(t, c, x)`, each
+//! with one row for every `(t, d)` or `(t, c)`, and sometimes damages one: a
+//! row missing, repeated, or with a NULL `x`; an `x` that is NaN or an
+//! infinity; a NULL `t`; or no rows at all. Then it draws a query:
 //!
 //! - **causal attention**, the maximum as a window (`MAX(s) OVER
 //!   (PARTITION BY i)`) or as `MAX(s) … GROUP BY i` joined back, the scores
@@ -24,8 +26,10 @@
 //!   fold, scaled differently).
 //!
 //! Invariants: the same rows as DataFusion without einfold, values within
-//! `1e-9` of its; a pipeline found exactly where the query is one; and the
-//! fused algorithm run whenever the tables are complete.
+//! `1e-9` of its, and the same NaNs and infinities; a pipeline found exactly
+//! where the query is one (where a key column is nullable, only that none is
+//! found in a look-alike); and the fused algorithm run whenever every key
+//! has one row.
 //!
 //! Reproduce a failure with `EINFOLD_SEED=<seed printed>`; search longer with
 //! `EINFOLD_CASES=<n>`.
@@ -144,32 +148,86 @@ fn query(rng: &mut Rng) -> (String, Expect) {
     }
 }
 
+/// What's wrong with a table, if anything.
+#[derive(Clone, Copy, Debug)]
+enum Damage {
+    None,
+    /// Row `r` is missing.
+    Missing(usize),
+    /// Row `r` appears twice.
+    Repeated(usize),
+    /// Row `r`'s `x` is NULL.
+    NullValue(usize),
+    /// Row `r`'s `x` is NaN or an infinity.
+    Special(usize, f64),
+    /// Row `r`'s `t` is NULL, in a nullable column.
+    NullKey(usize),
+    /// The table has no rows.
+    Empty,
+}
+
+impl Damage {
+    /// Some damage to a table of `rows` rows.
+    fn draw(rng: &mut Rng, rows: usize) -> Self {
+        let r = rng.below(rows);
+        match rng.below(6) {
+            0 => Damage::Missing(r),
+            1 => Damage::Repeated(r),
+            2 => Damage::NullValue(r),
+            3 => Damage::Special(
+                r,
+                [f64::NAN, f64::INFINITY, f64::NEG_INFINITY][rng.below(3)],
+            ),
+            4 => Damage::NullKey(r),
+            _ => Damage::Empty,
+        }
+    }
+
+    /// Whether every key has exactly one row, so that the fused algorithm
+    /// must run.
+    fn complete(self) -> bool {
+        matches!(self, Damage::None | Damage::Special(..))
+    }
+}
+
+/// Registers `name(t, second, x)` with every `(t, second)` in `extents`, as
+/// `damage` leaves it, in two partitions, in each of `ctxs`.
 fn register(
     ctxs: &[&SessionContext],
     name: &str,
     second: &str,
     extents: (usize, usize),
-    missing: Option<usize>,
+    damage: Damage,
     rng: &mut Rng,
 ) {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("t", DataType::Int64, false),
+        Field::new("t", DataType::Int64, matches!(damage, Damage::NullKey(_))),
         Field::new(second, DataType::Int64, false),
         Field::new("x", DataType::Float64, true),
     ]));
-    let rows: Vec<usize> = (0..extents.0 * extents.1)
-        .filter(|&r| Some(r) != missing)
-        .collect();
-    let values: Vec<f64> = rows
+    let mut rows: Vec<usize> = (0..extents.0 * extents.1).collect();
+    match damage {
+        Damage::Missing(r) => drop(rows.remove(r)),
+        Damage::Repeated(r) => rows.push(r),
+        Damage::Empty => rows.clear(),
+        _ => {}
+    }
+    let values: Vec<Option<f64>> = rows
         .iter()
-        .map(|_| (rng.below(2001) as f64 - 1000.0) / 500.0)
+        .map(|&r| match damage {
+            Damage::NullValue(d) if d == r => None,
+            Damage::Special(d, x) if d == r => Some(x),
+            _ => Some((rng.below(2001) as f64 - 1000.0) / 500.0),
+        })
         .collect();
+    let t = rows.iter().map(|&r| match damage {
+        Damage::NullKey(d) if d == r => None,
+        _ => Some((r / extents.1) as i64),
+    });
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
-            Arc::new(Int64Array::from_iter_values(
-                rows.iter().map(|&r| (r / extents.1) as i64),
-            )),
+            Arc::new(Int64Array::from_iter(t)),
             Arc::new(Int64Array::from_iter_values(
                 rows.iter().map(|&r| (r % extents.1) as i64),
             )),
@@ -188,7 +246,8 @@ fn register(
     }
 }
 
-fn rows(batches: &[RecordBatch]) -> Vec<(i64, i64, Option<f64>)> {
+/// Rows sorted by keys, a NULL `t` first.
+fn rows(batches: &[RecordBatch]) -> Vec<(Option<i64>, i64, Option<f64>)> {
     let mut out = Vec::new();
     for b in batches {
         let key = |c: usize| {
@@ -201,7 +260,11 @@ fn rows(batches: &[RecordBatch]) -> Vec<(i64, i64, Option<f64>)> {
         let (t, c) = (key(0), key(1));
         let x = b.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
         for r in 0..b.num_rows() {
-            out.push((t.value(r), c.value(r), x.is_valid(r).then(|| x.value(r))));
+            out.push((
+                t.is_valid(r).then(|| t.value(r)),
+                c.value(r),
+                x.is_valid(r).then(|| x.value(r)),
+            ));
         }
     }
     out.sort_by_key(|r| (r.0, r.1));
@@ -231,13 +294,26 @@ async fn einfold_finds_pipelines_and_changes_no_answer() {
             .with_config(config(threads[1]));
         let ours = SessionContext::new_with_state(einfold_datafusion::install(builder).build());
         let (l, d, c) = (1 + rng.below(90), 1 + rng.below(6), 1 + rng.below(4));
-        let complete = rng.chance(0.8);
-        let missing = (!complete).then(|| rng.below(l * c));
-        register(&[&host, &ours], "q", "d", (l, d), None, &mut rng);
-        register(&[&host, &ours], "k", "d", (l, d), None, &mut rng);
-        register(&[&host, &ours], "v", "c", (l, c), missing, &mut rng);
+        // Sometimes one table is damaged.
+        let tables = [("q", "d", (l, d)), ("k", "d", (l, d)), ("v", "c", (l, c))];
+        let damaged = rng.chance(0.3).then(|| rng.below(3));
+        let mut damage = Damage::None;
+        for (i, (name, second, extents)) in tables.into_iter().enumerate() {
+            let this = match damaged == Some(i) {
+                true => Damage::draw(&mut rng, extents.0 * extents.1),
+                false => Damage::None,
+            };
+            damage = match damaged == Some(i) {
+                true => this,
+                false => damage,
+            };
+            register(&[&host, &ours], name, second, extents, this, &mut rng);
+        }
+        let complete = damage.complete();
         let (sql, expect) = query(&mut rng);
-        let fail = |what: String| panic!("seed {seed}: {what}\nSQL: {sql}");
+        let fail = |what: String| {
+            panic!("seed {seed}: {what} ({damage:?} in table {damaged:?})\nSQL: {sql}")
+        };
 
         let frame = ours.sql(&sql).await.unwrap();
         let task = Arc::new(frame.task_ctx());
@@ -251,8 +327,11 @@ async fn einfold_finds_pipelines_and_changes_no_answer() {
             .indent(true)
             .to_string();
         let is_pipeline = shown.contains("softmax(");
+        // A nullable key may keep detection from proving the plan a
+        // pipeline; it must still not find one in a look-alike.
+        let nullable = matches!(damage, Damage::NullKey(_));
         match (expect, is_pipeline) {
-            (Expect::Pipeline, false) => fail(format!("found no pipeline:\n{shown}")),
+            (Expect::Pipeline, false) if !nullable => fail(format!("found no pipeline:\n{shown}")),
             (Expect::Decline, true) => fail(format!("found a pipeline in a look-alike:\n{shown}")),
             _ => {}
         }
@@ -272,6 +351,7 @@ async fn einfold_finds_pipelines_and_changes_no_answer() {
             let same = (o.0, o.1) == (t.0, t.1)
                 && match (o.2, t.2) {
                     (Some(x), Some(y)) if x.is_nan() || y.is_nan() => x.is_nan() && y.is_nan(),
+                    (Some(x), Some(y)) if x.is_infinite() || y.is_infinite() => x == y,
                     (Some(x), Some(y)) => (x - y).abs() <= 1e-9 * (1.0 + y.abs()),
                     (None, None) => true,
                     _ => false,

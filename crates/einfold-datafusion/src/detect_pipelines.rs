@@ -277,12 +277,11 @@ fn weights(plan: &LogicalPlan) -> Result<Option<Weights>> {
             }
             LogicalPlan::Join(j) => {
                 // The scores joined to their maximum by the kept output.
-                let (Some(sc), Some((m_scores, kept, m_col, key_col))) =
-                    (scores(&j.left)?, maximum(&j.right)?)
-                else {
+                let (Some(sc), Some(maximum)) = (scores(&j.left)?, maximum(&j.right)?) else {
                     return Ok(None);
                 };
-                if !same_scores(&sc, &m_scores)
+                let kept = maximum.kept;
+                if !same_scores(&sc, &maximum.scores)
                     || j.join_type != JoinType::Inner
                     || j.filter.is_some()
                 {
@@ -296,10 +295,10 @@ fn weights(plan: &LogicalPlan) -> Result<Option<Weights>> {
                 let [(l, r)] = j.on.as_slice() else {
                     return Ok(None);
                 };
-                if column(l) != kept_col.as_ref() || column(r) != Some(&key_col) {
+                if column(l) != kept_col.as_ref() || column(r) != Some(&maximum.key_column) {
                     return Ok(None);
                 }
-                (j.left.as_ref(), Some(m_col), Some(kept))
+                (j.left.as_ref(), Some(maximum.maximum_column), Some(kept))
             }
             other => (other, None, None),
         };
@@ -369,9 +368,20 @@ fn partition(partition_by: &[Expr], scores: &Scores, plan: &LogicalPlan) -> Opti
     scores.columns.get(i).copied().flatten()
 }
 
-/// `plan` as the largest score of each kept output, `MAX(s) … GROUP BY i`:
-/// its scores, the kept output, the maximum's column and the key's column.
-fn maximum(plan: &LogicalPlan) -> Result<Option<(Scores, usize, Column, Column)>> {
+/// The largest score of each kept output, `MAX(s) … GROUP BY i`.
+struct Maximum {
+    /// The scores it's the largest of.
+    scores: Scores,
+    /// The kept output it's grouped by.
+    kept: usize,
+    /// The plan's column holding the maximum.
+    maximum_column: Column,
+    /// The plan's column holding the kept output's key.
+    key_column: Column,
+}
+
+/// `plan` as the largest score of each kept output, or `None`.
+fn maximum(plan: &LogicalPlan) -> Result<Option<Maximum>> {
     let LogicalPlan::Projection(p) = strip(plan) else {
         return Ok(None);
     };
@@ -391,31 +401,37 @@ fn maximum(plan: &LogicalPlan) -> Result<Option<(Scores, usize, Column, Column)>
     let Some(scores) = scores(&agg.input)? else {
         return Ok(None);
     };
-    let (Some(score), Some(gc)) = (score_column(&scores, &agg.input), column(g)) else {
+    let (Some(score), Some(group)) = (score_column(&scores, &agg.input), column(g)) else {
         return Ok(None);
     };
     if params.args[0].clone().unalias() != Expr::Column(score) {
         return Ok(None);
     }
-    let Some(kept) = (agg.input.schema().index_of_column(gc).ok()).and_then(|i| scores.columns[i])
+    let Some(kept) =
+        (agg.input.schema().index_of_column(group).ok()).and_then(|i| scores.columns[i])
     else {
         return Ok(None);
     };
     // The projection's columns: the key, then the maximum, in some order.
     let (key, max) = (column_at(&p.input, 0), column_at(&p.input, 1));
-    let mut key_col = None;
-    let mut max_col = None;
+    let mut key_column = None;
+    let mut maximum_column = None;
     for (i, e) in p.expr.iter().enumerate() {
         match e.clone().unalias() {
-            Expr::Column(c) if c == key => key_col = Some(column_at(plan, i)),
-            Expr::Column(c) if c == max => max_col = Some(column_at(plan, i)),
+            Expr::Column(c) if c == key => key_column = Some(column_at(plan, i)),
+            Expr::Column(c) if c == max => maximum_column = Some(column_at(plan, i)),
             _ => return Ok(None),
         }
     }
-    let (Some(key_col), Some(max_col)) = (key_col, max_col) else {
+    let (Some(key_column), Some(maximum_column)) = (key_column, maximum_column) else {
         return Ok(None);
     };
-    Ok(Some((scores, kept, max_col, key_col)))
+    Ok(Some(Maximum {
+        scores,
+        kept,
+        maximum_column,
+        key_column,
+    }))
 }
 
 /// `p` as a fold pipeline (see the module's documentation): a

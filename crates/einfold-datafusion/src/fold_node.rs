@@ -16,7 +16,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::common::{plan_err, DFSchema, DFSchemaRef, Result};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan, UserDefinedLogicalNodeCore};
-use einfold_ir::{ColumnIndex, Comparison, DimensionId, Fold};
+use einfold_ir::{ColumnIndex, Comparison, DimensionId, Fold, RowValue};
 use einfold_kernels::DomainRows;
 
 /// A fold over a join in a DataFusion logical plan. Its inputs are the fold's
@@ -290,9 +290,15 @@ pub(crate) fn describe(fold: &Fold, domain_rows: DomainRows) -> String {
             format!(" {} {op} {}{offset}", name(c.left), name(c.right))
         })
         .collect();
+    // A product multiplies one factor of each operand; a row expression
+    // reads their columns, as `#operand.column`.
+    let (joiner, of) = match fold.row() {
+        RowValue::Expression(e) => (" ; ", format!(" of {e}")),
+        _ => (" * ", String::new()),
+    };
     format!(
-        "{} -> {}{}{}",
-        operands.join(" * "),
+        "{} -> {}{of}{}{}",
+        operands.join(joiner),
         outputs.join(","),
         match (fold.domain(), domain_rows) {
             (None, _) => "",

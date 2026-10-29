@@ -51,8 +51,8 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use einfold_ir::{
-    Aggregate as FoldAggregate, ColumnIndex, Comparison, Condition, Dimension, DimensionId, Domain,
-    DomainKey, Fold, Key, KeyEquality, Operand, Output, RowValue,
+    Aggregate as FoldAggregate, Binary, ColumnIndex, Comparison, Condition, Dimension, DimensionId,
+    Domain, DomainKey, Expression, Fold, Key, KeyEquality, Operand, Output, RowValue, Unary,
 };
 
 use crate::detect_pipelines;
@@ -316,7 +316,7 @@ fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
     let Some(Found {
         fold: spec,
         operands: plans,
-    }) = analyze(agg)?
+    }) = analyze(agg, false)?
     else {
         return Ok(None);
     };
@@ -340,11 +340,12 @@ fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
 }
 
 /// `agg` as a fold, if it is one: a `SUM` of a product of one factor from
-/// each side of an inner equi-join, grouped by columns, through projections.
-/// A condition of the join that compares two of the fold's dimensions, such
-/// as `q.t >= k.t`, becomes one of the fold's conditions; any other declines.
-pub(crate) fn analyze(agg: &Aggregate) -> Result<Option<Found>> {
-    use datafusion::logical_expr::ExprSchemable;
+/// each side of an inner equi-join, grouped by columns, through projections;
+/// or, with `expressions`, a `SUM` of a row expression of both sides (see
+/// [`fold_over`]). A condition of the join that compares two of the fold's
+/// dimensions, such as `q.t >= k.t`, becomes one of the fold's conditions;
+/// any other declines.
+pub(crate) fn analyze(agg: &Aggregate, expressions: bool) -> Result<Option<Found>> {
     let Some(arg) = sum_argument(agg) else {
         return Ok(None);
     };
@@ -365,37 +366,63 @@ pub(crate) fn analyze(agg: &Aggregate) -> Result<Option<Found>> {
             _ => return Ok(None),
         }
     };
-    if join.join_type != JoinType::Inner || join.on.is_empty() {
+    if join.on.is_empty() {
+        return Ok(None);
+    }
+    let groups = (agg.group_expr.iter())
+        .map(|g| resolve(g, &projections))
+        .collect::<Result<Vec<_>>>()?;
+    fold_over(join, &groups, &resolve(&arg, &projections)?, expressions)
+}
+
+/// The `SUM` of `value` over `join`, an inner join, grouped by `groups`, as
+/// a fold, with `groups` and `value` expressions of the join's columns.
+/// `value` is a product of one factor from each side, or, with
+/// `expressions`, a row expression (see [`row_expression`]). Over a join with
+/// no equalities, such as a `CROSS JOIN`, and a group key from each side,
+/// each pair of rows is its own group, and its one row is its sum.
+pub(crate) fn fold_over(
+    join: &Join,
+    groups: &[Expr],
+    value: &Expr,
+    expressions: bool,
+) -> Result<Option<Found>> {
+    if join.join_type != JoinType::Inner {
         return Ok(None);
     }
     let inputs = [join.left.schema().as_ref(), join.right.schema().as_ref()];
-    let Expr::BinaryExpr(BinaryExpr {
+    // A product's factors, one from each side.
+    let factor = |f: &Expr| -> Result<Option<usize>> {
+        let Some(s) = side(f, inputs) else {
+            return Ok(None);
+        };
+        let ok = f.get_type(inputs[s])? == DataType::Float64 && movable(f, inputs[s]);
+        Ok(ok.then_some(s))
+    };
+    let mut factors: [Option<Expr>; 2] = [None, None];
+    if let Expr::BinaryExpr(BinaryExpr {
         left,
         op: Operator::Multiply,
         right,
-    }) = resolve(&arg, &projections)?
-    else {
-        return Ok(None);
-    };
-    let mut factors: [Option<Expr>; 2] = [None, None];
-    for f in [*left, *right] {
-        let Some(s) = side(&f, inputs) else {
-            return Ok(None);
-        };
-        if factors[s].is_some()
-            || f.get_type(inputs[s])? != DataType::Float64
-            || !movable(&f, inputs[s])
-        {
-            return Ok(None);
+    }) = value
+    {
+        for f in [left.as_ref(), right.as_ref()] {
+            if let Some(s) = factor(f)? {
+                if factors[s].replace(f.clone()).is_some() {
+                    factors = [None, None];
+                    break;
+                }
+            }
         }
-        factors[s] = Some(f);
     }
-    let [Some(lf), Some(rf)] = factors else {
+    let product = factors[0].is_some() && factors[1].is_some();
+    if !product && !expressions {
         return Ok(None);
-    };
+    }
 
     // Dimensions: one per pair of join keys, then one per group key that
-    // isn't a join key. Each operand projects its keys, then its factor.
+    // isn't a join key. Each operand projects its keys, then its factor or
+    // the columns a row expression reads.
     let equality = match join.null_equality {
         NullEquality::NullEqualsNull => KeyEquality::NotDistinct,
         NullEquality::NullEqualsNothing => KeyEquality::Equal,
@@ -422,16 +449,15 @@ pub(crate) fn analyze(agg: &Aggregate) -> Result<Option<Found>> {
         }
     }
     let mut outputs = Vec::new();
-    for g in &agg.group_expr {
-        let g = resolve(g, &projections)?;
-        let (Expr::Column(_), Some(s)) = (&g, side(&g, inputs)) else {
+    for g in groups {
+        let (Expr::Column(_), Some(s)) = (g, side(g, inputs)) else {
             return Ok(None);
         };
-        let d = match join.on.iter().position(|pair| [&pair.0, &pair.1][s] == &g) {
+        let d = match join.on.iter().position(|pair| [&pair.0, &pair.1][s] == g) {
             Some(d) => d,
             None => {
                 dimensions.push(Dimension { equality });
-                if !hold(s, dimensions.len() - 1, g, &mut columns) {
+                if !hold(s, dimensions.len() - 1, g.clone(), &mut columns) {
                     return Ok(None);
                 }
                 dimensions.len() - 1
@@ -458,9 +484,22 @@ pub(crate) fn analyze(agg: &Aggregate) -> Result<Option<Found>> {
             conditions.extend(found);
         }
     }
+    // What each side projects after its keys, and the row value.
+    let (row, values): (RowValue, [Vec<Expr>; 2]) = match factors {
+        [Some(lf), Some(rf)] => (RowValue::Product, [vec![lf], vec![rf]]),
+        _ => {
+            let mut values = [Vec::new(), Vec::new()];
+            let base = [columns[0].len(), columns[1].len()];
+            match row_expression(value, inputs, base, &mut values)? {
+                Some(e) => (RowValue::Expression(e), values),
+                None => return Ok(None),
+            }
+        }
+    };
     let mut operands = Vec::new();
-    for (s, (input, factor)) in [(&join.left, lf), (&join.right, rf)]
+    for (s, (input, values)) in [&join.left, &join.right]
         .into_iter()
+        .zip(values)
         .enumerate()
     {
         let mut exprs: Vec<Expr> = columns[s]
@@ -468,11 +507,12 @@ pub(crate) fn analyze(agg: &Aggregate) -> Result<Option<Found>> {
             .enumerate()
             .map(|(c, e)| e.clone().alias(format!("k{c}")))
             .collect();
-        exprs.push(factor.alias("f"));
+        let factor = (row == RowValue::Product).then_some(ColumnIndex(exprs.len()));
+        exprs.extend((values.into_iter().enumerate()).map(|(i, e)| e.alias(format!("f{i}"))));
         operands.push((
             Operand {
                 keys: std::mem::take(&mut keys[s]),
-                factor: Some(ColumnIndex(columns[s].len())),
+                factor,
             },
             LogicalPlan::Projection(Projection::try_new(exprs, Arc::clone(input))?),
         ));
@@ -482,7 +522,7 @@ pub(crate) fn analyze(agg: &Aggregate) -> Result<Option<Found>> {
         dimensions,
         operand_specs,
         outputs,
-        RowValue::Product,
+        row,
         FoldAggregate::sum(),
         None,
     ) else {
@@ -496,6 +536,65 @@ pub(crate) fn analyze(agg: &Aggregate) -> Result<Option<Found>> {
         fold: spec,
         operands,
     }))
+}
+
+/// `e`, a `DOUBLE` expression of both sides of a join, as a row expression.
+/// Each largest part of `e` that reads one side only and may be computed
+/// on every row of it (see [`movable`]) becomes a column of that side's
+/// operand, appended to `values` after its `base` key columns. The rest must
+/// be operators of the closed set: `+ - * /`, negation, `abs`, `exp`, `ln`,
+/// and `power` with a positive constant exponent, on `DOUBLE`s, and `DOUBLE`
+/// literals. None of these raises an error in DataFusion on `DOUBLE`s, so
+/// computing them on the joined pairs gives what the host gives: zero to a
+/// negative power, which raises one, can't occur.
+fn row_expression(
+    e: &Expr,
+    inputs: [&DFSchema; 2],
+    base: [usize; 2],
+    values: &mut [Vec<Expr>; 2],
+) -> Result<Option<Expression>> {
+    let e = e.clone().unalias();
+    if let Some(s) = side(&e, inputs) {
+        if e.get_type(inputs[s])? != DataType::Float64 || !movable(&e, inputs[s]) {
+            return Ok(None);
+        }
+        let i = match values[s].iter().position(|v| *v == e) {
+            Some(i) => i,
+            None => {
+                values[s].push(e);
+                values[s].len() - 1
+            }
+        };
+        return Ok(Some(Expression::column(s, base[s] + i)));
+    }
+    let mut part = |e: &Expr| row_expression(e, inputs, base, values);
+    Ok(match &e {
+        Expr::Literal(ScalarValue::Float64(Some(x)), _) => Some(Expression::literal(*x)),
+        Expr::Negative(x) => part(x)?.map(|x| x.unary(Unary::Negate)),
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            let op = match op {
+                Operator::Plus => Binary::Add,
+                Operator::Minus => Binary::Subtract,
+                Operator::Multiply => Binary::Multiply,
+                Operator::Divide => Binary::Divide,
+                _ => return Ok(None),
+            };
+            match (part(left)?, part(right)?) {
+                (Some(a), Some(b)) => Some(a.binary(op, b)),
+                _ => None,
+            }
+        }
+        Expr::ScalarFunction(f) => match (f.name(), f.args.as_slice()) {
+            ("abs", [x]) => part(x)?.map(|x| x.unary(Unary::Abs)),
+            ("exp", [x]) => part(x)?.map(|x| x.unary(Unary::Exp)),
+            ("ln", [x]) => part(x)?.map(|x| x.unary(Unary::Ln)),
+            ("power", [x, Expr::Literal(ScalarValue::Float64(Some(p)), _)]) if *p > 0.0 => {
+                part(x)?.map(|x| x.binary(Binary::Power, Expression::literal(*p)))
+            }
+            _ => None,
+        },
+        _ => None,
+    })
 }
 
 /// The largest offset a condition may add to a key, `2³²`. Keys the kernels

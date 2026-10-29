@@ -22,7 +22,11 @@
 //! - **the scores:** a fold, as the rule's first shape, whose join may have
 //!   conditions comparing its group keys (the causal mask), under a
 //!   projection giving its group keys and its sum, scaled by a constant
-//!   (`* c` or `/ c`) or not;
+//!   (`* c` or `/ c`) or not. The sum may be of a row expression rather than
+//!   a product, such as `SUM(power(t.x - s.x, 2))` over a coordinate `d`;
+//!   and over a join with no equalities, such as a `CROSS JOIN` of points,
+//!   there may be no sum at all, each pair's one row its score (see
+//!   [`pair_weights`]);
 //! - **the weights:** the scores' group keys and `exp(s - m)`, with `m` the
 //!   largest score of the same kept key, as a window (`MAX(s) OVER
 //!   (PARTITION BY i)`, over the whole partition) or as `MAX(s) … GROUP BY i`
@@ -167,7 +171,7 @@ fn scores(plan: &LogicalPlan) -> Result<Option<Scores>> {
     let LogicalPlan::Aggregate(agg) = p.input.as_ref() else {
         return Ok(None);
     };
-    let Some(found) = detect_folds::analyze(agg)? else {
+    let Some(found) = detect_folds::analyze(agg, true)? else {
         return Ok(None);
     };
     let sum = column_at(&p.input, agg.group_expr.len());
@@ -243,6 +247,12 @@ fn weights(plan: &LogicalPlan) -> Result<Option<Weights>> {
     let LogicalPlan::Projection(p) = strip(plan) else {
         return Ok(None);
     };
+    if let Some(weights) = pair_weights(p)? {
+        return Ok(Some(weights));
+    }
+    if let Some(weights) = merged_weights(p)? {
+        return Ok(Some(weights));
+    }
     // The relation the weights are computed over, its scores, the score
     // column, and the shift's column if there is one.
     let below = p.input.as_ref();
@@ -361,6 +371,98 @@ fn weights(plan: &LogicalPlan) -> Result<Option<Weights>> {
         scores,
         shift,
         maximum_per,
+        columns,
+    }))
+}
+
+/// `p` as unshifted weights merged with their scores, as DataFusion merges
+/// `SELECT i, j, exp(s) FROM (SELECT q.t AS i, k.t AS j, SUM(…) AS s …)`
+/// into one projection of `exp(SUM(…))` over the aggregate: the scores are
+/// `p` with the weight's argument in place of the weight.
+fn merged_weights(p: &Projection) -> Result<Option<Weights>> {
+    if !matches!(p.input.as_ref(), LogicalPlan::Aggregate(_)) {
+        return Ok(None);
+    }
+    let exp = |e: &Expr| match e.clone().unalias() {
+        Expr::ScalarFunction(f) if f.name() == "exp" && f.args.len() == 1 => {
+            Some(f.args[0].clone())
+        }
+        _ => None,
+    };
+    let [w] = (0..p.expr.len())
+        .filter(|&i| exp(&p.expr[i]).is_some())
+        .collect::<Vec<_>>()[..]
+    else {
+        return Ok(None);
+    };
+    let mut exprs = p.expr.clone();
+    exprs[w] = exp(&p.expr[w]).expect("an exp").alias("s");
+    let plan = LogicalPlan::Projection(Projection::try_new(exprs, Arc::clone(&p.input))?);
+    let Some(scores) = scores(&plan)? else {
+        return Ok(None);
+    };
+    let columns = scores.columns.clone();
+    Ok(Some(Weights {
+        scores,
+        shift: Shift::None,
+        maximum_per: None,
+        columns,
+    }))
+}
+
+/// `p` as weights computed on each pair of a join with no equalities, such
+/// as a `CROSS JOIN` of target and source points: a key column from each
+/// side, and `exp(s)` of a row expression `s` of both, as a Gaussian kernel's
+/// weights are,
+///
+/// ```sql
+/// SELECT t.p, s.q, exp(-(power(t.x - s.x, 2) + power(t.y - s.y, 2)) / 0.25)
+/// FROM target t CROSS JOIN source s
+/// ```
+///
+/// Their scores are a fold with nothing to sum: each pair of keys is a
+/// group, and its one row's `s` its value. Two rows for one pair would be
+/// two weights here, which the fused algorithm, placing each pair once,
+/// declines.
+fn pair_weights(p: &Projection) -> Result<Option<Weights>> {
+    let LogicalPlan::Join(join) = p.input.as_ref() else {
+        return Ok(None);
+    };
+    if !join.on.is_empty() {
+        return Ok(None);
+    }
+    let mut groups = Vec::new();
+    let mut columns = Vec::new();
+    let mut score = None;
+    for e in &p.expr {
+        match e.clone().unalias() {
+            Expr::Column(c) => {
+                columns.push(Some(groups.len()));
+                groups.push(Expr::Column(c));
+            }
+            Expr::ScalarFunction(f)
+                if f.name() == "exp" && f.args.len() == 1 && score.is_none() =>
+            {
+                score = Some(f.args[0].clone());
+                columns.push(None);
+            }
+            _ => return Ok(None),
+        }
+    }
+    let Some(score) = score else {
+        return Ok(None);
+    };
+    let Some(found) = detect_folds::fold_over(join, &groups, &score, true)? else {
+        return Ok(None);
+    };
+    Ok(Some(Weights {
+        scores: Scores {
+            found,
+            scale: Scale::One,
+            columns: columns.clone(),
+        },
+        shift: Shift::None,
+        maximum_per: None,
         columns,
     }))
 }

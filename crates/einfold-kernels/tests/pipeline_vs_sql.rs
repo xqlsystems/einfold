@@ -24,7 +24,8 @@
 //! invariants:
 //!
 //! 1. **Runs when it can, and declines when it can't.** With every table
-//!    complete, the algorithm runs. When a table misses a row, repeats one,
+//!    complete, and a producer that reads both of its operands, the
+//!    algorithm runs. When a table misses a row, repeats one,
 //!    or holds a NULL factor, it either returns `None`, so that the caller
 //!    runs the host's plan, or (when the gap only shrinks a dimension's
 //!    range) gives SQL's result, as below.
@@ -164,11 +165,24 @@ fn value(rng: &mut Rng, spread: f64, specials: bool) -> f64 {
 
 /// A producer's row value, as the IR and as SQL over `q.x` and `k.x`: a
 /// product, or one of several row expressions, kernels of a distance among
-/// them, with `x` operand `q`'s and `k`'s value column.
+/// them, with `x` operand `q`'s and `k`'s value column. Rarely, an
+/// expression that reads only one operand, or neither: the fused algorithm
+/// places only the operands a producer reads, so it can't tell which rows
+/// the other has, and declines.
 fn row_value(rng: &mut Rng, x: usize) -> (RowValue, &'static str) {
     let (q, k) = (Expression::column(0, x), Expression::column(1, x));
     let lit = Expression::literal;
     let d = || q.clone().binary(Binary::Subtract, k.clone());
+    if rng.chance(0.1) {
+        return match rng.below(3) {
+            0 => (RowValue::Expression(q.unary(Unary::Exp)), "exp(q.x)"),
+            1 => (
+                RowValue::Expression(k.unary(Unary::Abs).unary(Unary::Negate)),
+                "-abs(k.x)",
+            ),
+            _ => (RowValue::Expression(lit(0.5)), "CAST(0.5 AS DOUBLE)"),
+        };
+    }
     match rng.below(6) {
         0 | 1 => (RowValue::Product, "q.x * k.x"),
         2 => (
@@ -278,6 +292,15 @@ fn case(rng: &mut Rng) -> Case {
             }
         },
         false => row_value(rng, x),
+    };
+    // A producer that reads one operand only, or neither, declines (see
+    // `row_value`).
+    let reads_both = match &row {
+        RowValue::Expression(e) => {
+            let read = e.columns();
+            (0..2).all(|o| read.iter().any(|&(operand, _)| operand == o))
+        }
+        _ => true,
     };
     const EQ: Dimension = Dimension {
         equality: KeyEquality::Equal,
@@ -415,7 +438,7 @@ fn case(rng: &mut Rng) -> Case {
         v,
         pipeline,
         sql,
-        complete,
+        complete: complete && reads_both,
         v_scale,
     }
 }

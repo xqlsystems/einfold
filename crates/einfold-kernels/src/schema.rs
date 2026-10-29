@@ -143,10 +143,11 @@ fn fold_schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Re
 /// per output, typed as the dimension's columns are, then the average, a
 /// nullable `Float64`. Columns are named by position, as [`schema`]'s are.
 ///
-/// Fails unless the producer's schema is valid (see [`schema`], whose
-/// producer may also be a `SUM` of a row expression of `Float64` columns), the values
-/// operand's columns exist, its factor is `Float64`, and each of its keys has
-/// the type of its dimension's other columns.
+/// Fails unless the producer is valid: a `SUM` of products whose schema is
+/// valid (see [`schema`]), or a `SUM` of a row expression whose columns are
+/// all `Float64`. Fails too unless the values operand's columns exist, its
+/// factor is `Float64`, and each of its keys has the type of its dimension's
+/// other columns.
 pub fn pipeline_schema(pipeline: &Pipeline, inputs: &[&Schema; 3]) -> Result<SchemaRef> {
     let producer = fold_schema(pipeline.producer(), &inputs[..2], None)?;
     let values = pipeline.values();

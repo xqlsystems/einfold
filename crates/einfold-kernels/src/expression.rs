@@ -40,16 +40,37 @@ impl Lanes {
         }
     }
 
-    /// Each pair's value, row by row, as `block`, added to it when `add`.
-    pub(crate) fn write(&self, (rows, width): (usize, usize), block: &mut [f64], add: bool) {
+    /// Each pair's value, row by row, into `block`, as `write` says.
+    pub(crate) fn write(&self, (rows, width): (usize, usize), block: &mut [f64], write: Write) {
         let (v, rs, cs) = self.strided(width);
         for (r, row) in block.chunks_exact_mut(width).take(rows).enumerate() {
             for (c, b) in row.iter_mut().enumerate() {
                 let x = v[r * rs + c * cs];
-                *b = if add { *b + x } else { x };
+                *b = match write {
+                    Write::Replace => x,
+                    Write::Add => *b + x,
+                };
             }
         }
     }
+}
+
+/// How [`Lanes::write`] writes into a block.
+#[derive(Clone, Copy)]
+pub(crate) enum Write {
+    /// Each value replaces the block's.
+    Replace,
+    /// Each value is added to the block's.
+    Add,
+}
+
+/// Which side of a binary operator a scalar is on.
+#[derive(Clone, Copy)]
+enum Scalar {
+    /// `v op x`.
+    Right,
+    /// `x op v`.
+    Left,
 }
 
 /// `e` over a tile of `rows × width` pairs, with `column(operand, column)`
@@ -86,19 +107,22 @@ fn unary(op: Unary, x: Lanes) -> Lanes {
 
 fn binary(op: Binary, a: Lanes, b: Lanes, (rows, width): (usize, usize)) -> Lanes {
     let zip = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(&a, &b)| op.apply(a, b)).collect();
-    let with = |v: &[f64], x: f64, left: bool| {
+    let with = |v: &[f64], x: f64, scalar: Scalar| {
         (v.iter())
-            .map(|&v| if left { op.apply(v, x) } else { op.apply(x, v) })
+            .map(|&v| match scalar {
+                Scalar::Right => op.apply(v, x),
+                Scalar::Left => op.apply(x, v),
+            })
             .collect()
     };
     match (&a, &b) {
         (Lanes::Scalar(x), Lanes::Scalar(y)) => Lanes::Scalar(op.apply(*x, *y)),
         (Lanes::Rows(u), Lanes::Rows(v)) => Lanes::Rows(zip(u, v)),
         (Lanes::Columns(u), Lanes::Columns(v)) => Lanes::Columns(zip(u, v)),
-        (Lanes::Rows(u), Lanes::Scalar(y)) => Lanes::Rows(with(u, *y, true)),
-        (Lanes::Scalar(x), Lanes::Rows(v)) => Lanes::Rows(with(v, *x, false)),
-        (Lanes::Columns(u), Lanes::Scalar(y)) => Lanes::Columns(with(u, *y, true)),
-        (Lanes::Scalar(x), Lanes::Columns(v)) => Lanes::Columns(with(v, *x, false)),
+        (Lanes::Rows(u), Lanes::Scalar(y)) => Lanes::Rows(with(u, *y, Scalar::Right)),
+        (Lanes::Scalar(x), Lanes::Rows(v)) => Lanes::Rows(with(v, *x, Scalar::Left)),
+        (Lanes::Columns(u), Lanes::Scalar(y)) => Lanes::Columns(with(u, *y, Scalar::Right)),
+        (Lanes::Scalar(x), Lanes::Columns(v)) => Lanes::Columns(with(v, *x, Scalar::Left)),
         _ => {
             let (u, v) = (a.strided(width), b.strided(width));
             // One loop per operator, so that none branches on it per pair.
@@ -164,7 +188,7 @@ mod tests {
                 _ => Lanes::Columns((0..width).map(|j| b(j, c)).collect()),
             };
             let mut block = vec![0.0; rows * width];
-            evaluate(e, (rows, width), &lanes).write((rows, width), &mut block, false);
+            evaluate(e, (rows, width), &lanes).write((rows, width), &mut block, Write::Replace);
             for r in 0..rows {
                 for j in 0..width {
                     let value = |o: usize, ColumnIndex(c): ColumnIndex| {

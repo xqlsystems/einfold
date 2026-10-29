@@ -207,6 +207,12 @@ pub(crate) fn pipeline(
             let mut read = e.columns();
             read.sort();
             read.dedup();
+            // Only the operands an expression reads are placed, and placing
+            // an operand is what checks that it has every row. One that
+            // reads neither operand, or one only, isn't this algorithm's.
+            if !(0..2).all(|o| read.iter().any(|&(operand, _)| operand == o)) {
+                return Ok(None);
+            }
             read
         }
         _ => return Ok(None),
@@ -492,10 +498,16 @@ fn tile(
                             _ => Lanes::Columns(m[at * nj + j0..at * nj + j0 + width].to_vec()),
                         }
                     };
+                    // The first position replaces the block's, and the rest
+                    // add to it.
+                    let write = match at {
+                        0 => expression::Write::Replace,
+                        _ => expression::Write::Add,
+                    };
                     expression::evaluate(e, (rows, width), &lanes).write(
                         (rows, width),
                         block,
-                        at > 0,
+                        write,
                     );
                 }
             }

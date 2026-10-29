@@ -417,6 +417,7 @@ def _average(weights, mask=""):
 def test_fuses_weighted_sums_beyond_attention(sql):
     """The README's list of what einfold finds: each of these runs as one
     fused pipeline, with the rows DataFusion gives."""
-    off, on, found = _pair(_attention_tables)
+    off, on, _ = _pair(_attention_tables)
     _assert_same(off.sql(sql).to_arrow_table(), on.sql(sql).to_arrow_table())
-    assert found.plans_with_pipelines() >= 1
+    analyzed = "\n".join(on.sql("EXPLAIN ANALYZE " + sql).to_pydict()["plan"])
+    assert "fused_pipelines=1" in analyzed, analyzed

@@ -20,8 +20,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/release-python.yml
-      - python/pyproject.toml
-      - python/Cargo.toml
+      - python/**
   workflow_dispatch:
 
 permissions:
@@ -85,27 +84,31 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
 
-  # The tests run against each wheel that can run on its builder's runner, as
-  # a user would install it, from outside the source tree.
+  # Each wheel is tested as a user would install it, from outside the source
+  # tree, on its platform, with the oldest Python it supports and recent ones.
   test:
-    name: test (${{ matrix.runner }}, Python ${{ matrix.python }})
+    name: test (${{ matrix.platform.name }}, Python ${{ matrix.python }})
     needs: wheels
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
-        python: ["3.10", "3.13"]
+        platform:
+          - { name: linux x86_64, runner: ubuntu-latest, wheel: wheel-ubuntu-latest-x86_64 }
+          - { name: linux aarch64, runner: ubuntu-24.04-arm, wheel: wheel-ubuntu-24.04-arm-aarch64 }
+          - { name: macOS arm64, runner: macos-14, wheel: wheel-macos-14-aarch64-apple-darwin }
+          - { name: macOS x86_64, runner: macos-15-intel, wheel: wheel-macos-14-x86_64-apple-darwin }
+        python: ["3.10", "3.13", "3.15"]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python }}
+          allow-prereleases: true
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: wheel-${{ matrix.runner }}-*
+          name: ${{ matrix.platform.wheel }}
           path: dist
-          merge-multiple: true
       - name: install
         shell: bash
         run: |

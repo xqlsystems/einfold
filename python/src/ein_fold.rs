@@ -17,8 +17,9 @@ use pyo3::types::{PyCapsule, PyDict};
 
 use crate::bridge::{self, Bridge, Counts};
 use crate::by_reference::{self, ByReference};
-use crate::capsule::{self, check_version};
-use crate::logical_codec::{LogicalCodec, PhysicalCodec};
+use crate::capsule;
+use crate::logical_codec::LogicalCodec;
+use crate::physical_codec::PhysicalCodec;
 use crate::stack;
 
 /// einfold, as an extension for DataFusion's `SessionContext.with_extensions`.
@@ -85,16 +86,16 @@ impl EinFold {
         let components = py
             .import("datafusion")?
             .getattr("SessionExtensionComponents")?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item(
+        let keyword_arguments = PyDict::new(py);
+        keyword_arguments.set_item(
             "logical_extension_codecs",
             (Py::new(py, LogicalCodec { codec: logical })?,),
         )?;
-        kwargs.set_item(
+        keyword_arguments.set_item(
             "physical_extension_codecs",
             (Py::new(py, PhysicalCodec { codec: physical })?,),
         )?;
-        components.call((), Some(&kwargs))
+        components.call((), Some(&keyword_arguments))
     }
 
     fn __datafusion_session_planner__<'py>(
@@ -117,28 +118,29 @@ impl EinFold {
         // SAFETY: capsules of this name hold an FFI_QueryPlanner.
         let session_planner: &FFI_QueryPlanner =
             unsafe { capsule::capsule_value(&planner, c"datafusion_query_planner")? };
-        check_version("the session's query planner", unsafe {
+        capsule::check_version("the session's query planner", unsafe {
             (session_planner.version)()
         })?;
         let logical = capsule::capsule(&ctx, "__datafusion_logical_extension_codec__")?;
         // SAFETY: capsules of this name hold an FFI_LogicalExtensionCodec.
         let logical: &FFI_LogicalExtensionCodec =
             unsafe { capsule::capsule_value(&logical, c"datafusion_logical_extension_codec")? };
-        check_version("the session's logical codec", unsafe {
+        capsule::check_version("the session's logical codec", unsafe {
             (logical.version)()
         })?;
         let physical = capsule::capsule(&ctx, "__datafusion_physical_extension_codec__")?;
         // SAFETY: capsules of this name hold an FFI_PhysicalExtensionCodec.
         let physical: &FFI_PhysicalExtensionCodec =
             unsafe { capsule::capsule_value(&physical, c"datafusion_physical_extension_codec")? };
-        check_version("the session's physical codec", unsafe {
+        capsule::check_version("the session's physical codec", unsafe {
             (physical.version)()
         })?;
         let (logical, physical) = (logical.clone(), physical.clone());
         let bridge = Bridge {
             counts: Arc::clone(&self.counts),
         };
-        let ffi = FFI_QueryPlanner::new_with_ffi_codecs(Arc::new(bridge), logical, physical);
-        PyCapsule::new_with_value(py, ffi, c"datafusion_query_planner")
+        let ffi_planner =
+            FFI_QueryPlanner::new_with_ffi_codecs(Arc::new(bridge), logical, physical);
+        PyCapsule::new_with_value(py, ffi_planner, c"datafusion_query_planner")
     }
 }

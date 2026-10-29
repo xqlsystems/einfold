@@ -85,7 +85,8 @@ Don't worry about getting everything right the first time. Reviewers will help.
 A maintainer, or an agent a maintainer asks, releases einfold for Python:
 
 1. Set the version in `python/pyproject.toml`, such as `0.1.0rc2` for a release candidate or `0.1.0` for a release, and merge that.
-2. Push a tag `python-v<version>` on that commit. The [release workflow](.github/workflows/release-python.yml) builds wheels for Linux and macOS, tests each, and publishes them and the source to PyPI, and to a GitHub release, marked a pre-release for a release candidate. Running the workflow by hand builds and tests without publishing.
+2. Once, before the first release: on PyPI, add a trusted publisher for the project `einfold`, with owner `xqlsystems`, repository `einfold`, workflow `release-python.yml` and environment `pypi`; on GitHub, the repository needs that `pypi` environment (Settings, Environments). PyPI then trusts the workflow's runs, and no token is stored.
+3. Push a tag `python-v<version>` on that commit. The [release workflow](.github/workflows/release-python.yml) builds wheels for Linux and macOS, tests each, and publishes them and the source to PyPI, and to a GitHub release, marked a pre-release for a release candidate. Running the workflow by hand builds and tests without publishing.
 
 A release candidate is installed with `pip install --pre einfold`, and is accepted by testing it in the projects that use einfold.
 

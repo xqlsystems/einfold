@@ -23,6 +23,12 @@ on:
       - python/**
   workflow_dispatch:
 
+# A newer push to a pull request supersedes its run; a tag's run, which
+# publishes, is never cancelled.
+concurrency:
+  group: release-python-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -56,8 +62,8 @@ jobs:
         platform:
           - { name: linux x86_64, runner: ubuntu-latest, target: x86_64, manylinux: "2_28" }
           - { name: linux aarch64, runner: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
-          - { name: macOS arm64, runner: macos-14, target: aarch64-apple-darwin, manylinux: "" }
-          - { name: macOS x86_64, runner: macos-14, target: x86_64-apple-darwin, manylinux: "" }
+          - { name: macOS arm64, runner: macos-15, target: aarch64-apple-darwin, manylinux: "" }
+          - { name: macOS x86_64, runner: macos-15-intel, target: x86_64-apple-darwin, manylinux: "" }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
@@ -96,8 +102,8 @@ jobs:
         platform:
           - { name: linux x86_64, runner: ubuntu-latest, wheel: wheel-ubuntu-latest-x86_64 }
           - { name: linux aarch64, runner: ubuntu-24.04-arm, wheel: wheel-ubuntu-24.04-arm-aarch64 }
-          - { name: macOS arm64, runner: macos-14, wheel: wheel-macos-14-aarch64-apple-darwin }
-          - { name: macOS x86_64, runner: macos-15-intel, wheel: wheel-macos-14-x86_64-apple-darwin }
+          - { name: macOS arm64, runner: macos-15, wheel: wheel-macos-15-aarch64-apple-darwin }
+          - { name: macOS x86_64, runner: macos-15-intel, wheel: wheel-macos-15-intel-x86_64-apple-darwin }
         python: ["3.10", "3.13", "3.15"]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

@@ -23,29 +23,24 @@
 //!
 //! The Python package exports `EinFold` as `einfold.datafusion.EinFold`.
 
-use mimalloc::MiMalloc;
 use pyo3::prelude::*;
 
+mod allocator;
 mod bridge;
 mod by_reference;
 mod capsule;
 mod ein_fold;
 mod lean;
 mod logical_codec;
+mod physical_codec;
 mod stack;
-
-/// mimalloc, Microsoft's general-purpose allocator, which datafusion-python
-/// uses too, in its version 2, which runs beside PyArrow's own copy (see
-/// `Cargo.toml`).
-#[global_allocator]
-static ALLOCATOR: MiMalloc = MiMalloc;
 
 /// The native part of the `einfold` Python package.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ein_fold::EinFold>()?;
     m.add_class::<logical_codec::LogicalCodec>()?;
-    m.add_class::<logical_codec::PhysicalCodec>()?;
+    m.add_class::<physical_codec::PhysicalCodec>()?;
     m.add("DATAFUSION_VERSION", datafusion::DATAFUSION_VERSION)?;
     Ok(())
 }

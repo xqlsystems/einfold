@@ -1207,11 +1207,13 @@ async fn einfold_runs_short_of_memory_only_where_the_host_does() {
         "out of memory in both {both_short}, in einfold only {ours_short}, in the host only \
          {host_short}; einfold ran the host's plan for memory in {fell_back} of {cases} cases"
     );
-    assert!(
-        ours_short <= host_short,
-        "einfold alone ran out of memory in {ours_short} cases, the host alone in {host_short}"
-    );
+    // Both are claims about many cases: one case, replayed from its seed,
+    // may run short in either.
     if cases >= 100 {
+        assert!(
+            ours_short <= host_short,
+            "einfold alone ran out of memory in {ours_short} cases, the host alone in {host_short}"
+        );
         assert!(fell_back > 0, "einfold never ran short of memory");
     }
 }

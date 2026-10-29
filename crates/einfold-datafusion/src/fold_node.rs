@@ -282,7 +282,12 @@ pub(crate) fn describe(fold: &Fold, domain_rows: DomainRows) -> String {
                 Comparison::GreaterOrEqual => ">=",
                 _ => "?",
             };
-            format!(" {} {op} {}", name(c.left), name(c.right))
+            let offset = match c.offset {
+                0 => String::new(),
+                o if o < 0 => format!(" - {}", o.unsigned_abs()),
+                o => format!(" + {o}"),
+            };
+            format!(" {} {op} {}{offset}", name(c.left), name(c.right))
         })
         .collect();
     format!(

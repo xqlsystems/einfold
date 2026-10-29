@@ -8,8 +8,10 @@
 //!
 //! Each case draws tables `q(t, d, x)`, `k(t, d, x)` and `v(t, [c,] x)` with
 //! random extents, and a pipeline: scores `SUM(q.x * k.x)`, scaled by a
-//! random constant or not, under a random causal-style condition between
-//! `q.t` and `k.t` (either way round, any of `<`, `<=`, `>`, `>=`) or none;
+//! random constant or not, under none, one or two random conditions between
+//! `q.t` and `k.t`, `q.t <op> k.t + c` (either way round, any of `<`, `<=`,
+//! `>`, `>=`, with a small offset `c` or none), two of which may make a band
+//! such as a sliding window's;
 //! weights `exp(s - MAX(s) OVER (PARTITION BY i))` or `exp(s)`; and an average
 //! normalized by the kept groups' weights (a `norm` relation of `SUM(w) … GROUP BY i`) or by the
 //! joined rows' (`SUM(w * v.x) / SUM(w)`). Values are drawn so that scores
@@ -250,21 +252,31 @@ fn case(rng: &mut Rng) -> Case {
         (Comparison::Greater, ">"),
         (Comparison::GreaterOrEqual, ">="),
     ];
+    // None, one condition, or two: a band such as a sliding window's, when
+    // they bound `k.t` from both sides. Offsets are small, against extents
+    // of up to 150, so that bands are narrow and wide, and some empty.
     let mut condition = String::new();
-    if rng.chance(0.7) {
+    let mut conditions = Vec::new();
+    let count = [0, 1, 1, 2][rng.below(4)];
+    for _ in 0..count {
         let (comparison, op) = comparisons[rng.below(4)];
-        let (left, right, sql) = match rng.chance(0.5) {
-            true => (0, 2, format!(" AND q.t {op} k.t")),
-            false => (2, 0, format!(" AND k.t {op} q.t")),
+        let offset = match rng.chance(0.3) {
+            true => 0,
+            false => rng.below(81) as i64 - 40,
         };
-        condition = sql;
-        let c = Condition {
+        let (left, right, l, r) = match rng.chance(0.5) {
+            true => (0, 2, "q.t", "k.t"),
+            false => (2, 0, "k.t", "q.t"),
+        };
+        condition += &format!(" AND {l} {op} {r} + {offset}");
+        conditions.push(Condition {
             left: DimensionId(left),
             comparison,
             right: DimensionId(right),
-        };
-        producer = producer.with_conditions(vec![c]).unwrap();
+            offset,
+        });
     }
+    producer = producer.with_conditions(conditions).unwrap();
     let (scale, scale_sql) = match rng.below(3) {
         0 => (Scale::One, String::new()),
         1 => (Scale::Times(-0.7), " * -0.7".to_string()),
@@ -446,10 +458,10 @@ async fn pipeline_matches_sql() {
     }
 }
 
-/// The causal mask `q.t >= k.t` on a square leaves about half the pairs of
-/// tiles unvisited.
-#[test]
-fn causal_masks_skip_half_the_tiles() {
+/// The pairs of tiles visited and the pairs in all, for attention over 1,024
+/// positions (16 tiles of 64) under `conditions` between `q.t` and `k.t`,
+/// checking that every average of `v.x = 1` is 1.
+fn tiles_visited(conditions: &[(Comparison, i64)]) -> (usize, usize) {
     let mut rng = Rng::new(7);
     let l = 64 * 16;
     let q = Table::complete(&["t", "d"], &[l, 8], || rng.unit());
@@ -473,11 +485,14 @@ fn causal_masks_skip_half_the_tiles() {
             factor: Some(ColumnIndex(2)),
         },
     ];
-    let causal = Condition {
-        left: DimensionId(0),
-        comparison: Comparison::GreaterOrEqual,
-        right: DimensionId(2),
-    };
+    let conditions = (conditions.iter())
+        .map(|&(comparison, offset)| Condition {
+            left: DimensionId(0),
+            comparison,
+            right: DimensionId(2),
+            offset,
+        })
+        .collect();
     let producer = Fold::try_new(
         vec![EQ; 3],
         ops,
@@ -487,7 +502,7 @@ fn causal_masks_skip_half_the_tiles() {
         None,
     )
     .unwrap()
-    .with_conditions(vec![causal])
+    .with_conditions(conditions)
     .unwrap();
     let values = Operand {
         keys: vec![key(2, 0)],
@@ -515,12 +530,27 @@ fn causal_masks_skip_half_the_tiles() {
     let piped = einfold_kernels::pipeline(&pipeline, inputs, schema, Options::default())
         .unwrap()
         .unwrap();
-    // 16 × 16 pairs; those on and below the diagonal are visited.
-    assert_eq!((piped.tiles_visited, piped.tiles), (16 * 17 / 2, 256));
     // Every average of v.x = 1 is 1.
     let rows = rows(&piped.batches);
     assert_eq!(rows.len(), l);
     assert!(rows.iter().all(|(_, x)| (x.unwrap() - 1.0).abs() < 1e-12));
+    (piped.tiles_visited, piped.tiles)
+}
+
+/// The causal mask `q.t >= k.t` on a square leaves about half the pairs of
+/// tiles unvisited: of 16 × 16, those on and below the diagonal are visited.
+#[test]
+fn causal_masks_skip_half_the_tiles() {
+    let causal = [(Comparison::GreaterOrEqual, 0)];
+    assert_eq!(tiles_visited(&causal), (16 * 17 / 2, 256));
+}
+
+/// A sliding window of 64 keys, `q.t >= k.t AND q.t - k.t < 64`, visits each
+/// query tile's diagonal tile and the one before it: 16 + 15 of 256.
+#[test]
+fn sliding_windows_visit_a_band_of_tiles() {
+    let window = [(Comparison::GreaterOrEqual, 0), (Comparison::Less, 64)];
+    assert_eq!(tiles_visited(&window), (16 + 15, 256));
 }
 
 /// A pipeline may leave one of its own dimensions out of its outputs, to be

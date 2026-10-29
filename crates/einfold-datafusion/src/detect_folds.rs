@@ -44,10 +44,11 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::Transformed;
-use datafusion::common::{Column, DFSchema, NullEquality, Result};
+use datafusion::common::{Column, DFSchema, NullEquality, Result, ScalarValue};
 use datafusion::functions_aggregate::sum::Sum;
 use datafusion::logical_expr::{
-    Aggregate, BinaryExpr, Expr, Join, JoinType, LogicalPlan, Operator, Projection,
+    Aggregate, Between, BinaryExpr, Expr, ExprSchemable, Join, JoinType, LogicalPlan, Operator,
+    Projection,
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use einfold_ir::{
@@ -452,10 +453,10 @@ pub(crate) fn analyze(agg: &Aggregate) -> Result<Option<Found>> {
     let mut conditions = Vec::new();
     if let Some(filter) = &join.filter {
         for c in datafusion::logical_expr::utils::split_conjunction(filter) {
-            let Some(condition) = comparison(c, &columns, &keys, inputs) else {
+            let Some(found) = comparisons(c, &columns, &keys, inputs) else {
                 return Ok(None);
             };
-            conditions.push(condition);
+            conditions.extend(found);
         }
     }
     let mut operands = Vec::new();
@@ -498,15 +499,47 @@ pub(crate) fn analyze(agg: &Aggregate) -> Result<Option<Found>> {
     }))
 }
 
-/// `e` as a condition between two of a fold's dimensions: `l <op> r` with
-/// `l` and `r` columns that an operand holds as keys (`columns` and `keys`,
-/// per side of the join), on different sides.
-fn comparison(
+/// The largest offset a condition may add to a key, `2³²`. Keys the kernels
+/// take are non-negative `Int64` positions in arrays that fit in memory, far
+/// below `2⁶²`, so SQL's arithmetic on them with such offsets can't overflow,
+/// and a condition computes exactly what SQL's comparison does.
+const MAX_OFFSET: i128 = 1 << 32;
+
+/// `e` as conditions between two of a fold's dimensions, each `l <op> r +
+/// offset` with `l` and `r` columns that an operand holds as keys (`columns`
+/// and `keys`, per side of the join), on different sides. `e` is a
+/// comparison whose sides add and subtract keys and integer literals, such
+/// as `q.t - k.t < 32` or `q.t < k.t + 32`; `abs(q.t - k.t) < 32`, which is
+/// two of them; or `x BETWEEN lo AND hi`, which is `x >= lo AND x <= hi`. A
+/// comparison with arithmetic needs `Int64` keys (see [`MAX_OFFSET`]).
+fn comparisons(
     e: &Expr,
     columns: &[Vec<Expr>; 2],
     keys: &[Vec<Key>; 2],
     inputs: [&DFSchema; 2],
-) -> Option<Condition> {
+) -> Option<Vec<Condition>> {
+    if let Expr::Between(Between {
+        expr,
+        negated: false,
+        low,
+        high,
+    }) = e
+    {
+        let x = expr.as_ref().clone();
+        let mut found = comparisons(
+            &x.clone().gt_eq(low.as_ref().clone()),
+            columns,
+            keys,
+            inputs,
+        )?;
+        found.extend(comparisons(
+            &x.lt_eq(high.as_ref().clone()),
+            columns,
+            keys,
+            inputs,
+        )?);
+        return Some(found);
+    }
     let Expr::BinaryExpr(BinaryExpr { left, op, right }) = e else {
         return None;
     };
@@ -517,17 +550,130 @@ fn comparison(
         Operator::GtEq => Comparison::GreaterOrEqual,
         _ => return None,
     };
+    // `abs(x) < w` is `x < w AND x > 0 - w`, and `abs(x) <= w` the same with
+    // `<=` and `>=`: a band either side of the diagonal.
+    let abs = |e: &Expr| match e {
+        Expr::ScalarFunction(f) if f.name() == "abs" && f.args.len() == 1 => {
+            Some(f.args[0].clone())
+        }
+        _ => None,
+    };
+    let band = match (abs(left), comparison, abs(right)) {
+        (Some(x), Comparison::Less | Comparison::LessOrEqual, None) => Some((x, *op, right)),
+        (None, Comparison::Greater | Comparison::GreaterOrEqual, Some(x)) => {
+            Some((x, op.swap()?, left))
+        }
+        (None, _, None) => None,
+        _ => return None,
+    };
+    if let Some((x, op, w)) = band {
+        let w = w.as_ref().clone();
+        let below = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(x.clone()),
+            op,
+            Box::new(w.clone()),
+        ));
+        let negated = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Literal(ScalarValue::Int64(Some(0)), None)),
+            Operator::Minus,
+            Box::new(w),
+        ));
+        let above = Expr::BinaryExpr(BinaryExpr::new(Box::new(x), op.swap()?, Box::new(negated)));
+        let mut found = comparisons(&below, columns, keys, inputs)?;
+        found.extend(comparisons(&above, columns, keys, inputs)?);
+        return Some(found);
+    }
     let dimension = |e: &Expr| -> Option<(usize, DimensionId)> {
         let s = side(e, inputs)?;
         let c = columns[s].iter().position(|k| k == e)?;
         let key = keys[s].iter().find(|k| k.column == ColumnIndex(c))?;
         Some((s, key.dimension))
     };
-    let ((ls, l), (rs, r)) = (dimension(left)?, dimension(right)?);
-    (ls != rs && l != r).then_some(Condition {
+    // `left - right <op> 0`, as signed terms and a constant.
+    let mut sum = Linear::default();
+    sum.add(left, 1, &dimension)?;
+    sum.add(right, -1, &dimension)?;
+    let Linear {
+        terms,
+        constant,
+        arithmetic,
+    } = sum;
+    // `a - b + constant <op> 0` is `a <op> b - constant`.
+    let ((l, ls, le), (r, rs, re)) = match terms[..] {
+        [(1, s, d, e), (-1, t, f, g)] => ((d, s, e), (f, t, g)),
+        [(-1, t, f, g), (1, s, d, e)] => ((d, s, e), (f, t, g)),
+        _ => return None,
+    };
+    let int64 = |e: &Expr, s: usize| e.get_type(inputs[s]).ok() == Some(DataType::Int64);
+    if ls == rs || l == r || (arithmetic && !(int64(le, ls) && int64(re, rs))) {
+        return None;
+    }
+    Some(vec![Condition {
         left: l,
         comparison,
         right: r,
+        offset: i64::try_from(-constant).ok()?,
+    }])
+}
+
+/// An integer expression of keys as a sum: signed key terms, each with its
+/// side of the join, dimension and expression, plus a constant; and whether
+/// it did any arithmetic.
+#[derive(Default)]
+struct Linear<'a> {
+    terms: Vec<(i8, usize, DimensionId, &'a Expr)>,
+    constant: i128,
+    arithmetic: bool,
+}
+
+impl<'a> Linear<'a> {
+    /// Adds `sign · e`, if `e` is a key, an integer literal of at most
+    /// [`MAX_OFFSET`], or a sum or difference of them.
+    fn add(
+        &mut self,
+        e: &'a Expr,
+        sign: i8,
+        dimension: &impl Fn(&Expr) -> Option<(usize, DimensionId)>,
+    ) -> Option<()> {
+        match e {
+            Expr::BinaryExpr(BinaryExpr { left, op, right })
+                if matches!(op, Operator::Plus | Operator::Minus) =>
+            {
+                self.arithmetic = true;
+                self.add(left, sign, dimension)?;
+                let sign = if *op == Operator::Plus { sign } else { -sign };
+                self.add(right, sign, dimension)
+            }
+            Expr::Literal(value, _) => {
+                let v = integer(value)?;
+                if v.abs() > MAX_OFFSET {
+                    return None;
+                }
+                self.arithmetic = true;
+                self.constant += i128::from(sign) * v;
+                Some(())
+            }
+            e => {
+                let (s, d) = dimension(e)?;
+                self.terms.push((sign, s, d, e));
+                Some(())
+            }
+        }
+    }
+}
+
+/// A non-NULL integer literal's value.
+fn integer(value: &ScalarValue) -> Option<i128> {
+    Some(match value {
+        ScalarValue::Int8(Some(v)) => i128::from(*v),
+        ScalarValue::Int16(Some(v)) => i128::from(*v),
+        ScalarValue::Int32(Some(v)) => i128::from(*v),
+        ScalarValue::Int64(Some(v)) => i128::from(*v),
+        ScalarValue::UInt8(Some(v)) => i128::from(*v),
+        ScalarValue::UInt16(Some(v)) => i128::from(*v),
+        ScalarValue::UInt32(Some(v)) => i128::from(*v),
+        ScalarValue::UInt64(Some(v)) => i128::from(*v),
+        _ => return None,
     })
 }
 

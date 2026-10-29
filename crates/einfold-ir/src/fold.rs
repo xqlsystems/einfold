@@ -43,7 +43,7 @@
 //! [`Domain`]), and **conditions**: comparisons between dimensions that a
 //! joined row must meet, such as causal attention's `q.t >= k.t`, under
 //! which a query position may use a key only if the key isn't at a later
-//! position (see [`Condition`]).
+//! position, or a sliding window's `q.t - k.t < 32` (see [`Condition`]).
 //!
 //! Indices into a fold's dimensions and into its inputs' columns have types
 //! of their own, [`DimensionId`] and [`ColumnIndex`], so that one can't be
@@ -159,14 +159,31 @@ impl Comparison {
             Comparison::GreaterOrEqual => left >= right,
         }
     }
+
+    /// The comparison with its sides swapped: `a < b` is `b > a`.
+    #[must_use]
+    pub fn mirrored(self) -> Self {
+        match self {
+            Comparison::Less => Comparison::Greater,
+            Comparison::LessOrEqual => Comparison::GreaterOrEqual,
+            Comparison::Greater => Comparison::Less,
+            Comparison::GreaterOrEqual => Comparison::LessOrEqual,
+        }
+    }
 }
 
 /// A comparison of two dimensions' keys that every joined row must meet, in
 /// SQL a condition of the join: `ON … AND <left's column> >= <right's
-/// column>`. It is a *mask* given by a predicate rather than by an operand's
-/// rows: the pairs of keys it allows join, and the others are absent, as if
-/// they had no row. A comparison with a NULL key isn't true, so a row with a
-/// NULL key in either dimension doesn't join.
+/// column> + <offset>`. It is a *mask* given by a predicate rather than by an
+/// operand's rows: the pairs of keys it allows join, and the others are
+/// absent, as if they had no row. A comparison with a NULL key isn't true, so
+/// a row with a NULL key in either dimension doesn't join.
+///
+/// With an offset of 0 it is causal attention's mask, `q.t >= k.t`. Two
+/// conditions on the same pair of dimensions make a band: a sliding window's
+/// `q.t >= k.t AND q.t - k.t < 32` is `q.t >= k.t + 0` and `q.t < k.t + 32`.
+/// The offset is exact integer arithmetic, so a condition holds as SQL's
+/// comparison does wherever SQL's arithmetic on the keys doesn't overflow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Condition {
     /// The dimension on the comparison's left.
@@ -175,6 +192,31 @@ pub struct Condition {
     pub comparison: Comparison,
     /// The dimension on its right.
     pub right: DimensionId,
+    /// What is added to the right key before comparing.
+    pub offset: i64,
+}
+
+impl Condition {
+    /// Whether keys `left` and `right` of the two dimensions meet the
+    /// condition: `left <op> right + offset`, without overflow.
+    #[must_use]
+    pub fn holds(&self, left: i64, right: i64) -> bool {
+        let right = i128::from(right) + i128::from(self.offset);
+        self.comparison.holds(i128::from(left), right)
+    }
+
+    /// The same condition with its dimensions swapped: `a < b + c` is
+    /// `b > a - c`. `None` if the offset is `i64::MIN`, whose negation
+    /// doesn't fit.
+    #[must_use]
+    pub fn mirrored(&self) -> Option<Self> {
+        Some(Condition {
+            left: self.right,
+            comparison: self.comparison.mirrored(),
+            right: self.left,
+            offset: self.offset.checked_neg()?,
+        })
+    }
 }
 
 /// One key column of a fold's result.
@@ -635,6 +677,7 @@ mod tests {
             left: DimensionId(l),
             comparison: Comparison::GreaterOrEqual,
             right: DimensionId(r),
+            offset: 0,
         };
         let f = || matmul(vec![out(0), out(2)], None).unwrap();
         assert_eq!(
@@ -646,5 +689,51 @@ mod tests {
         assert!(Comparison::GreaterOrEqual.holds(2, 2));
         assert!(!Comparison::Greater.holds(2, 2));
         assert!(Comparison::Less.holds(1, 2) && Comparison::LessOrEqual.holds(2, 2));
+    }
+
+    #[test]
+    fn a_condition_adds_its_offset_to_the_right_key() {
+        let comparisons = [
+            Comparison::Less,
+            Comparison::LessOrEqual,
+            Comparison::Greater,
+            Comparison::GreaterOrEqual,
+        ];
+        let offsets = [0, 1, -1, 31, -32, i64::MAX, i64::MIN + 1];
+        let keys = [0, 1, 5, 31, 32, 33, i64::MAX];
+        for comparison in comparisons {
+            for offset in offsets {
+                let c = Condition {
+                    left: DimensionId(0),
+                    comparison,
+                    right: DimensionId(1),
+                    offset,
+                };
+                let m = c.mirrored().unwrap();
+                assert_eq!((m.left, m.right, m.offset), (c.right, c.left, -offset));
+                for (l, r) in keys.iter().flat_map(|&l| keys.iter().map(move |&r| (l, r))) {
+                    let want = comparison.holds(i128::from(l), i128::from(r) + i128::from(offset));
+                    assert_eq!(c.holds(l, r), want, "{l} {comparison:?} {r} + {offset}");
+                    assert_eq!(
+                        m.holds(r, l),
+                        want,
+                        "mirrored, {l} {comparison:?} {r} + {offset}"
+                    );
+                }
+            }
+        }
+        let c = Condition {
+            left: DimensionId(0),
+            comparison: Comparison::Less,
+            right: DimensionId(1),
+            offset: 32,
+        };
+        assert!(c.holds(40, 9) && !c.holds(41, 9));
+        assert!(Condition {
+            offset: i64::MIN,
+            ..c
+        }
+        .mirrored()
+        .is_none());
     }
 }

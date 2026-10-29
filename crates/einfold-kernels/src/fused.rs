@@ -48,12 +48,14 @@
 //! raise of the shift. With [`Shift::None`], `m` stays 0, as SQL's `exp(s)`
 //! does, overflow included.
 //!
-//! **Masks are absent rows.** A [`Condition`] between the X and J dimensions
-//! allows, for each X position, an interval of J positions, since keys are
-//! positions. A pair of tiles the condition disallows entirely is never
-//! visited. In a pair it disallows in part, disallowed pairs are skipped, not
-//! given weight 0: `0 · NaN` is NaN, but SQL forms no row for them. An X
-//! position with no allowed J position has no rows in the output, as in SQL.
+//! **Masks are absent rows.** A [`Condition`] between the X and J dimensions,
+//! `x <op> j + offset`, allows for each X position an interval of J
+//! positions, since keys are positions; several conditions, such as a
+//! sliding window's two, allow the intervals' intersection. A pair of tiles
+//! the conditions disallow entirely is never visited. In a pair they disallow
+//! in part, disallowed pairs are skipped, not given weight 0: `0 · NaN` is
+//! NaN, but SQL forms no row for them. An X position with no allowed J
+//! position has no rows in the output, as in SQL.
 //!
 //! **When SQL and dense arrays agree.** Every operand must be complete: one
 //! row at every position of its dimensions, and no NULL factors. Then every
@@ -146,29 +148,27 @@ pub(crate) fn pipeline(
     if !ys.iter().all(|&d| output(d)) {
         return Ok(None);
     }
-    // A condition between the one X and the one J dimension, as `x <op> j`.
-    let mask = match producer.conditions() {
-        [] => None,
-        [c] => match (&xs[..], &js[..]) {
+    // The conditions, each between the one X and the one J dimension, as
+    // `x <op> j + offset`.
+    let mut mask = Vec::new();
+    for c in producer.conditions() {
+        let condition = match (&xs[..], &js[..]) {
             // The four comparisons `allowed` knows; one added later declines.
             ([x], [j]) if (c.left.0, c.right.0) == (*x, *j) => match c.comparison {
                 Comparison::Less
                 | Comparison::LessOrEqual
                 | Comparison::Greater
-                | Comparison::GreaterOrEqual => Some(c.comparison),
+                | Comparison::GreaterOrEqual => *c,
                 _ => return Ok(None),
             },
-            ([x], [j]) if (c.left.0, c.right.0) == (*j, *x) => match c.comparison {
-                Comparison::Less => Some(Comparison::Greater),
-                Comparison::LessOrEqual => Some(Comparison::GreaterOrEqual),
-                Comparison::Greater => Some(Comparison::Less),
-                Comparison::GreaterOrEqual => Some(Comparison::LessOrEqual),
-                _ => return Ok(None),
+            ([x], [j]) if (c.left.0, c.right.0) == (*j, *x) => match c.mirrored() {
+                Some(m) => m,
+                None => return Ok(None),
             },
             _ => return Ok(None),
-        },
-        _ => return Ok(None),
-    };
+        };
+        mask.push((condition.comparison, condition.offset));
+    }
 
     // Each batch's keys as positions, and each dimension's extent.
     let placements = [
@@ -242,15 +242,25 @@ pub(crate) fn pipeline(
         return Ok(None);
     }
 
-    // Each X position's allowed J positions, an interval.
+    // Each X position's allowed J positions, an interval: the intersection
+    // of each condition's. `x >= j + c` allows `j <= x - c`, `x < j + c`
+    // allows `j > x - c`, and so on, worked in i128 so that no offset
+    // overflows, then clamped to the J positions.
     let allowed = |x: usize| -> (usize, usize) {
-        match mask {
-            None => (0, nj),
-            Some(Comparison::GreaterOrEqual) => (0, (x + 1).min(nj)),
-            Some(Comparison::Greater) => (0, x.min(nj)),
-            Some(Comparison::LessOrEqual) => (x.min(nj), nj),
-            Some(_) => ((x + 1).min(nj), nj),
+        let x = i128::try_from(x).expect("a position fits in i128");
+        let n = i128::try_from(nj).expect("an extent fits in i128");
+        let (mut lo, mut hi) = (0i128, n);
+        for &(comparison, offset) in &mask {
+            let bound = x - i128::from(offset);
+            match comparison {
+                Comparison::GreaterOrEqual => hi = hi.min(bound + 1),
+                Comparison::Greater => hi = hi.min(bound),
+                Comparison::LessOrEqual => lo = lo.max(bound),
+                _ => lo = lo.max(bound + 1),
+            }
         }
+        let clamp = |p: i128| usize::try_from(p.clamp(0, n)).expect("clamped to the extent");
+        (clamp(lo), clamp(hi.max(lo)))
     };
     let (x_tiles, j_tiles) = (nx.div_ceil(XT), nj.div_ceil(JT));
     let tiles = dense::par_tasks(x_tiles, threads, |t| {

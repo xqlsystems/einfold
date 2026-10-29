@@ -336,10 +336,15 @@ async fn main() {
                     err(&ours),
                     err(&host)
                 );
+                if !same_bits || !err(&ours).is_finite() {
+                    eprintln!("einfold's {form} result changed with the threads, or isn't finite");
+                    std::process::exit(1);
+                }
             }
         }
         "edges" => {
             let l = 128;
+            let mut failed = false;
             let cases: [(&str, &str, usize, f64); 7] = [
                 ("none", "q", 0, 0.0),
                 ("NaN in q", "q", 70 * D + 3, f64::NAN),
@@ -387,6 +392,11 @@ async fn main() {
                     nan(&ours),
                     shown.contains("fused_pipelines=1")
                 );
+                failed |= host_rows != our_rows || differ > 0;
+            }
+            if failed {
+                eprintln!("einfold's rows differ from DataFusion's on special values");
+                std::process::exit(1);
             }
         }
         c => panic!("unknown subcommand {c:?}"),

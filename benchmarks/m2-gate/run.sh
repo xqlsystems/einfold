@@ -41,11 +41,11 @@ for form in window groupby; do
     run "einfold $form L=$l" "$BIN" df "$form" "$l" on
   done
   for l in 1024 4096 8192 16384; do
-    "$BIN" duck-sql "$form" "$l" > "$WORK/q.sql"
+    "$BIN" duck-sql "$form" "$l" > "$WORK/q.sql" || exit 1
     run "duckdb $form L=$l" "$PYTHON" "$HERE/duckdb_run.py" "$WORK/q.sql"
   done
 done
 for scale in 1 10 40; do
   "$BIN" accuracy 2048 "$scale" || exit 1
 done
-"$BIN" edges
+"$BIN" edges || exit 1

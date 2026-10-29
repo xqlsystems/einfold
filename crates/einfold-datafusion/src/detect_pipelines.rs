@@ -603,6 +603,9 @@ pub(crate) fn pipeline(p: &Projection) -> Result<Option<LogicalPlan>> {
     let mut values_columns: Vec<Column> = vec![values_key.clone()];
     let mut outputs = Vec::new();
     let mut names = Vec::new();
+    // Each GROUP BY key shown once: one shown twice would let the count
+    // below pass with another key hidden.
+    let mut shown = vec![false; groups];
     for (i, e) in keys.iter().enumerate() {
         let Some(c) = column(&e.clone().unalias()).cloned() else {
             return Ok(None);
@@ -610,6 +613,9 @@ pub(crate) fn pipeline(p: &Projection) -> Result<Option<LogicalPlan>> {
         let Some(g) = group_of(&c) else {
             return Ok(None);
         };
+        if std::mem::replace(&mut shown[g], true) {
+            return Ok(None);
+        }
         let traced = trace(&agg.input, &agg.group_expr[g])?;
         match leaf_of(&traced, &relations) {
             Some(l) if l == wl && output_of(&traced) == Some(kept) => {

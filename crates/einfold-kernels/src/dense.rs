@@ -230,6 +230,16 @@ pub(crate) fn fold(
     // extents, batches in parallel; then each dimension's extent, its largest
     // key in either operand, plus one.
     let rows = |batches: &[RecordBatch]| batches.iter().map(|b| b.num_rows()).sum::<usize>();
+    // Keys that aren't integers are declined below; declined before asking
+    // for memory, so that they don't spend the budget.
+    let integers = |op: &Operand, batches: &[RecordBatch]| {
+        (batches.first()).is_none_or(|batch| {
+            (op.keys.iter()).all(|key| batch.column(key.column.0).data_type().is_integer())
+        })
+    };
+    if !integers(op_a, a) || !integers(op_b, b) {
+        return Ok(None);
+    }
     // The keys, cast: 8 bytes a key.
     let cast = rows(a) * op_a.keys.len() + rows(b) * op_b.keys.len();
     options.reserve(cast.saturating_mul(8), "the dense algorithm's keys")?;

@@ -368,8 +368,10 @@ impl Budget for Pool<'_> {
 
 /// `batches` as this operator's output stream: in batches of `batch_size`
 /// rows at most, counted in `output_rows`. `reservation` counts them, and
-/// gives back each slice's share as it is emitted: from then on, what reads
-/// it holds it, and counts it if it keeps it, as it would the host's.
+/// gives back each batch's share as its last slice is emitted: the slices
+/// share the batch's buffers, which this stream holds until then. From then
+/// on, what reads it holds it, and counts it if it keeps it, as it would the
+/// host's.
 fn slices(
     batches: Vec<RecordBatch>,
     batch_size: usize,
@@ -383,7 +385,8 @@ fn slices(
             let (rows, bytes) = (batch.num_rows(), batch.get_array_memory_size());
             (0..rows).step_by(batch_size).map(move |start| {
                 let n = batch_size.min(rows - start);
-                (batch.slice(start, n), bytes * n / rows)
+                let last = start + n == rows;
+                (batch.slice(start, n), if last { bytes } else { 0 })
             })
         })
         .collect();

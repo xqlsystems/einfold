@@ -757,8 +757,10 @@ fn declines_a_pipeline_that_sums_its_own_dimension_away() {
     // Dimension 3, `v.c`, is the pipeline's own, and not an output.
     let pipeline = Pipeline::try_new(
         producer,
-        Scale::One,
-        Shift::KeptMaximum,
+        Weight::Exp {
+            scale: Scale::One,
+            shift: Shift::KeptMaximum,
+        },
         vec![EQ],
         values,
         vec![DimensionId(0)],

@@ -84,6 +84,18 @@
 //!   -- --ignored --nocapture soak
 //! ```
 //!
+//! Both shrink a failing case before reporting it: they set its settings back
+//! to their defaults, run it on one partition at the default batch size, put
+//! each table in one batch, remove ranges of its rows and set its values to
+//! one. Each change is kept if the case still fails the same property, and the
+//! smallest case found is reported in full, under the original failure's
+//! first line. The query stays as it is. Shrinking stops after
+//! `EINFOLD_SHRINK_TRIES` tries (default 200; 0 turns it off) or
+//! `EINFOLD_SHRINK_SECS` seconds (default 120), and is deterministic up to
+//! DataFusion's own timing, so a failure's seed usually replays its shrunk
+//! case too. In a soak, the watchdog times each try, and reports the failure
+//! unshrunk if one hangs.
+//!
 //! Failures known to an open issue are kept out of both by default, so that
 //! they don't drown new ones (see [`KNOWN`]); `EINFOLD_SIM_KNOWN=1` brings
 //! them back, to check whether a fix holds.
@@ -94,8 +106,6 @@ mod check;
 mod data;
 #[path = "simulation/queries.rs"]
 mod queries;
-#[path = "simulation/rng.rs"]
-mod rng;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -105,9 +115,10 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, ArrayRef, Float64Array, RecordBatch};
 use datafusion::prelude::SessionContext;
 
-use data::{KeyType, Rows, Table, Values};
+use data::{KeyType, Rows, Slice, Table, Values};
+use einfold_testkit::shrink::{self, Budget, Shrink};
+use einfold_testkit::Rng;
 use queries::{Options, Query, Shape};
-use rng::Rng;
 
 /// Bugs with an open issue, which the simulation steps around unless
 /// `EINFOLD_SIM_KNOWN` is set, so that they don't drown new findings. Each
@@ -171,6 +182,7 @@ fn avoids(bug: Known) -> bool {
 }
 
 /// One generated case.
+#[derive(Clone)]
 struct Case {
     seed: u64,
     values: Values,
@@ -246,12 +258,7 @@ fn case(seed: u64) -> Case {
         data::table(&mut rng, "r", (tj_r, ej), (tk, ek), rr, values, "t"),
         data::table(&mut rng, "d", (ti, ei + 1), (tk, ek + 1), dr, values, "c"),
     ];
-    let twins = (values == Values::Inexact).then(|| {
-        [
-            tables.iter().map(|t| twin(t, |_| 1.0)).collect(),
-            tables.iter().map(|t| twin(t, f64::abs)).collect(),
-        ]
-    });
+    let twins = twins(values, &tables);
     let query = queries::query(&mut rng, options);
     let join_filter = query.join_filter;
     let threads = [1 + rng.below(6), 1 + rng.below(6), 1 + rng.below(6)];
@@ -279,6 +286,16 @@ fn case(seed: u64) -> Case {
     }
 }
 
+/// For inexact values, the tables' twins: see [`Case::twins`].
+fn twins(values: Values, tables: &[Table]) -> Option<[Vec<Table>; 2]> {
+    (values == Values::Inexact).then(|| {
+        [
+            tables.iter().map(|t| twin(t, |_| 1.0)).collect(),
+            tables.iter().map(|t| twin(t, f64::abs)).collect(),
+        ]
+    })
+}
+
 /// `t` with each non-NULL value `v` replaced by `f(v)`, in one partition.
 fn twin(t: &Table, f: impl Fn(f64) -> f64) -> Table {
     let v = t
@@ -293,11 +310,65 @@ fn twin(t: &Table, f: impl Fn(f64) -> f64) -> Table {
     let mut columns: Vec<ArrayRef> = t.all.columns().to_vec();
     columns[2] = Arc::new(mapped);
     let all = RecordBatch::try_new(Arc::clone(&t.schema), columns).expect("same schema");
-    Table {
-        name: t.name,
-        schema: Arc::clone(&t.schema),
-        partitions: vec![vec![all.clone()]],
-        all,
+    let rows = 0..all.num_rows();
+    Table::sliced(t.name, all, vec![Slice { partition: 0, rows }])
+}
+
+/// Simpler cases, the biggest simplifications first: settings back to their
+/// defaults, one at a time; one partition and the default batch size; each
+/// table in one batch, then without ranges of its rows, then with ranges of
+/// its values 1. The query stays as it is.
+///
+/// A setting comes back only where the simulation draws it: repartitioning
+/// stays off while a memory pool is on, which would hang the case (#71).
+impl Shrink for Case {
+    fn candidates(&self) -> Box<dyn Iterator<Item = Case> + '_> {
+        let mut simpler = Vec::new();
+        let mut settings = |change: fn(&mut check::Settings)| {
+            let mut c = self.clone();
+            change(&mut c.settings);
+            c.settings = c.settings.avoiding_pool_hang();
+            if c.settings != self.settings {
+                simpler.push(c);
+            }
+        };
+        settings(|s| s.pool = None);
+        settings(|s| s.sort_merge = false);
+        settings(|s| s.no_dynamic_filters = false);
+        settings(|s| s.no_repartition = false);
+        for i in 0..3 {
+            if self.threads[i] != 1 {
+                let mut c = self.clone();
+                c.threads[i] = 1;
+                simpler.push(c);
+            }
+            if self.batch_sizes[i] != 8192 {
+                let mut c = self.clone();
+                c.batch_sizes[i] = 8192;
+                simpler.push(c);
+            }
+        }
+        let with = move |t: usize, table: Table| {
+            let mut c = self.clone();
+            c.tables[t] = table;
+            c.twins = twins(c.values, &c.tables);
+            c
+        };
+        let tables = (0..self.tables.len()).flat_map(move |t| {
+            let table = &self.tables[t];
+            let n = table.all.num_rows();
+            let one = (table.slices.len() > 1).then(|| with(t, table.in_one_batch()));
+            let removed = shrink::removals(n).map(move |r| with(t, table.without(r)));
+            let ones = shrink::removals(n).filter_map(move |r| {
+                let v = (table.all.column(2).as_any())
+                    .downcast_ref::<Float64Array>()
+                    .expect("v");
+                let changes = r.clone().any(|i| !v.is_valid(i) || v.value(i) != 1.0);
+                changes.then(|| with(t, table.with_ones(r)))
+            });
+            one.into_iter().chain(removed).chain(ones)
+        });
+        Box::new(simpler.into_iter().chain(tables))
     }
 }
 
@@ -808,6 +879,41 @@ fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|s| s.parse().ok())
 }
 
+/// `case`'s failure, shrunk: its first line, then the smallest case found
+/// that fails the same property, reported in full. `beat` is called before
+/// each try.
+fn shrunk(rt: &tokio::runtime::Runtime, case: Case, failure: String, beat: impl Fn()) -> String {
+    let first = failure.lines().next().unwrap_or_default().to_string();
+    let want = shrink::tag(&failure).to_string();
+    let s = shrink::shrink(case, failure, Budget::from_env(200, 120), |c| {
+        beat();
+        shrink::failure_of(|| {
+            let o = rt.block_on(run_case(c));
+            let same = o.failures.iter().find(|f| shrink::tag(f) == want);
+            match same.or(o.failures.first()) {
+                Some(f) => Err(f.clone()),
+                None => Ok(()),
+            }
+        })
+    });
+    let budget = if s.exhausted {
+        ", where the budget ran out"
+    } else {
+        ""
+    };
+    format!(
+        "{first}\n  shrunk in {} steps ({} tries{budget}) to:\n{}",
+        s.steps, s.tries, s.failure
+    )
+}
+
+/// `o`'s failures, the first shrunk.
+fn reported(rt: &tokio::runtime::Runtime, case: &Case, o: Outcome, beat: impl Fn()) -> Vec<String> {
+    let mut failures = o.failures.into_iter();
+    let first = failures.next().map(|f| shrunk(rt, case.clone(), f, beat));
+    first.into_iter().chain(failures).collect()
+}
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -837,7 +943,7 @@ fn simulation() {
         let o = rt.block_on(run_case(&case));
         tally.add(&o);
         failures.extend(
-            o.failures
+            reported(&rt, &case, o, || {})
                 .into_iter()
                 .map(|f| format!("seed {}: {f}", case.seed)),
         );
@@ -926,21 +1032,32 @@ fn soak() {
     );
     // A watchdog: a case that runs for more than `EINFOLD_SOAK_STALL_SECS`
     // (default 120) is a hang, reported as a failure of its seed before the
-    // soak exits, since the stuck case can't be abandoned.
+    // soak exits, since the stuck case can't be abandoned. While a failure is
+    // shrunk, each try is timed in turn, and if one hangs the failure being
+    // shrunk is reported as it was.
     let stall = env_u64("EINFOLD_SOAK_STALL_SECS").unwrap_or(120);
-    let running = Arc::new(std::sync::Mutex::new((u64::MAX, Instant::now())));
+    let running = Arc::new(std::sync::Mutex::new((
+        u64::MAX,
+        Instant::now(),
+        None::<String>,
+    )));
     {
         let running = Arc::clone(&running);
         let log_path = log_path.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
-            let (seed, since) = *running.lock().expect("the watchdog's lock");
+            let (seed, since, pending) = running.lock().expect("the watchdog's lock").clone();
             if seed != u64::MAX && since.elapsed().as_secs() > stall {
-                let line = format!(
-                    "FAILURE (seed={seed}, base={base}):\n[stall] the case ran for more than {stall} s; \
-                     replay: EINFOLD_SEED={seed} cargo test -p einfold-datafusion --test simulation \
-                     --release -- --nocapture simulation\n"
-                );
+                let line = match pending {
+                    Some(f) => format!(
+                        "FAILURE (seed={seed}, base={base}):\n{f}\n  (unshrunk: a try at shrinking it ran for more than {stall} s)\n"
+                    ),
+                    None => format!(
+                        "FAILURE (seed={seed}, base={base}):\n[stall] the case ran for more than {stall} s; \
+                         replay: EINFOLD_SEED={seed} cargo test -p einfold-datafusion --test simulation \
+                         --release -- --nocapture simulation\n"
+                    ),
+                };
                 eprintln!("{line}");
                 if let Some(p) = &log_path {
                     if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(p) {
@@ -953,10 +1070,15 @@ fn soak() {
     }
     while start.elapsed().as_secs() < budget {
         let seed = base.wrapping_add(iters);
-        *running.lock().expect("the watchdog's lock") = (seed, Instant::now());
-        let o = rt.block_on(run_case(&case(seed)));
+        *running.lock().expect("the watchdog's lock") = (seed, Instant::now(), None);
+        let case = case(seed);
+        let o = rt.block_on(run_case(&case));
         tally.add(&o);
-        for f in &o.failures {
+        let pending = o.failures.first().cloned();
+        let beat = || {
+            *running.lock().expect("the watchdog's lock") = (seed, Instant::now(), pending.clone());
+        };
+        for f in reported(&rt, &case, o, beat) {
             logline(&format!("FAILURE (seed={seed}, base={base}):\n{f}"));
         }
         iters += 1;

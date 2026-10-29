@@ -20,6 +20,7 @@ einfold-kernels = { workspace = true }
 futures = "0.3"
 
 [dev-dependencies]
+einfold-testkit = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

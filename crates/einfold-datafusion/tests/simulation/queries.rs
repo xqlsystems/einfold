@@ -27,7 +27,7 @@
 //! and compositions: two folds under `UNION ALL`, a fold of a fold's result,
 //! and `ORDER BY` with `LIMIT` above.
 
-use super::rng::Rng;
+use einfold_testkit::Rng;
 
 /// Which shape a query was built as, for the tallies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -280,6 +280,7 @@ pub struct Mask {
 }
 
 /// A random query and the shape it was built as.
+#[derive(Clone)]
 pub struct Query {
     pub sql: String,
     pub shape: Shape,

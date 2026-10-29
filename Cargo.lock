@@ -1350,6 +1350,7 @@ dependencies = [
  "datafusion",
  "einfold-ir",
  "einfold-kernels",
+ "einfold-testkit",
  "futures",
  "tokio",
 ]

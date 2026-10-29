@@ -19,7 +19,7 @@ use einfold_datafusion::{DetectFolds, EinFoldQueryPlanner};
 
 /// Session settings a case varies, the same for the host and einfold: how
 /// DataFusion plans joins and aggregates, and how much memory it may use.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Settings {
     /// Sort-merge joins rather than hash joins.
     pub sort_merge: bool,

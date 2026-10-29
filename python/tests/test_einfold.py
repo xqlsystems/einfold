@@ -368,6 +368,16 @@ def test_explains_the_plan_einfold_runs():
     assert explain["plan_type"] == off.sql("EXPLAIN " + MATMUL).to_pydict()["plan_type"]
     logical, physical = explain["plan"]
     assert "Fold: " in logical and "EinFoldExec" in physical
+    # Below the operator, its inputs: a scan of each of the product's tables.
+    lines = physical.splitlines()
+    at = next(i for i, line in enumerate(lines) if "EinFoldExec" in line)
+    indent = lambda line: len(line) - len(line.lstrip())
+    below = []
+    for line in lines[at + 1:]:
+        if indent(line) <= indent(lines[at]):
+            break
+        below.append(line)
+    assert sum("DataSourceExec" in line for line in below) == 2, physical
     verbose = on.sql("EXPLAIN VERBOSE " + MATMUL).to_pydict()["plan_type"]
     assert len(verbose) > 2 and "physical_plan" in verbose
     analyzed = "\n".join(on.sql("EXPLAIN ANALYZE " + MATMUL).to_pydict()["plan"])

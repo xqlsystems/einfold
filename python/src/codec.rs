@@ -25,6 +25,8 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::{PhysicalExtensionCodec, PhysicalProtoConverterExtension};
 
+use crate::lean::Lean;
+
 /// Marks a buffer [`ByReference`] wrote.
 const MAGIC: &[u8] = b"einfold-ref:";
 
@@ -123,7 +125,7 @@ impl LogicalExtensionCodec for ByReference {
             return plan_err!("not a table einfold's codec encoded");
         };
         match take(&TABLES, id) {
-            Some(table) => Ok(table),
+            Some(table) => Ok(Arc::new(Lean::new(table))),
             None => plan_err!("einfold's codec holds no table {id}"),
         }
     }

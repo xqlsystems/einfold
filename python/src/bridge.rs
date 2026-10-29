@@ -45,6 +45,8 @@ use einfold_datafusion::{DetectFolds, EinFoldPlanner, FoldNode, PipelineNode};
 use futures::Stream;
 use tokio::runtime::{Handle, Runtime};
 
+use crate::lean;
+
 /// The Tokio runtime einfold's operators run on. This library holds its own
 /// copy of Tokio, so the session's runtime isn't visible to it.
 pub(crate) fn runtime() -> Handle {
@@ -165,7 +167,14 @@ impl QueryPlanner for Bridge {
         use datafusion::physical_planner::PhysicalPlanner;
 
         self.counts.plans.fetch_add(1, Ordering::Relaxed);
-        let detected = DetectFolds::default().detect(relink(plan.clone())?)?;
+        // Copying the session's in-memory tables only saves time: if it
+        // fails, the plan reads them as the session would.
+        let relinked = relink(plan.clone())?;
+        let plan = match lean::localize(relinked.clone(), session).await {
+            Ok(localized) => localized,
+            Err(_) => relinked,
+        };
+        let detected = DetectFolds::default().detect(plan)?;
         let nodes = einfold_nodes(&detected)?;
         if nodes.folds + nodes.pipelines > 0 {
             self.counts.with_einfold.fetch_add(1, Ordering::Relaxed);

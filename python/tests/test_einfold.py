@@ -18,7 +18,7 @@ import textwrap
 import numpy as np
 import pyarrow as pa
 import pytest
-from datafusion import SessionContext
+from datafusion import SessionContext, col
 
 from einfold.datafusion import EinFold
 
@@ -296,3 +296,64 @@ def test_runs_a_masked_fold():
     off, on, found = _pair(_attention_tables)
     _assert_same(off.sql(MASKED_SCORES).to_arrow_table(), on.sql(MASKED_SCORES).to_arrow_table())
     assert found.plans_with_einfold() >= 1
+
+
+def test_sees_values_changed_in_place():
+    """xarray-sql keeps a dataset already in memory as an in-memory table over
+    its arrays, so a value changed in place changes what the next query
+    returns. einfold reads such a table through its own copy, made for each
+    query, which must see the change too."""
+    xr = pytest.importorskip("xarray")
+    xql = pytest.importorskip("xarray_sql")
+    rng = np.random.default_rng(1)
+    a = xr.Dataset({"val": (("s", "k"), rng.standard_normal((50, 16)))},
+                   coords={"s": np.arange(50), "k": np.arange(16)})
+    w = xr.Dataset({"val": (("k", "o"), rng.standard_normal((16, 8)))},
+                   coords={"k": np.arange(16), "o": np.arange(8)})
+    off, on = xql.Context(), xql.Context()
+    found = _install(on)
+    for ctx in (off, on):
+        ctx.from_dataset("a", a)
+        ctx.from_dataset("w", w)
+    _assert_same(off.sql(MATMUL).to_arrow_table(), on.sql(MATMUL).to_arrow_table())
+    w["val"].values *= -2.0
+    _assert_same(off.sql(MATMUL).to_arrow_table(), on.sql(MATMUL).to_arrow_table())
+    assert found.plans_with_einfold() >= 2
+
+
+@pytest.mark.parametrize("second", ["SELECT s, AVG(val) AS mean FROM a GROUP BY s",
+                                    "SELECT s, k, -val AS val FROM a"])
+def test_tells_unnamed_tables_apart(second):
+    """A DataFrame's cached result (`DataFrame.cache()`) is a table without a
+    name: every scan of one is called `?table?`. einfold copies the tables a
+    query reads once per query, and must copy each unnamed one apart, whether
+    its columns differ from another's or match them."""
+    off, on, found = _pair(_tables)
+    for ctx in (off, on):
+        ctx.register_view("x", ctx.sql("SELECT s, k, val FROM a").cache())
+        ctx.register_view("y", ctx.sql(second).cache())
+    on_k = "AND x.k = y.k" if "k," in second else ""
+    sql = (f"SELECT x.s, SUM(x.val * y.{'val' if on_k else 'mean'}) AS v "
+           f"FROM x JOIN y ON x.s = y.s {on_k} GROUP BY x.s")
+    _assert_same(off.sql(sql).to_arrow_table(), on.sql(sql).to_arrow_table())
+    _assert_same(off.sql(MATMUL.replace("FROM a", "FROM x a")).to_arrow_table(),
+                 on.sql(MATMUL.replace("FROM a", "FROM x a")).to_arrow_table())
+    assert found.plans() >= 2
+
+
+def test_tells_a_table_registered_again_apart():
+    """A DataFrame keeps the table its name named when it was made. A plan
+    joining one made before a name was registered again with one made after
+    reads both tables, though they share a name."""
+    def joined(ctx):
+        ctx.register_record_batches("t", [[pa.record_batch({"k": [0, 1], "v": [1.0, 2.0]})]])
+        before = ctx.table("t").select(col("k"), col("v").alias("before"))
+        ctx.deregister_table("t")
+        ctx.register_record_batches("t", [[pa.record_batch({"k": [0, 1], "v": [10.0, 20.0]})]])
+        after = ctx.table("t").select(col("k").alias("k2"), col("v").alias("after"))
+        rows = before.join(after, left_on="k", right_on="k2").select(col("k"), col("before"), col("after"))
+        return sorted(zip(*rows.to_pydict().values()))
+
+    off, on = SessionContext(), SessionContext()
+    _install(on)
+    assert joined(on) == joined(off) == [(0, 1.0, 10.0), (1, 2.0, 20.0)]

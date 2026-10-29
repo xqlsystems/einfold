@@ -93,9 +93,12 @@ for log in "${logs[@]}"; do
     ' "$log")
   fi
 
-  # A soak that ended without its summary and without a failure crashed,
-  # say on a segfault or a panic outside a case: that's a finding too.
-  if [ "$n" -eq 0 ] && ! grep -q '^SOAK done' "$log" 2>/dev/null; then
+  # A soak that ended without its summary crashed, say on a segfault or a
+  # panic outside a case, whether or not it recorded failures first: that's a
+  # finding too. The watchdog's hang reports, `[stall]` or a failure whose
+  # shrinking hung, already explain a missing summary.
+  if ! grep -q '^SOAK done' "$log" 2>/dev/null &&
+    ! grep -qE '^\[stall\]|a try at shrinking it ran for more than' "$log" 2>/dev/null; then
     total=$((total + 1))
     if [ "$block_count" -lt "$MAX_BLOCKS" ]; then
       blocks+="CRASH ($(basename "$log")): the soak ended without its summary. The log's last lines:"$'\n'
@@ -123,7 +126,6 @@ echo "Found $total property failure(s) across ${#logs[@]} region log(s); prepari
 # seed alone, so EINFOLD_SEED replays it.
 # ---------------------------------------------------------------------------
 first_seed=$(printf '%s' "$blocks" | sed -n 's/^FAILURE (seed=\([0-9]*\).*/\1/p' | head -1)
-first_seed=${first_seed:-0}
 
 # Each soak writes a `REPRO <command>` line with a `{seed}` placeholder, so the
 # repro names the soak that failed. The first log with a failure supplies it; a
@@ -138,7 +140,10 @@ done
 if [ -z "$repro" ]; then
   repro='EINFOLD_SEED={seed} cargo test -p einfold-datafusion --test simulation --release -- --nocapture simulation'
 fi
-repro=${repro//\{seed\}/$first_seed}
+# A crash has no seed: the soak logs a case's seed only when it fails.
+if [ -n "$first_seed" ]; then
+  repro=${repro//\{seed\}/$first_seed}
+fi
 
 run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-xqlsystems/einfold}/actions/runs/${GITHUB_RUN_ID:-local}"
 date_utc=$(date -u '+%Y-%m-%d %H:%M UTC')
@@ -154,13 +159,19 @@ body_file=$(mktemp)
   echo
   echo "### Reproduce"
   echo
-  echo "Each failure names its seed; \`EINFOLD_SEED=<seed>\` replays that case"
-  echo "alone and prints its SQL and tables. On the same platform as the build"
-  echo "above:"
-  echo
-  echo '```bash'
-  echo "$repro"
-  echo '```'
+  if [ -n "$first_seed" ]; then
+    echo "Each failure names its seed; \`EINFOLD_SEED=<seed>\` replays that case"
+    echo "alone and prints its SQL and tables. On the same platform as the build"
+    echo "above:"
+    echo
+    echo '```bash'
+    echo "$repro"
+    echo '```'
+  else
+    echo "Only crashes were found, and a crash has no seed: the soak logs a"
+    echo "case's seed only when it fails. A region's last \`HEARTBEAT\` gives the"
+    echo "cases it had run, from its base, before the crash."
+  fi
   echo
   echo "The full per-region logs are attached to the workflow run as artifacts."
   echo

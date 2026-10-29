@@ -164,18 +164,23 @@ pub(crate) fn describe(pipeline: &Pipeline) -> String {
         .map(|k| name(k.dimension))
         .collect();
     let outputs: Vec<String> = pipeline.outputs().iter().map(|&d| name(d)).collect();
-    let shift = match pipeline.shift() {
-        Shift::KeptMaximum => ", shifted",
-        _ => "",
-    };
-    let normalizer = match pipeline.normalizer() {
-        Normalizer::JoinedRows => ", over joined rows",
-        _ => "",
-    };
+    // The scale, if any, then whether the scores are shifted and how the
+    // average is normalized, as `/ 8, shifted`.
+    let mut softmax = Vec::new();
+    let scale = pipeline.scale().to_string();
+    if !scale.trim().is_empty() {
+        softmax.push(scale.trim().to_string());
+    }
+    if pipeline.shift() == Shift::KeptMaximum {
+        softmax.push("shifted".to_string());
+    }
+    if pipeline.normalizer() == Normalizer::JoinedRows {
+        softmax.push("over joined rows".to_string());
+    }
     format!(
-        "{}; softmax({}{shift}{normalizer}) * {} -> {}",
+        "{}; softmax({}) * {} -> {}",
         fold_node::describe(producer, einfold_kernels::DomainRows::Any),
-        pipeline.scale().to_string().trim(),
+        softmax.join(", "),
         values.join(","),
         outputs.join(",")
     )

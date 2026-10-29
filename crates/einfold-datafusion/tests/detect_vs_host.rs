@@ -58,6 +58,8 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::scalar::ScalarValue;
+use datafusion::variable::{VarProvider, VarType};
 use einfold_datafusion::{DetectFolds, EinFoldExec, EinFoldQueryPlanner, FoldNode};
 
 struct Rng(u64);
@@ -702,6 +704,50 @@ async fn folds_whose_fallback_runs_recur() {
     assert!(same_answer(&TEXT_TABLES, sql).await > 0);
 }
 
+/// A session variable, `@t`, a `DOUBLE`.
+#[derive(Debug)]
+struct Threshold;
+
+impl VarProvider for Threshold {
+    fn get_value(&self, _names: Vec<String>) -> datafusion::common::Result<ScalarValue> {
+        Ok(ScalarValue::Float64(Some(1.5)))
+    }
+
+    fn get_type(&self, _names: &[String]) -> Option<DataType> {
+        Some(DataType::Float64)
+    }
+}
+
+/// A fold's fallback is planned only when it runs, with the planning
+/// session's variables: one naming `@t` plans then as it did with the query.
+#[tokio::test]
+async fn fallbacks_plan_with_the_sessions_variables() {
+    let sql = "SELECT l.a, r.b, SUM(l.v * r.v) AS v FROM l JOIN r ON l.b = r.a \
+               WHERE l.v > @t GROUP BY l.a, r.b";
+    let (plain, with) = (host(4), einfold(4, true));
+    for ctx in [&plain, &with] {
+        ctx.register_variable(VarType::UserDefined, Arc::new(Threshold));
+        for s in TEXT_TABLES {
+            ctx.sql(s).await.unwrap().collect().await.unwrap();
+        }
+    }
+    let expected = rows(&plain.sql(sql).await.unwrap().collect().await.unwrap());
+    let frame = with.sql(sql).await.unwrap();
+    let task = Arc::new(frame.task_ctx());
+    let plan = frame.create_physical_plan().await.unwrap();
+    assert!(exec_folds(&plan).0 > 0, "einfold finds the fold");
+    let got = rows(
+        &datafusion::physical_plan::collect(Arc::clone(&plan), task)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(got, expected);
+    let shown = DisplayableExecutionPlan::with_metrics(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(shown.contains("host_plans=1"), "{shown}");
+}
+
 /// A plan whose fallback ran, reset and run again, gives the same rows.
 #[tokio::test]
 async fn reset_plans_whose_fallback_ran_rerun() {
@@ -774,9 +820,7 @@ async fn fallbacks_hold_only_the_hosts_plan() {
         .unwrap()
         .fallback()
         .expect("a fallback");
-    let mut inner = Vec::new();
-    execs(fallback, &mut inner);
-    assert!(inner.is_empty(), "the fallback runs einfold again");
+    assert_eq!(folds(fallback), (0, 0), "the fallback runs einfold again");
 }
 
 /// A domain whose duplicate rows disagree on the regroup's test: the uniqueness
@@ -850,10 +894,12 @@ async fn joined_back_fallbacks_hold_only_the_hosts_plan() {
     execs(&plan, &mut found);
     assert_eq!(found.len(), 1, "one fold joined back");
     let any: &dyn std::any::Any = found[0].as_ref();
-    let fallback = (any.downcast_ref::<EinFoldExec>().unwrap().fallback()).expect("a fallback");
-    let mut inner = Vec::new();
-    execs(fallback, &mut inner);
-    assert!(inner.is_empty(), "the fallback runs einfold again");
+    let fallback = any
+        .downcast_ref::<EinFoldExec>()
+        .unwrap()
+        .fallback()
+        .expect("a fallback");
+    assert_eq!(folds(fallback), (0, 0), "the fallback runs einfold again");
 }
 
 #[test]

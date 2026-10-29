@@ -32,7 +32,7 @@ pub struct EinFoldPlanner;
 impl ExtensionPlanner for EinFoldPlanner {
     async fn plan_extension(
         &self,
-        planner: &dyn PhysicalPlanner,
+        _planner: &dyn PhysicalPlanner,
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
@@ -43,10 +43,9 @@ impl ExtensionPlanner for EinFoldPlanner {
             let schema = Arc::new(node.schema().as_arrow().clone());
             let pipeline = node.pipeline().clone();
             let exec = EinFoldExec::for_pipeline(pipeline, physical_inputs.to_vec(), schema);
-            let fallback = planner
-                .create_physical_plan(node.fallback(), session)
-                .await?;
-            return Ok(Some(Arc::new(exec.with_fallback(fallback))));
+            let exec = (exec.with_fallback(node.fallback().clone()))
+                .with_execution_props(session.execution_props().clone());
+            return Ok(Some(Arc::new(exec)));
         }
         let Some(node) = node.as_any().downcast_ref::<FoldNode>() else {
             return Ok(None);
@@ -54,7 +53,8 @@ impl ExtensionPlanner for EinFoldPlanner {
         let schema = Arc::new(node.schema().as_arrow().clone());
         let mut exec = EinFoldExec::new(node.fold().clone(), physical_inputs.to_vec(), schema);
         if let Some(plan) = node.fallback() {
-            exec = exec.with_fallback(planner.create_physical_plan(plan, session).await?);
+            exec = (exec.with_fallback(plan.clone()))
+                .with_execution_props(session.execution_props().clone());
         }
         if node.domain_rows() == DomainRows::UniqueKeys {
             exec = exec.requiring_unique_domain();

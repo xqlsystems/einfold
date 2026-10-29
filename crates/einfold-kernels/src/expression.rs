@@ -29,21 +29,23 @@ pub(crate) enum Lanes {
 }
 
 impl Lanes {
-    /// The value at row `r`, column `c`.
-    fn at(&self, r: usize, c: usize, width: usize) -> f64 {
+    /// The values, with the strides that place pair `(r, c)` at `r · row +
+    /// c · column`, so that loops over pairs don't branch on the shape.
+    fn strided(&self, width: usize) -> (&[f64], usize, usize) {
         match self {
-            Lanes::Scalar(x) => *x,
-            Lanes::Rows(v) => v[r],
-            Lanes::Columns(v) => v[c],
-            Lanes::Block(v) => v[r * width + c],
+            Lanes::Scalar(x) => (std::slice::from_ref(x), 0, 0),
+            Lanes::Rows(v) => (v, 1, 0),
+            Lanes::Columns(v) => (v, 0, 1),
+            Lanes::Block(v) => (v, width, 1),
         }
     }
 
     /// Each pair's value, row by row, as `block`, added to it when `add`.
     pub(crate) fn write(&self, (rows, width): (usize, usize), block: &mut [f64], add: bool) {
-        for r in 0..rows {
-            for (c, b) in block[r * width..(r + 1) * width].iter_mut().enumerate() {
-                let x = self.at(r, c, width);
+        let (v, rs, cs) = self.strided(width);
+        for (r, row) in block.chunks_exact_mut(width).take(rows).enumerate() {
+            for (c, b) in row.iter_mut().enumerate() {
+                let x = v[r * rs + c * cs];
                 *b = if add { *b + x } else { x };
             }
         }
@@ -98,13 +100,34 @@ fn binary(op: Binary, a: Lanes, b: Lanes, (rows, width): (usize, usize)) -> Lane
         (Lanes::Columns(u), Lanes::Scalar(y)) => Lanes::Columns(with(u, *y, true)),
         (Lanes::Scalar(x), Lanes::Columns(v)) => Lanes::Columns(with(v, *x, false)),
         _ => {
-            let mut out = Vec::with_capacity(rows * width);
-            for r in 0..rows {
-                out.extend((0..width).map(|c| op.apply(a.at(r, c, width), b.at(r, c, width))));
-            }
-            Lanes::Block(out)
+            let (u, v) = (a.strided(width), b.strided(width));
+            // One loop per operator, so that none branches on it per pair.
+            Lanes::Block(match op {
+                Binary::Add => block(|a, b| Binary::Add.apply(a, b), u, v, (rows, width)),
+                Binary::Subtract => block(|a, b| Binary::Subtract.apply(a, b), u, v, (rows, width)),
+                Binary::Multiply => block(|a, b| Binary::Multiply.apply(a, b), u, v, (rows, width)),
+                Binary::Divide => block(|a, b| Binary::Divide.apply(a, b), u, v, (rows, width)),
+                Binary::Power => block(|a, b| Binary::Power.apply(a, b), u, v, (rows, width)),
+                _ => block(|a, b| op.apply(a, b), u, v, (rows, width)),
+            })
         }
     }
+}
+
+/// `f` of `u` and `v`, given as [`Lanes::strided`] gives them, at every
+/// pair of a tile, row by row.
+fn block(
+    f: impl Fn(f64, f64) -> f64,
+    (u, urs, ucs): (&[f64], usize, usize),
+    (v, vrs, vcs): (&[f64], usize, usize),
+    (rows, width): (usize, usize),
+) -> Vec<f64> {
+    let mut out = Vec::with_capacity(rows * width);
+    for r in 0..rows {
+        let (u, v) = (&u[r * urs..], &v[r * vrs..]);
+        out.extend((0..width).map(|c| f(u[c * ucs], v[c * vcs])));
+    }
+    out
 }
 
 #[cfg(test)]

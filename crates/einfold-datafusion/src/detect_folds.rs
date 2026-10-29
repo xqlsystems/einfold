@@ -79,9 +79,9 @@ enum Fallback {
     /// the host's own plan.
     HostPlan,
     /// EinFold's discrimination algorithm, for any keys and density. The
-    /// default: on the folds in einfold's demos and xarray-sql's benchmarks
-    /// that the dense algorithm can't take (sparse weight tables, graph
-    /// edges, embedding lookups), it beats the host's plan.
+    /// default: on the folds the dense algorithm can't take, such as sums
+    /// over sparse weight tables, graph edges and embedding lookups, it
+    /// beats the host's plan.
     #[default]
     Kernels,
 }

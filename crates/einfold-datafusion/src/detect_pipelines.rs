@@ -176,7 +176,12 @@ fn scores(plan: &LogicalPlan) -> Result<Option<Scores>> {
     let mut columns = Vec::new();
     for e in &p.expr {
         match e.clone().unalias() {
+            // One score column, scaled or not: a second would leave which
+            // is the score unclear.
             Expr::Column(c) if c == sum => {
+                if scale.is_some() {
+                    return Ok(None);
+                }
                 scale = Some(Scale::One);
                 columns.push(None);
             }

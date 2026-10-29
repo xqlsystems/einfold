@@ -167,10 +167,23 @@ fn query(rng: &mut Rng) -> (String, Expect) {
             ][rng.below(2)];
             (average(wrong, norm), Expect::Decline)
         }
-        6 => {
-            let other = "SELECT i, SUM(exp(2.0 * w)) AS z FROM weights GROUP BY i";
-            (average(window, other), Expect::Decline)
-        }
+        6 => match rng.chance(0.5) {
+            true => {
+                let other = "SELECT i, SUM(exp(2.0 * w)) AS z FROM weights GROUP BY i";
+                (average(window, other), Expect::Decline)
+            }
+            // The scores and their weights side by side, the scores summed
+            // with the values: DataFusion merges the projections, and the
+            // raw score is no weight.
+            false => (
+                format!(
+                    "WITH {scores}, weights AS (SELECT i, j, s, exp(s) AS w FROM scores) \
+                     SELECT weights.i AS t, v.c, SUM(weights.s * v.x) / SUM(weights.w) AS x \
+                     FROM weights JOIN v ON weights.j = v.t GROUP BY weights.i, v.c"
+                ),
+                Expect::Decline,
+            ),
+        },
         _ => {
             // The normalizer sums weights of other scores: the same fold,
             // scaled differently, so the shift doesn't cancel.

@@ -401,6 +401,12 @@ fn merged_weights(p: &Projection) -> Result<Option<Weights>> {
     let Some(scores) = scores(&plan)? else {
         return Ok(None);
     };
+    // The weight's argument is the scores' one column that isn't a key; a
+    // projection that also shows the raw score has two, and the raw one is
+    // no weight.
+    if scores.columns.iter().filter(|c| c.is_none()).count() != 1 {
+        return Ok(None);
+    }
     let columns = scores.columns.clone();
     Ok(Some(Weights {
         scores,

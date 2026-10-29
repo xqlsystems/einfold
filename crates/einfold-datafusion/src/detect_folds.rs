@@ -387,6 +387,8 @@ pub(crate) fn fold_over(
     value: &Expr,
     expressions: bool,
 ) -> Result<Option<Found>> {
+    use datafusion::logical_expr::ExprSchemable;
+
     if join.join_type != JoinType::Inner {
         return Ok(None);
     }
@@ -553,6 +555,8 @@ fn row_expression(
     base: [usize; 2],
     values: &mut [Vec<Expr>; 2],
 ) -> Result<Option<Expression>> {
+    use datafusion::logical_expr::ExprSchemable;
+
     let e = e.clone().unalias();
     if let Some(s) = side(&e, inputs) {
         if e.get_type(inputs[s])? != DataType::Float64 || !movable(&e, inputs[s]) {

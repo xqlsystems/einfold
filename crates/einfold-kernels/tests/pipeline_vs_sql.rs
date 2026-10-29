@@ -821,8 +821,10 @@ fn gives_no_rows_without_queries_or_keys() {
     };
     let pipeline = Pipeline::try_new(
         producer,
-        Scale::One,
-        Shift::KeptMaximum,
+        Weight::Exp {
+            scale: Scale::One,
+            shift: Shift::KeptMaximum,
+        },
         vec![],
         values,
         vec![DimensionId(0)],

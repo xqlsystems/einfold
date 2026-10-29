@@ -15,21 +15,24 @@
 //! runs `einfold_kernels`. [`install`] adds it to a session. This is the only einfold crate that depends on a query
 //! engine.
 
-mod exec;
+mod detect_folds;
+mod ein_fold_exec;
+mod fold_node;
 mod join_back;
-mod node;
-mod rule;
+mod planner;
 
 use std::sync::Arc;
 
 use datafusion::execution::SessionStateBuilder;
 
-pub use exec::{EinFoldExec, EinFoldPlanner, EinFoldQueryPlanner};
-pub use node::FoldNode;
-pub use rule::{DetectFolds, MOVABLE_FUNCTIONS};
+pub use detect_folds::{DetectFolds, MOVABLE_FUNCTIONS};
+pub use ein_fold_exec::EinFoldExec;
+pub use fold_node::FoldNode;
+pub use planner::{EinFoldPlanner, EinFoldQueryPlanner};
 
 /// `builder` with einfold installed: an [`EinFoldQueryPlanner`] that applies
 /// [`DetectFolds`] to each optimized plan, then plans the nodes it makes.
+#[must_use]
 pub fn install(builder: SessionStateBuilder) -> SessionStateBuilder {
     builder.with_query_planner(Arc::new(EinFoldQueryPlanner::detecting(
         DetectFolds::default(),

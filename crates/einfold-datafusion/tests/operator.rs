@@ -24,11 +24,12 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Float64Array, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::common::ScalarValue;
 use datafusion::datasource::MemTable;
 use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::{col, lit, when, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{self, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use einfold_datafusion::{EinFoldQueryPlanner, FoldNode};
 use einfold_ir::{
@@ -173,14 +174,18 @@ async fn fold_plan(ctx: &SessionContext) -> LogicalPlan {
         ["s", "k", "v", "g"].map(String::from).to_vec(),
     )
     .unwrap();
-    let value = when(
-        col("v").is_null(),
-        lit(datafusion::common::ScalarValue::Float64(None)),
+    let value = logical_expr::when(
+        logical_expr::col("v").is_null(),
+        logical_expr::lit(ScalarValue::Float64(None)),
     )
-    .otherwise(col("g"))
+    .otherwise(logical_expr::col("g"))
     .unwrap();
     LogicalPlanBuilder::from(node.into_plan())
-        .project(vec![col("s"), col("k"), value.alias("v")])
+        .project(vec![
+            logical_expr::col("s"),
+            logical_expr::col("k"),
+            value.alias("v"),
+        ])
         .unwrap()
         .build()
         .unwrap()

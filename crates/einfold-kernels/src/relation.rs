@@ -19,6 +19,7 @@ pub struct Relation<'a> {
 
 impl<'a> Relation<'a> {
     /// `batches`, all of `schema`.
+    #[must_use]
     pub fn new(schema: &'a SchemaRef, batches: &'a [RecordBatch]) -> Self {
         Relation { schema, batches }
     }

@@ -9,6 +9,7 @@
 //! [`EinFoldPlanner`](crate::EinFoldPlanner) turns it into
 //! [`EinFoldExec`](crate::EinFoldExec).
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::sync::Arc;
 
@@ -87,6 +88,7 @@ impl FoldNode {
     /// algorithm doesn't apply, [`EinFoldExec`](crate::EinFoldExec) runs
     /// `plan` instead of the hash algorithm, so the host's own plan is the
     /// slowest the fold can be.
+    #[must_use]
     pub fn with_fallback(mut self, plan: LogicalPlan) -> Self {
         self.fallback = Some(plan);
         self.found = true;
@@ -120,6 +122,7 @@ impl FoldNode {
     /// The domain's column that makes a row's value NULL where it is true, if
     /// any: such a row gets a NULL value, as `CASE WHEN <column> THEN NULL
     /// ELSE <value> END` gives it.
+    #[must_use]
     pub fn null_when(&self) -> Option<ColumnIndex> {
         self.null_when
     }
@@ -137,21 +140,25 @@ impl FoldNode {
     }
 
     /// The plan this node replaced, if any.
+    #[must_use]
     pub fn fallback(&self) -> Option<&LogicalPlan> {
         self.fallback.as_ref()
     }
 
     /// The node's inputs: its operands, then its domain.
+    #[must_use]
     pub fn inputs_owned(&self) -> Vec<LogicalPlan> {
         self.inputs.clone()
     }
 
     /// The fold this node computes.
+    #[must_use]
     pub fn fold(&self) -> &Fold {
         &self.fold
     }
 
     /// This node as a logical plan.
+    #[must_use]
     pub fn into_plan(self) -> LogicalPlan {
         LogicalPlan::Extension(Extension {
             node: Arc::new(self),
@@ -161,7 +168,7 @@ impl FoldNode {
 
 // The schema follows from the fold and the inputs, so ordering ignores it.
 impl PartialOrd for FoldNode {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         fn key(n: &FoldNode) -> impl PartialOrd + '_ {
             (
                 &n.fold,

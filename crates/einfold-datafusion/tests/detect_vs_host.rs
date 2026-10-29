@@ -40,16 +40,18 @@
 //! Reproduce a failure with `EINFOLD_SEED=<seed printed>`; search longer with
 //! `EINFOLD_CASES=<n>`.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
     Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::arrow::util::display::array_value_to_string;
+use datafusion::arrow::util::display;
 use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use einfold_datafusion::{DetectFolds, EinFoldExec, EinFoldQueryPlanner, FoldNode};
 
@@ -363,7 +365,7 @@ fn einfold(threads: usize, fallback: bool) -> SessionContext {
 /// domain.
 fn exec_folds(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> (usize, usize) {
     let (mut all, mut domains) = (0, 0);
-    let any: &dyn std::any::Any = plan.as_ref();
+    let any: &dyn Any = plan.as_ref();
     if let Some(e) = any.downcast_ref::<EinFoldExec>() {
         all += 1;
         domains += usize::from(e.fold().domain().is_some());
@@ -407,7 +409,7 @@ fn rows(batches: &[RecordBatch]) -> Vec<String> {
                     // them apart.
                     Some(f) if f.is_valid(r) && f.value(r).is_nan() => "NaN".into(),
                     Some(f) if f.is_valid(r) => format!("{:x}", f.value(r).to_bits()),
-                    _ => array_value_to_string(c, r).unwrap(),
+                    _ => display::array_value_to_string(c, r).unwrap(),
                 })
                 .collect();
             out.push(row.join("|"));
@@ -419,7 +421,13 @@ fn rows(batches: &[RecordBatch]) -> Vec<String> {
 
 #[tokio::test]
 async fn einfold_changes_no_answer() {
-    let (cases, dense, host_plans, joined) = sweep(0xde7e_c7ed, false).await;
+    let Ran {
+        cases,
+        dense,
+        host_plans,
+        joined_dense,
+        joined_host,
+    } = sweep(0xde7e_c7ed, false).await;
     // Most spellings rule the dense path out (a group key that is a join key,
     // a summed key held by one side, keys that can't be positions), and the
     // kernels' own test covers it. Here both it and the host's plan must run.
@@ -430,15 +438,16 @@ async fn einfold_changes_no_answer() {
             some(host_plans),
             "the host's plan ran in only {host_plans} cases"
         );
-        assert!(joined.0 + joined.1 > 0, "no fold joined back ran");
+        assert!(joined_dense + joined_host > 0, "no fold joined back ran");
     }
 }
 
 #[tokio::test]
 async fn folds_joined_back_check_their_domain() {
-    let (cases, _, _, (dense, host)) = sweep(0x10_1ced, true).await;
-    if cases >= 100 {
-        let some = |n: usize| n * 10 >= cases;
+    let ran = sweep(0x10_1ced, true).await;
+    let (dense, host) = (ran.joined_dense, ran.joined_host);
+    if ran.cases >= 100 {
+        let some = |n: usize| n * 10 >= ran.cases;
         assert!(
             some(dense) && some(host),
             "folds joined back ran dense in {dense} cases and on the host in {host}"
@@ -446,12 +455,23 @@ async fn folds_joined_back_check_their_domain() {
     }
 }
 
+/// How many cases a sweep ran, and how many ran each path.
+struct Ran {
+    cases: usize,
+    /// Cases that ran the dense algorithm.
+    dense: usize,
+    /// Cases that ran the host's own plan in place of einfold's.
+    host_plans: usize,
+    /// Folds joined back to their domain that ran the dense algorithm.
+    joined_dense: usize,
+    /// Folds joined back to their domain that ran the host's plan.
+    joined_host: usize,
+}
+
 /// Runs the cases from `default_seed`, or as `EINFOLD_SEED` and
 /// `EINFOLD_CASES` say, panicking at the first that fails; with
-/// `joined_back`, only folds joined back to their domain. Returns how many
-/// cases ran, how many ran the dense path and the host's plan, and how many
-/// folds joined back ran each.
-async fn sweep(default_seed: u64, joined_back: bool) -> (usize, usize, usize, (usize, usize)) {
+/// `joined_back`, only folds joined back to their domain.
+async fn sweep(default_seed: u64, joined_back: bool) -> Ran {
     let seed: u64 = std::env::var("EINFOLD_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -514,11 +534,9 @@ async fn sweep(default_seed: u64, joined_back: bool) -> (usize, usize, usize, (u
         let got = datafusion::physical_plan::collect(Arc::clone(&physical), ours.task_ctx())
             .await
             .unwrap();
-        let shown = datafusion::physical_plan::display::DisplayableExecutionPlan::with_metrics(
-            physical.as_ref(),
-        )
-        .indent(true)
-        .to_string();
+        let shown = DisplayableExecutionPlan::with_metrics(physical.as_ref())
+            .indent(true)
+            .to_string();
         dense += usize::from(shown.contains("dense_folds=1"));
         host_plans += usize::from(shown.contains("host_plans=1"));
         if expect == Expect::JoinedBack && fallback {
@@ -537,12 +555,13 @@ async fn sweep(default_seed: u64, joined_back: bool) -> (usize, usize, usize, (u
     eprintln!(
         "folds joined back to their domain: the dense path ran in {joined_dense}, the host's plan in {joined_host}"
     );
-    (
-        cases as usize,
+    Ran {
+        cases: cases as usize,
         dense,
         host_plans,
-        (joined_dense, joined_host),
-    )
+        joined_dense,
+        joined_host,
+    }
 }
 
 /// Runs `setup`'s statements, then `sql` with and without einfold, and

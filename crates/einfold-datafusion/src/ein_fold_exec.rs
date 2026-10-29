@@ -2,44 +2,34 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`EinFoldExec`], the physical operator that computes a [`FoldNode`], and
-//! the planners that put it in DataFusion's physical plans.
+//! [`EinFoldExec`], the physical operator that computes a [`FoldNode`](crate::FoldNode).
 
 use std::fmt;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use datafusion::arrow::compute::nullif;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::catalog::Session;
 use datafusion::common::runtime::SpawnedTask;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{internal_err, DataFusionError, Result};
-use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
-use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
-use datafusion::optimizer::{OptimizerContext, OptimizerRule};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    self, collect_partitioned, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
-    Partitioning, PlanProperties,
+    self, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
 };
-use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use einfold_ir::{ColumnIndex, Fold};
 use einfold_kernels::{Algorithm, DomainRows, Folded, Options, Relation};
-use futures::{future, stream, StreamExt, TryStreamExt};
+use futures::{future, stream};
 
-use crate::node::{self, FoldNode};
-use crate::rule::DetectFolds;
+use crate::fold_node;
 use crate::HOST;
 
-/// Computes a fold over a join (see [`FoldNode`]) without forming the join's
+/// Computes a fold over a join (see [`FoldNode`](crate::FoldNode)) without forming the join's
 /// rows: each joined pair updates its output group directly.
 ///
 /// Its children are the fold's operands, then its domain if it has one. It
@@ -79,7 +69,8 @@ pub struct EinFoldExec {
 
 impl EinFoldExec {
     /// The operator computing `fold` over `inputs` (operands, then domain),
-    /// producing `schema`, which [`FoldNode`] derives.
+    /// producing `schema`, which [`FoldNode`](crate::FoldNode) derives.
+    #[must_use]
     pub fn new(fold: Fold, inputs: Vec<Arc<dyn ExecutionPlan>>, schema: SchemaRef) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema),
@@ -119,6 +110,7 @@ impl EinFoldExec {
     /// domain's Boolean column `column` is true, as `CASE WHEN <column> THEN
     /// NULL ELSE <value> END` does. The host's plan, if it runs, computes its
     /// own values.
+    #[must_use]
     pub fn with_null_when(mut self, column: ColumnIndex) -> Self {
         self.null_when = Some(column);
         self
@@ -126,6 +118,7 @@ impl EinFoldExec {
 
     /// The host's plan this operator runs where the dense algorithm doesn't
     /// apply, if it has one.
+    #[must_use]
     pub fn fallback(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         self.fallback.as_ref()
     }
@@ -140,6 +133,7 @@ impl EinFoldExec {
     }
 
     /// The fold this operator computes.
+    #[must_use]
     pub fn fold(&self) -> &Fold {
         &self.fold
     }
@@ -150,7 +144,7 @@ impl DisplayAs for EinFoldExec {
         write!(
             f,
             "EinFoldExec: {}",
-            node::describe(&self.fold, self.domain_rows)
+            fold_node::describe(&self.fold, self.domain_rows)
         )
     }
 }
@@ -164,7 +158,9 @@ async fn collect(
     ctx: Arc<TaskContext>,
     reservation: &MemoryReservation,
 ) -> Result<Vec<RecordBatch>> {
-    let batches = collect_partitioned(plan, ctx).await?.concat();
+    let batches = physical_plan::collect_partitioned(plan, ctx)
+        .await?
+        .concat();
     for b in &batches {
         reservation.try_grow(b.get_array_memory_size())?;
     }
@@ -235,6 +231,7 @@ impl ExecutionPlan for EinFoldExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        use futures::{StreamExt, TryStreamExt};
         if partition != 0 {
             return internal_err!("EinFoldExec has one partition, asked for {partition}");
         }
@@ -378,89 +375,5 @@ impl ExecutionPlan for EinFoldExec {
             schema,
             stream.boxed(),
         )))
-    }
-}
-
-/// Plans a [`FoldNode`] as an [`EinFoldExec`]. Give it to DataFusion's
-/// physical planner with
-/// [`DefaultPhysicalPlanner::with_extension_planners`], or use
-/// [`EinFoldQueryPlanner`].
-#[derive(Debug, Default)]
-pub struct EinFoldPlanner;
-
-#[async_trait]
-impl ExtensionPlanner for EinFoldPlanner {
-    async fn plan_extension(
-        &self,
-        planner: &dyn PhysicalPlanner,
-        node: &dyn UserDefinedLogicalNode,
-        _logical_inputs: &[&LogicalPlan],
-        physical_inputs: &[Arc<dyn ExecutionPlan>],
-        session: &dyn Session,
-        _planning_ctx: &PhysicalPlanningContext,
-    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let Some(node) = node.as_any().downcast_ref::<FoldNode>() else {
-            return Ok(None);
-        };
-        let schema = Arc::new(node.schema().as_arrow().clone());
-        let mut exec = EinFoldExec::new(node.fold().clone(), physical_inputs.to_vec(), schema);
-        if let Some(plan) = node.fallback() {
-            exec = exec.with_fallback(planner.create_physical_plan(plan, session).await?);
-        }
-        if node.domain_rows() == DomainRows::UniqueKeys {
-            exec = exec.requiring_unique_domain();
-        }
-        if let Some(c) = node.null_when() {
-            exec = exec.with_null_when(c);
-        }
-        Ok(Some(Arc::new(exec)))
-    }
-}
-
-/// DataFusion's default query planner, with [`EinFoldPlanner`] added, and,
-/// if made with [`EinFoldQueryPlanner::detecting`], [`DetectFolds`] applied to
-/// each optimized logical plan just before it is planned. Install it with
-/// `SessionStateBuilder::with_query_planner`, or use [`install`](crate::install).
-///
-/// Detecting here, rather than among the optimizer's rules, keeps `Fold`
-/// nodes out of optimized logical plans, which other code reads: ddx, for
-/// one, turns them into Substrait to differentiate them, and Substrait can't
-/// encode a `Fold`. Only the plan that runs has them. It is also where a host
-/// that can't add optimizer rules from outside, such as DataFusion's Python
-/// bindings, can take a query planner.
-#[derive(Debug, Default)]
-pub struct EinFoldQueryPlanner {
-    detect: Option<DetectFolds>,
-}
-
-impl EinFoldQueryPlanner {
-    /// The planner, applying `rule` to each plan before planning it.
-    pub fn detecting(rule: DetectFolds) -> Self {
-        EinFoldQueryPlanner { detect: Some(rule) }
-    }
-}
-
-#[async_trait]
-impl QueryPlanner for EinFoldQueryPlanner {
-    async fn create_physical_plan(
-        &self,
-        plan: &LogicalPlan,
-        session: &dyn Session,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let detected;
-        let plan = match &self.detect {
-            None => plan,
-            Some(rule) => {
-                let config = OptimizerContext::new();
-                detected = plan
-                    .clone()
-                    .transform_up(|node| rule.rewrite(node, &config))?
-                    .data;
-                &detected
-            }
-        };
-        DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(EinFoldPlanner)])
-            .create_physical_plan(plan, session)
-            .await
     }
 }

@@ -11,7 +11,7 @@
 //! random constant or not, under a random causal-style condition between
 //! `q.t` and `k.t` (either way round, any of `<`, `<=`, `>`, `>=`) or none;
 //! weights `exp(s - MAX(s) OVER (PARTITION BY i))` or `exp(s)`; and an average
-//! normalized by the kept groups' weights (demo 1's `norm` CTE) or by the
+//! normalized by the kept groups' weights (a `norm` relation of `SUM(w) … GROUP BY i`) or by the
 //! joined rows' (`SUM(w * v.x) / SUM(w)`). Values are drawn so that scores
 //! spread widely, and some are NaN, ±inf, or large enough that `exp(s)`
 //! overflows, and some rows' scores are all `-inf`, or `-inf` beside a NaN

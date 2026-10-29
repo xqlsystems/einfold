@@ -5,14 +5,24 @@
 //! EinFold's fused pipeline algorithm: a [`Pipeline`] computed tile by tile,
 //! so that the producer's results never exist in full.
 //!
+//! It is loop fusion: the producer's loop over its groups and the consumer's
+//! loop over the values it sums share one loop over pairs of tiles. That
+//! applies to any pipeline whose producer groups pair the consumer's groups
+//! with the dimensions it sums away, whatever the query means. The names
+//! below follow attention, one such query, where they are familiar: the
+//! operands `q`, `k` and `v`, and a query, a key and a feature.
+//!
 //! Every dimension has one of four roles:
 //!
 //! - **X**: a producer output held by its first operand, `q`, kept by the
-//!   pipeline (attention's queries `i`);
-//! - **E**: summed by the producer, held by both its operands (features);
+//!   pipeline (in attention, the query `i`; in a kernel smoother, the target
+//!   point);
+//! - **E**: summed by the producer, held by both its operands (a feature, or
+//!   a coordinate);
 //! - **J**: a producer output held by its second operand, `k`, summed by the
-//!   consumer and joined with the values operand `v` (keys `j`);
-//! - **Y**: the pipeline's own dimensions, held by `v` (value features `d`).
+//!   consumer and joined with the values operand `v` (a key, or a source
+//!   point);
+//! - **Y**: the pipeline's own dimensions, held by `v` (a value's feature).
 //!
 //! As in the dense fold, keys are positions, each role's dimensions are
 //! flattened into one position, and every operand is placed in a dense

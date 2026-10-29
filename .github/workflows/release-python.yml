@@ -38,7 +38,7 @@ env:
 jobs:
   version:
     name: check the tag against the package's version
-    if: startsWith(github.ref, 'refs/tags/python-v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/python-v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -129,7 +129,7 @@ jobs:
   publish:
     name: publish to PyPI
     needs: [version, wheels, sdist, test]
-    if: startsWith(github.ref, 'refs/tags/python-v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/python-v')
     runs-on: ubuntu-latest
     environment:
       name: pypi

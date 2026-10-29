@@ -6,8 +6,8 @@
 # Package Index. A tag `python-v<version>` publishes that version, which must
 # match `python/pyproject.toml`; a version such as `0.1.0rc1` is a
 # pre-release, which pip installs only when asked (`pip install --pre`).
-# Running the workflow by hand, or on a pull request that changes how the
-# package is built, builds and tests the wheels without publishing. PyPI
+# Running the workflow by hand, weekly, or on a pull request that changes
+# how the package is built, builds and tests the wheels without publishing. PyPI
 # trusts this workflow through trusted publishing, so no token is stored.
 # Action versions are pinned by commit, as in ci.yml.
 name: Release Python
@@ -16,11 +16,18 @@ on:
   push:
     tags: ["python-v*"]
   # A pull request that changes how the package is built builds and tests
-  # it, without publishing.
+  # it on every platform, without publishing. Other changes to the package
+  # are tested on Linux by ci.yml's python job.
   pull_request:
     paths:
       - .github/workflows/release-python.yml
-      - python/**
+      - python/pyproject.toml
+      - python/Cargo.toml
+      - python/Cargo.lock
+  # Weekly, to catch a platform's runner image breaking the build between
+  # releases, without slowing any pull request.
+  schedule:
+    - cron: "17 6 * * 1"
   workflow_dispatch:
 
 # A newer push to a pull request supersedes its run; a tag's run, which

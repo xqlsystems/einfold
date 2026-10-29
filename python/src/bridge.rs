@@ -120,6 +120,23 @@ fn relink(plan: LogicalPlan) -> Result<LogicalPlan> {
     relinked.data.recompute_schema()
 }
 
+/// `plan`, made ready to be explained here if it is an `EXPLAIN`. One
+/// arrives through the FFI rebuilt from protobuf, with only its initial
+/// plan's text, and marked as not optimized, so DataFusion's physical
+/// planner would show only that. The session did optimize it, and einfold
+/// has detected its folds, so it is marked optimized: DataFusion's planner
+/// then shows the plan that runs, its `Fold` nodes included, as the final
+/// logical plan, and adds the physical plans, as it does for its own.
+fn explained(plan: LogicalPlan) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Explain(mut e) => {
+            e.logical_optimization_succeeded = true;
+            LogicalPlan::Explain(e)
+        }
+        other => other,
+    }
+}
+
 /// What the planner has seen, for a session's reports.
 #[derive(Debug, Default)]
 pub(crate) struct Counts {
@@ -174,7 +191,7 @@ impl QueryPlanner for Bridge {
             Ok(localized) => localized,
             Err(_) => relinked,
         };
-        let detected = DetectFolds::default().detect(plan)?;
+        let detected = explained(DetectFolds::default().detect(plan)?);
         let nodes = einfold_nodes(&detected)?;
         if nodes.folds + nodes.pipelines > 0 {
             self.counts.with_einfold.fetch_add(1, Ordering::Relaxed);

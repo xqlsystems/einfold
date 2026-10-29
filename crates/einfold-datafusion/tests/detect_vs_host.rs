@@ -905,8 +905,10 @@ fn host_plan_runs_where_there_is_no_tokio_runtime() {
 async fn masked_folds_keep_their_mask_under_a_domain() {
     let setup = [
         "CREATE TABLE l (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,2.0),(1,0,3.0),(1,1,4.0)",
-        "CREATE TABLE r (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,10.0),(1,0,100.0),(1,1,1000.0)",
-        "CREATE TABLE d (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,NULL),(1,0,1.0),(1,1,1.0)",
+        "CREATE TABLE r (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,10.0),(0,2,5.0),(1,0,100.0),(1,1,1000.0),(1,2,7.0)",
+        // Groups (0, 2) and (1, 2) have joined rows, summing to 19 and 43 unmasked, but
+        // the mask `l.a >= r.b` excludes them, so they're 0 from the domain.
+        "CREATE TABLE d (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0,0,1.0),(0,1,NULL),(0,2,1.0),(1,0,1.0),(1,1,1.0),(1,2,1.0)",
     ];
     let masked = "SELECT l.a AS g0, r.b AS g1, SUM(l.v * r.v) AS v FROM l JOIN r \
                   ON l.b = r.a AND l.a >= r.b GROUP BY l.a, r.b";

@@ -27,16 +27,15 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    collect_partitioned, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
-    PlanProperties,
+    self, collect_partitioned, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+    Partitioning, PlanProperties,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use einfold_ir::{ColumnIndex, Fold};
-use einfold_kernels::{Algorithm, Options, Relation};
-use futures::future::try_join_all;
-use futures::{stream, StreamExt, TryStreamExt};
+use einfold_kernels::{Algorithm, DomainRows, Folded, Options, Relation};
+use futures::{future, stream, StreamExt, TryStreamExt};
 
-use crate::node::{describe, FoldNode};
+use crate::node::{self, FoldNode};
 use crate::rule::DetectFolds;
 use crate::HOST;
 
@@ -71,7 +70,7 @@ pub struct EinFoldExec {
     /// The host's plan for the same rows, run instead of the hash algorithm.
     fallback: Option<Arc<dyn ExecutionPlan>>,
     /// Whether to run the fallback unless no two domain rows reach one group.
-    unique_domain: bool,
+    domain_rows: DomainRows,
     /// The domain's Boolean column that makes a row's value NULL where true.
     null_when: Option<ColumnIndex>,
     properties: Arc<PlanProperties>,
@@ -92,7 +91,7 @@ impl EinFoldExec {
             fold,
             inputs,
             fallback: None,
-            unique_domain: false,
+            domain_rows: DomainRows::Any,
             null_when: None,
             properties: Arc::new(properties),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -110,8 +109,9 @@ impl EinFoldExec {
     /// This operator, computing its fold only when no two of its domain's
     /// rows reach one group, and running its fallback otherwise. It needs a
     /// fallback (see [`EinFoldExec::with_fallback`]).
+    #[must_use]
     pub fn requiring_unique_domain(mut self) -> Self {
-        self.unique_domain = true;
+        self.domain_rows = DomainRows::UniqueKeys;
         self
     }
 
@@ -134,7 +134,7 @@ impl EinFoldExec {
     fn copy(&self, inputs: Vec<Arc<dyn ExecutionPlan>>) -> EinFoldExec {
         let mut exec = EinFoldExec::new(self.fold.clone(), inputs, self.schema());
         exec.fallback = self.fallback.clone();
-        exec.unique_domain = self.unique_domain;
+        exec.domain_rows = self.domain_rows;
         exec.null_when = self.null_when;
         exec
     }
@@ -150,7 +150,7 @@ impl DisplayAs for EinFoldExec {
         write!(
             f,
             "EinFoldExec: {}",
-            describe(&self.fold, self.unique_domain)
+            node::describe(&self.fold, self.domain_rows)
         )
     }
 }
@@ -248,9 +248,9 @@ impl ExecutionPlan for EinFoldExec {
         let options = Options {
             host: HOST,
             threads: context.session_config().target_partitions(),
-            unique_domain: self.unique_domain,
+            domain_rows: self.domain_rows,
         };
-        if self.unique_domain && self.fallback.is_none() {
+        if self.domain_rows == DomainRows::UniqueKeys && self.fallback.is_none() {
             return internal_err!("EinFoldExec requires a unique domain, but has no fallback");
         }
         let builder = || MetricBuilder::new(&self.metrics);
@@ -271,20 +271,19 @@ impl ExecutionPlan for EinFoldExec {
             // Every input is read whole, and stays in the batches it arrived
             // in: the kernels read them batch by batch.
             let schemas: Vec<SchemaRef> = inputs.iter().map(|i| i.schema()).collect();
-            let mut batches = try_join_all(
-                inputs
-                    .into_iter()
-                    .map(|i| collect(i, Arc::clone(&context), &reservation)),
-            )
-            .await?;
-            let domain = (batches.len() == 3).then(|| batches.pop().unwrap());
+            let reads =
+                (inputs.into_iter()).map(|i| collect(i, Arc::clone(&context), &reservation));
+            let mut read = future::try_join_all(reads).await?.into_iter();
+            // Two operands, then the domain if the fold has one, as checked
+            // above.
+            let (Some(a), Some(b), domain) = (read.next(), read.next(), read.next()) else {
+                return internal_err!("EinFoldExec read fewer than two inputs");
+            };
             // Each domain batch's NULL mask: the kernels give one output batch
             // per domain batch, row for row.
             let masks: Option<Vec<ArrayRef>> = null_when
                 .zip(domain.as_ref())
                 .map(|(c, d)| d.iter().map(|b| Arc::clone(b.column(c.0))).collect());
-            let b = batches.pop().unwrap();
-            let a = batches.pop().unwrap();
             let timer = compute.timer();
             let with_fallback = fallback.is_some();
             let kernel_out = Arc::clone(&out);
@@ -298,7 +297,12 @@ impl ExecutionPlan for EinFoldExec {
                 let domain = domain.as_deref().map(|d| Relation::new(&schemas[2], d));
                 match with_fallback {
                     true => einfold_kernels::fold_dense(&fold, a, b, domain, kernel_out, options)
-                        .map(|r| r.map(|batches| (Algorithm::Dense, batches))),
+                        .map(|r| {
+                            r.map(|batches| Folded {
+                                algorithm: Algorithm::Dense,
+                                batches,
+                            })
+                        }),
                     false => {
                         einfold_kernels::fold(&fold, a, b, domain, kernel_out, options).map(Some)
                     }
@@ -330,18 +334,19 @@ impl ExecutionPlan for EinFoldExec {
                     .collect()
             };
             let batches = match (ran, fallback) {
-                (Some((Algorithm::Dense, batches)), _) => {
-                    dense_folds.add(1);
-                    masked(batches)?
-                }
-                (Some((Algorithm::Hash, batches)), _) => {
-                    hash_folds.add(1);
+                (Some(Folded { algorithm, batches }), _) => {
+                    match algorithm {
+                        Algorithm::Dense => dense_folds.add(1),
+                        Algorithm::Hash => hash_folds.add(1),
+                        // An algorithm added later, which no metric counts yet.
+                        _ => {}
+                    }
                     masked(batches)?
                 }
                 (None, Some(plan)) => {
                     // The host's plan, its columns under this operator's names.
                     host_plans.add(1);
-                    collect_partitioned(plan, Arc::clone(&context))
+                    physical_plan::collect_partitioned(plan, Arc::clone(&context))
                         .await?
                         .concat()
                         .into_iter()
@@ -402,7 +407,7 @@ impl ExtensionPlanner for EinFoldPlanner {
         if let Some(plan) = node.fallback() {
             exec = exec.with_fallback(planner.create_physical_plan(plan, session).await?);
         }
-        if node.unique_domain() {
+        if node.domain_rows() == DomainRows::UniqueKeys {
             exec = exec.requiring_unique_domain();
         }
         if let Some(c) = node.null_when() {

@@ -50,10 +50,10 @@ use datafusion::common::ScalarValue;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use einfold_ir::{
-    Aggregate, ColumnIndex, Dimension, DimensionId, Domain, Fold, KeyEquality, Operand, Output,
-    RowValue,
+    Aggregate, ColumnIndex, Dimension, DimensionId, Domain, DomainKey, Fold, Key, KeyEquality,
+    Operand, Output, RowValue,
 };
-use einfold_kernels::{Algorithm, FloatKeys, Host, Options, Relation};
+use einfold_kernels::{Algorithm, DomainRows, FloatKeys, Host, Options, Relation};
 
 struct Rng(u64);
 
@@ -393,7 +393,7 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
             keys: mine
                 .iter()
                 .enumerate()
-                .map(|(c, &d)| (DimensionId(d), ColumnIndex(c)))
+                .map(|(c, &d)| Key::new(DimensionId(d), ColumnIndex(c)))
                 .collect(),
             factor: Some(ColumnIndex(mine.len())),
         };
@@ -433,7 +433,9 @@ fn case(rng: &mut Rng, dense: bool, large: Option<[usize; 3]>) -> Case {
             .enumerate()
             .map(|(i, &d)| Output {
                 dimension: DimensionId(d),
-                domain_key: domain_keys.get(i).map(|&eq| (ColumnIndex(i), eq)),
+                domain_key: domain_keys
+                    .get(i)
+                    .map(|&eq| DomainKey::new(ColumnIndex(i), eq)),
             })
             .collect(),
         RowValue::Product,
@@ -646,9 +648,9 @@ fn run_fold(case: &Case, rng: &mut Rng) -> (Vec<RecordBatch>, Algorithm) {
     let options = Options {
         host: HOST,
         threads: 1 + rng.below(8),
-        unique_domain: false,
+        ..Options::default()
     };
-    let (algorithm, out) = einfold_kernels::fold(
+    let folded = einfold_kernels::fold(
         &case.fold,
         Relation::new(&case.a.schema, &a),
         Relation::new(&case.b.schema, &b),
@@ -657,7 +659,7 @@ fn run_fold(case: &Case, rng: &mut Rng) -> (Vec<RecordBatch>, Algorithm) {
         options,
     )
     .unwrap();
-    (out, algorithm)
+    (folded.batches, folded.algorithm)
 }
 
 /// Checks invariant 4 for a case with a domain that the dense path computes,
@@ -675,18 +677,18 @@ fn check_unique_domain(case: &Case, rng: &mut Rng, fail: impl Fn(String)) -> boo
     );
     let d: Vec<RecordBatch> = domain.partitions(rng).into_iter().flatten().collect();
     let operands = [case.a.schema.as_ref(), case.b.schema.as_ref()];
-    let mut dense = |fold: &Fold, d: Option<&[RecordBatch]>, unique_domain| {
+    let mut dense = |fold: &Fold, d: Option<&[RecordBatch]>, domain_rows| {
         let schema = einfold_kernels::schema(fold, &operands, d.map(|_| domain.schema.as_ref()));
         let options = Options {
             host: HOST,
             threads: 1 + rng.below(8),
-            unique_domain,
+            domain_rows,
         };
         let d = d.map(|batches| Relation::new(&domain.schema, batches));
         einfold_kernels::fold_dense(fold, a, b, d, schema.unwrap(), options).unwrap()
     };
     let keys = fold.outputs().len();
-    let unchecked = dense(fold, Some(&d), false).expect("the dense path applies");
+    let unchecked = dense(fold, Some(&d), DomainRows::Any).expect("the dense path applies");
     // The groups, from the same fold without its domain.
     let outputs = fold
         .outputs()
@@ -705,7 +707,7 @@ fn check_unique_domain(case: &Case, rng: &mut Rng, fail: impl Fn(String)) -> boo
         None,
     )
     .unwrap();
-    let groups: std::collections::HashSet<String> = match dense(&bare, None, false) {
+    let groups: std::collections::HashSet<String> = match dense(&bare, None, DomainRows::Any) {
         Some(out) => rows(&out, keys).into_iter().map(|(k, _)| k).collect(),
         None => return false,
     };
@@ -713,7 +715,7 @@ fn check_unique_domain(case: &Case, rng: &mut Rng, fail: impl Fn(String)) -> boo
     let repeated = rows(&unchecked, keys)
         .into_iter()
         .any(|(k, _)| groups.contains(&k) && !seen.insert(k));
-    match dense(fold, Some(&d), true) {
+    match dense(fold, Some(&d), DomainRows::UniqueKeys) {
         Some(_) if repeated => {
             fail("the checked dense path accepted two domain rows with one group's keys".into());
             true

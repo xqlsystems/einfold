@@ -44,8 +44,8 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use einfold_ir::{
-    Aggregate as FoldAggregate, ColumnIndex, Dimension, DimensionId, Domain, Fold, KeyEquality,
-    Operand, Output, RowValue,
+    Aggregate as FoldAggregate, ColumnIndex, Dimension, DimensionId, Domain, DomainKey, Fold, Key,
+    KeyEquality, Operand, Output, RowValue,
 };
 
 use crate::join_back::joined_back;
@@ -306,12 +306,12 @@ fn fold(agg: &Aggregate, fallback: bool) -> Result<Option<LogicalPlan>> {
     };
     let mut dimensions = Vec::new();
     let mut columns: [Vec<Expr>; 2] = [Vec::new(), Vec::new()];
-    let mut keys: [Vec<(DimensionId, ColumnIndex)>; 2] = [Vec::new(), Vec::new()];
+    let mut keys: [Vec<Key>; 2] = [Vec::new(), Vec::new()];
     let mut hold = |s: usize, d: usize, e: Expr, columns: &mut [Vec<Expr>; 2]| {
         if columns[s].contains(&e) {
             return false;
         }
-        keys[s].push((DimensionId(d), ColumnIndex(columns[s].len())));
+        keys[s].push(Key::new(DimensionId(d), ColumnIndex(columns[s].len())));
         columns[s].push(e);
         true
     };
@@ -516,7 +516,7 @@ fn from_domain(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
         NullEquality::NullEqualsNull => KeyEquality::NotDistinct,
         NullEquality::NullEqualsNothing => KeyEquality::Equal,
     };
-    let mut keys: Vec<Option<(ColumnIndex, KeyEquality)>> = vec![None; n];
+    let mut keys: Vec<Option<DomainKey>> = vec![None; n];
     for (l, r) in on {
         let (Expr::Column(lc), Expr::Column(rc)) = (l, r) else {
             return Ok(None);
@@ -528,7 +528,11 @@ fn from_domain(p: &Projection, fallback: bool) -> Result<Option<LogicalPlan>> {
             return Ok(None);
         };
         let i = columns[i];
-        if i >= n || keys[i].replace((ColumnIndex(d), equality)).is_some() {
+        if i >= n
+            || keys[i]
+                .replace(DomainKey::new(ColumnIndex(d), equality))
+                .is_some()
+        {
             return Ok(None);
         }
     }

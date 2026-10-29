@@ -37,7 +37,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, NullEquality, Result};
 use datafusion::logical_expr::expr::Case;
 use datafusion::logical_expr::{lit, Expr, Join, JoinType, LogicalPlan, Projection};
-use einfold_ir::{ColumnIndex, Domain, Fold, KeyEquality, Output};
+use einfold_ir::{ColumnIndex, Domain, DomainKey, Fold, KeyEquality, Output};
 
 use crate::node::FoldNode;
 use crate::rule::{
@@ -261,7 +261,7 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
             return Ok(None);
         };
         outputs.push(Output {
-            domain_key: Some((ColumnIndex(c), equality)),
+            domain_key: Some(DomainKey::new(ColumnIndex(c), equality)),
             ..*o
         });
     }

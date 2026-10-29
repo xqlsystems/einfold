@@ -51,6 +51,7 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef};
 use einfold_ir::{ColumnIndex, DimensionId, Domain, Fold};
 
+use crate::options::DomainRows;
 use crate::Result;
 
 /// Output rows per block, when the output has at least [`FEW_CELLS`] cells.
@@ -146,8 +147,9 @@ fn par_tasks<T: Send>(tasks: usize, threads: usize, f: impl Fn(usize) -> T + Syn
 /// The fold of `a` and `b`'s batches (and `domain`'s, if the fold has one)
 /// by the dense algorithm on `threads` threads, or `None` when its conditions
 /// don't hold and the hash path must be used instead. With a domain, there is
-/// one output batch per domain batch. With `unique_domain`, it is also `None`
-/// when two of the domain's rows locate the same cell of the output.
+/// one output batch per domain batch. With [`DomainRows::UniqueKeys`], it is
+/// also `None` when two of the domain's rows locate the same cell of the
+/// output.
 pub(crate) fn fold(
     fold: &Fold,
     a: &[RecordBatch],
@@ -155,7 +157,7 @@ pub(crate) fn fold(
     domain: Option<&[RecordBatch]>,
     schema: SchemaRef,
     threads: usize,
-    unique_domain: bool,
+    domain_rows: DomainRows,
 ) -> Result<Option<Vec<RecordBatch>>> {
     let [op_a, op_b] = fold.operands() else {
         return Ok(None);
@@ -185,7 +187,8 @@ pub(crate) fn fold(
         (batches.iter())
             .map(|batch| {
                 (op.keys.iter())
-                    .map(|&(DimensionId(d), ColumnIndex(c))| {
+                    .map(|key| {
+                        let (DimensionId(d), ColumnIndex(c)) = (key.dimension, key.column);
                         let (k, n) = keys(batch.column(c))?;
                         extent[d] = extent[d].max(n);
                         Some((d, k))
@@ -301,7 +304,7 @@ pub(crate) fn fold(
             let keys: Vec<ColumnIndex> = fold
                 .outputs()
                 .iter()
-                .map(|o| o.domain_key.expect("a fold with a domain").0)
+                .map(|o| o.domain_key.expect("a fold with a domain").column)
                 .collect();
             let strides: Vec<usize> = dims
                 .iter()
@@ -338,7 +341,7 @@ pub(crate) fn fold(
             let located = par_tasks(domain.len(), threads, |i| locate(&domain[i], &cells))
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?;
-            if unique_domain {
+            if domain_rows == DomainRows::UniqueKeys {
                 let mut seen = vec![false; nx * ny];
                 for &c in located.iter().flatten() {
                     if c != NO_GROUP && std::mem::replace(&mut seen[c], true) {

@@ -24,8 +24,8 @@ use datafusion::logical_expr::{col, lit, when, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
 use einfold_datafusion::{EinFoldQueryPlanner, FoldNode};
 use einfold_ir::{
-    Aggregate, ColumnIndex, Dimension, DimensionId, Domain, Fold, KeyEquality, Operand, Output,
-    RowValue,
+    Aggregate, ColumnIndex, Dimension, DimensionId, Domain, DomainKey, Fold, Key, KeyEquality,
+    Operand, Output, RowValue,
 };
 
 /// The fastest of five runs of `f`, in milliseconds.
@@ -58,15 +58,15 @@ fn gradient(
         vec![
             Operand {
                 keys: vec![
-                    (DimensionId(0), ColumnIndex(0)),
-                    (DimensionId(1), ColumnIndex(1)),
+                    Key::new(DimensionId(0), ColumnIndex(0)),
+                    Key::new(DimensionId(1), ColumnIndex(1)),
                 ],
                 factor: Some(ColumnIndex(2)),
             },
             Operand {
                 keys: vec![
-                    (DimensionId(1), ColumnIndex(0)),
-                    (DimensionId(2), ColumnIndex(1)),
+                    Key::new(DimensionId(1), ColumnIndex(0)),
+                    Key::new(DimensionId(2), ColumnIndex(1)),
                 ],
                 factor: Some(ColumnIndex(2)),
             },
@@ -74,11 +74,11 @@ fn gradient(
         vec![
             Output {
                 dimension: DimensionId(0),
-                domain_key: Some((ColumnIndex(0), eq)),
+                domain_key: Some(DomainKey::new(ColumnIndex(0), eq)),
             },
             Output {
                 dimension: DimensionId(2),
-                domain_key: Some((ColumnIndex(1), eq)),
+                domain_key: Some(DomainKey::new(ColumnIndex(1), eq)),
             },
         ],
         RowValue::Product,

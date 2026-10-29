@@ -1000,3 +1000,54 @@ async fn masked_folds_keep_their_mask_under_a_domain() {
         }
     }
 }
+
+/// Causal attention's scores over two heads, `h`: a masked fold whose join
+/// key `h` is also grouped by, a batch dimension, as the scores of a
+/// multi-head model in SQL have. The dense algorithm computes it, so the
+/// host's plan never runs.
+#[tokio::test]
+async fn masked_folds_over_heads_run_dense() {
+    use datafusion::physical_plan;
+    let values = |phase: f64| -> String {
+        let mut rows = Vec::new();
+        for h in 0..2 {
+            for t in 0..5 {
+                for d in 0..3 {
+                    // Small integers, so that every order of the sums is exact.
+                    let v = ((h * 15 + t * 3 + d) as f64 + phase) % 7.0 - 3.0;
+                    rows.push(format!("({h}, {t}, {d}, {v:?})"));
+                }
+            }
+        }
+        rows.join(", ")
+    };
+    let setup = [
+        format!(
+            "CREATE TABLE q (h BIGINT, t BIGINT, d BIGINT, x DOUBLE) AS VALUES {}",
+            values(0.0)
+        ),
+        format!(
+            "CREATE TABLE k (h BIGINT, t BIGINT, d BIGINT, x DOUBLE) AS VALUES {}",
+            values(2.0)
+        ),
+    ];
+    let setup: Vec<&str> = setup.iter().map(String::as_str).collect();
+    let sql = "SELECT q.h, q.t AS i, k.t AS j, SUM(q.x * k.x) AS s FROM q JOIN k \
+               ON q.h = k.h AND q.d = k.d WHERE q.t >= k.t GROUP BY q.h, q.t, k.t";
+    assert_eq!(same_answer(&setup, sql).await, 1);
+    let ours = einfold(4, true);
+    for s in &setup {
+        ours.sql(s).await.unwrap().collect().await.unwrap();
+    }
+    let frame = ours.sql(sql).await.unwrap();
+    let ctx = Arc::new(frame.task_ctx());
+    let plan = frame.create_physical_plan().await.unwrap();
+    physical_plan::collect(Arc::clone(&plan), ctx)
+        .await
+        .unwrap();
+    let shown = DisplayableExecutionPlan::with_metrics(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(shown.contains("dense_folds=1"), "{shown}");
+    assert!(!shown.contains("host_plans=1"), "{shown}");
+}

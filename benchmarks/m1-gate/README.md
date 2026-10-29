@@ -32,12 +32,12 @@ An earlier measurement, before the fixes for #60–#62, gave 4.0–4.1× (368.9 
 
 The gradients agree within their derived bounds (`bounds` in `src/main.rs`), and einfold's are the same bits on 1 thread as on 12.
 
-einfold finds each gradient step whole: ddx's transposed contraction, joined back to the table, grouped again by the table's keys, and left-joined from it. It runs the step as the contraction with the table as its domain, checking as it runs that the table's keys are unique. That took Ā from 246 ms to 14.
+einfold finds each gradient step whole: ddx's transposed contraction, joined back to the table, grouped again by the table's keys, and left-joined from it. It runs the step as the contraction with the table as its domain, checking as it runs that the table's keys are unique. That took Ā from 262 ms to 16.
 
 Where the rest is, with einfold on:
 
-- **ddx's checks, 32 ms,** run before the steps. One groups `a`'s 800,000 rows by their keys to check that they identify its rows. It isn't a fold, and einfold leaves it to DataFusion. It checks the same thing einfold's domain check does, so a host running both does that work twice.
+- **ddx's checks, 33 ms,** run before the steps. One groups `a`'s 800,000 rows by their keys to check that they identify its rows. It isn't a fold, and einfold leaves it to DataFusion. It checks the same thing einfold's domain check does, so a host running both does that work twice.
 - **`cotangent_0`, 17 ms,** is elementwise (the derivative of `tanh(z)²`), not a fold.
-- **The three folds, 37 ms between them.** They are mostly linear passes: reading 800,000 rows' keys and factors, and writing 400,000 or 800,000 rows out.
+- **The three folds, 40 ms between them.** They are mostly linear passes: reading 800,000 rows' keys and factors, and writing 400,000 or 800,000 rows out.
 
 So more than half of what remains is ddx's own work outside the folds. Even if einfold's three folds were free, the program would be about 7× faster, not more.

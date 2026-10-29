@@ -197,8 +197,17 @@ async fn measure(ctx: SessionContext, n: usize) -> Measured {
             .to_string();
         steps.push((short, ms));
     }
+    // ddx names each gradient step after the table it differentiates: W̄ is
+    // `w`'s gradient and Ā is `a`'s. Name them rather than tell them apart by
+    // row count, which coincide when n = h.
     let mut gradients = Vec::new();
-    for step in program.steps().filter(|s| s.name.contains("_grad_")) {
+    for table in ["w", "a"] {
+        let suffix = format!("_{table}");
+        let mut matching = program
+            .steps()
+            .filter(|s| s.name.contains("_grad_") && s.name.ends_with(&suffix));
+        let step = matching.next().expect("ddx's program has each gradient step");
+        assert!(matching.next().is_none(), "one gradient step per table");
         let sql = format!("SELECT * FROM {} ORDER BY 1, 2", step.name);
         let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
         let mut rows = Vec::new();
@@ -219,8 +228,6 @@ async fn measure(ctx: SessionContext, n: usize) -> Measured {
         }
         gradients.push(rows);
     }
-    // W̄ has d·h rows, Ā has n·d.
-    gradients.sort_by_key(|g| g.len());
     let (a, w) = (dense(&ctx, "a", n, d).await, dense(&ctx, "w", d, h).await);
     Measured {
         run,

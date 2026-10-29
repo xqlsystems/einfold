@@ -458,14 +458,22 @@ impl ExecutionPlan for EinFoldExec {
         Some(self.metrics.clone_inner())
     }
 
-    /// Every input's statistics over all its partitions, which the operator
-    /// reads whole, into its one partition; or none, once its own are known.
+    /// The statistics of the inputs its own are estimated from (see
+    /// [`ExecutionPlan::statistics_from_inputs`]), over all their partitions,
+    /// which the operator reads whole, into its one partition: the domain's
+    /// alone for a fold with one, and otherwise its operands'. None, once its
+    /// own are known.
     fn child_stats_requests(&self, _partition: Option<usize>) -> Vec<ChildStats> {
-        let request = match self.statistics.get() {
-            Some(_) => ChildStats::Skip,
-            None => ChildStats::At(None),
-        };
-        vec![request; self.inputs.len()]
+        if self.statistics.get().is_some() {
+            return vec![ChildStats::Skip; self.inputs.len()];
+        }
+        let domain = matches!(&self.work, Work::Fold(fold) if fold.domain().is_some());
+        (0..self.inputs.len())
+            .map(|i| match domain && i < 2 {
+                true => ChildStats::Skip,
+                false => ChildStats::At(None),
+            })
+            .collect()
     }
 
     /// How many rows the operator emits, and their bytes, as DataFusion's

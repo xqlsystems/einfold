@@ -1,0 +1,138 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Builds einfold's Python package and publishes it to PyPI, the Python
+# Package Index. A tag `python-v<version>` publishes that version, which must
+# match `python/pyproject.toml`; a version such as `0.1.0rc1` is a
+# pre-release, which pip installs only when asked (`pip install --pre`).
+# Running the workflow by hand builds and tests the wheels without
+# publishing. PyPI trusts this workflow through trusted publishing, so no
+# token is stored. Action versions are pinned by commit, as in ci.yml.
+name: Release Python
+
+on:
+  push:
+    tags: ["python-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: check the tag against the package's version
+    if: startsWith(github.ref, 'refs/tags/python-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: compare
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' python/pyproject.toml)
+          test "python-v$version" = "$GITHUB_REF_NAME" || {
+            echo "tag $GITHUB_REF_NAME doesn't match python/pyproject.toml's $version"
+            exit 1
+          }
+
+  # One wheel per platform: the extension uses Python's stable ABI (abi3), so
+  # each wheel serves every Python from 3.10. Windows waits until the tests
+  # run there (they use Unix's `resource` module).
+  wheels:
+    name: wheel (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { name: linux x86_64, runner: ubuntu-latest, target: x86_64, manylinux: "2_28" }
+          - { name: linux aarch64, runner: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
+          - { name: macOS arm64, runner: macos-14, target: aarch64-apple-darwin, manylinux: "" }
+          - { name: macOS x86_64, runner: macos-14, target: x86_64-apple-darwin, manylinux: "" }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux || 'auto' }}
+          args: --release --out dist -m python/Cargo.toml
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheel-${{ matrix.platform.runner }}-${{ matrix.platform.target }}
+          path: dist/*.whl
+
+  sdist:
+    name: source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: sdist
+          args: --out dist -m python/Cargo.toml
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # The tests run against each wheel that can run on its builder's runner, as
+  # a user would install it, from outside the source tree.
+  test:
+    name: test (${{ matrix.runner }}, Python ${{ matrix.python }})
+    needs: wheels
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: wheel-${{ matrix.runner }}-*
+          path: dist
+          merge-multiple: true
+      - name: install
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-index --find-links dist einfold
+          python -m pip install "datafusion==55.0.0" pytest numpy pyarrow
+      - name: tests
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: python -m pytest -q "$GITHUB_WORKSPACE/python/tests"
+
+  publish:
+    name: publish to PyPI
+    needs: [version, wheels, sdist, test]
+    if: startsWith(github.ref, 'refs/tags/python-v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/einfold/
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+      # A GitHub release with the same files, marked a pre-release when the
+      # version is one (it contains a letter, as in 0.1.0rc1).
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#python-v}
+          prerelease=$([[ "$version" =~ [a-z] ]] && echo --prerelease || true)
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "einfold for Python $version" --generate-notes $prerelease

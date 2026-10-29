@@ -80,6 +80,15 @@ Rust code follows [Google's Rust style guide](https://google.github.io/styleguid
 
 Don't worry about getting everything right the first time. Reviewers will help.
 
+## Releasing the Python package
+
+A maintainer, or an agent a maintainer asks, releases einfold for Python:
+
+1. Set the version in `python/pyproject.toml`, such as `0.1.0rc2` for a release candidate or `0.1.0` for a release, and merge that.
+2. Push a tag `python-v<version>` on that commit. The [release workflow](.github/workflows/release-python.yml) builds wheels for Linux and macOS, tests each, and publishes them and the source to PyPI, and to a GitHub release, marked a pre-release for a release candidate. Running the workflow by hand builds and tests without publishing.
+
+A release candidate is installed with `pip install --pre einfold`, and is accepted by testing it in the projects that use einfold.
+
 ## What reviewers look for
 
 einfold rewrites other engines' query plans, so above all it must never change a query's answer. Reviewers check that:

@@ -28,8 +28,10 @@ The rows are the same as the engine's, up to the rounding of floating-point sums
 einfold plugs into a SQL engine. Today that's [Apache DataFusion](https://datafusion.apache.org/python/)'s Python bindings:
 
 ```sh
-pip install "einfold[datafusion]"
+pip install --pre "einfold[datafusion]"
 ```
+
+einfold is in pre-release: `--pre` installs the latest release candidate.
 
 ```python
 from datafusion import SessionContext
@@ -55,7 +57,9 @@ Every query in that session is planned by einfold from then on. What it doesn't 
 ## What it finds
 
 - **Sums of products over a join**, grouped by columns of either side: matrix products, contractions, weighted sums and regridding with a weight table. Also the same left-joined from a table, so that every row of the table gets its sum.
-- **Softmax-weighted averages of such a sum**, such as attention, written with a window (`exp(s - MAX(s) OVER (PARTITION BY i))`) or with `GROUP BY` joined back. A causal mask, such as `q.t >= k.t`, is skipped tile by tile.
+- **A weighted sum of such a sum, fused with it.** One query computes scores, a second sums values weighted by a function of them, and einfold runs both tile by tile, never holding all the scores at once. Attention is one: weights `exp(s - MAX(s))` normalized by their sum, written with a window (`OVER (PARTITION BY i)`) or with `GROUP BY` joined back. The weights can be any expression of the score, such as a sigmoid or a Cauchy kernel's `1 / (1 + s * s)`, normalized or not, so a plain chain of two matrix products fuses too.
+- **Scores that are an expression of two rows' values,** not only a sum of products: a Gaussian kernel's `exp(-power(x - y, 2) / h)` over a cross join, for kernel smoothing.
+- **Masks that compare keys,** skipped tile by tile: causal (`q.t >= k.t`), a sliding window (`q.t - k.t < 128`, `BETWEEN`, `abs(q.t - k.t) <= w`), and the same on a sum of products by itself.
 
 ## How fast
 

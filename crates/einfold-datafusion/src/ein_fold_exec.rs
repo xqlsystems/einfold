@@ -5,7 +5,8 @@
 //! [`EinFoldExec`], the physical operator that computes a [`FoldNode`](crate::FoldNode).
 
 use std::fmt;
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use datafusion::arrow::compute::nullif;
@@ -149,16 +150,57 @@ impl DisplayAs for EinFoldExec {
     }
 }
 
+/// `work`'s result. A plan's operators spawn tasks on a Tokio runtime, so
+/// where none is current, as when a host in another library polls this
+/// operator through DataFusion's FFI, `work` runs on one of this library's
+/// own, made when first needed. Dropping the future, as a cancelled query
+/// does, aborts that work.
+async fn on_a_runtime<T: Send + 'static>(
+    work: impl Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
+    static RUNTIME: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return work.await;
+    }
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .ok()
+    });
+    let Some(runtime) = runtime else {
+        return internal_err!("EinFoldExec could not start a Tokio runtime");
+    };
+    // Entered only to spawn: the task aborts when dropped.
+    let task = {
+        let _entered = runtime.enter();
+        SpawnedTask::spawn(work)
+    };
+    task.join()
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+}
+
+/// Every batch of every partition of the host's plan `plan`, in partition
+/// order, on a runtime (see [`on_a_runtime`]).
+async fn run_host_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    ctx: Arc<TaskContext>,
+) -> Result<Vec<Vec<RecordBatch>>> {
+    on_a_runtime(physical_plan::collect_partitioned(plan, ctx)).await
+}
+
 /// Every batch of every partition of `plan`, in partition order, each counted
 /// against `reservation`. The partitions are read concurrently, since an
 /// operator such as a hash repartition produces them together and would
-/// otherwise buffer all but one.
+/// otherwise buffer all but one. They run on a runtime (see
+/// [`on_a_runtime`]), since an input's operators may spawn tasks too.
 async fn collect(
     plan: Arc<dyn ExecutionPlan>,
     ctx: Arc<TaskContext>,
     reservation: &MemoryReservation,
 ) -> Result<Vec<RecordBatch>> {
-    let batches = physical_plan::collect_partitioned(plan, ctx)
+    let batches = on_a_runtime(physical_plan::collect_partitioned(plan, ctx))
         .await?
         .concat();
     for b in &batches {
@@ -285,7 +327,7 @@ impl ExecutionPlan for EinFoldExec {
             let with_fallback = fallback.is_some();
             let kernel_out = Arc::clone(&out);
             let held = Arc::clone(&reservation);
-            let ran = SpawnedTask::spawn_blocking(move || {
+            let kernel = move || {
                 let _held = held;
                 let (a, b) = (
                     Relation::new(&schemas[0], &a),
@@ -304,9 +346,16 @@ impl ExecutionPlan for EinFoldExec {
                         einfold_kernels::fold(&fold, a, b, domain, kernel_out, options).map(Some)
                     }
                 }
-            })
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))??;
+            };
+            // On a blocking thread, off the async runtime; or, where there is
+            // no Tokio runtime to spawn on, as when a host in another library
+            // polls this plan through DataFusion's FFI, on this thread.
+            let ran = match tokio::runtime::Handle::try_current() {
+                Ok(_) => SpawnedTask::spawn_blocking(kernel)
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))??,
+                Err(_) => kernel()?,
+            };
             timer.done();
             // The kernel has dropped its inputs: release them, so that the
             // host's plan, if it runs, and the operators downstream have the
@@ -343,7 +392,7 @@ impl ExecutionPlan for EinFoldExec {
                 (None, Some(plan)) => {
                     // The host's plan, its columns under this operator's names.
                     host_plans.add(1);
-                    physical_plan::collect_partitioned(plan, Arc::clone(&context))
+                    run_host_plan(plan, Arc::clone(&context))
                         .await?
                         .concat()
                         .into_iter()

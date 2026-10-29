@@ -297,3 +297,90 @@ async fn holds_only_its_output_in_the_memory_pool() {
         "{reserved} bytes reserved for an output of {output}"
     );
 }
+
+#[test]
+fn runs_where_there_is_no_tokio_runtime() {
+    use datafusion::physical_plan::{self, ExecutionPlan};
+    use futures::TryStreamExt;
+    fn find(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+        match plan.name() == "EinFoldExec" {
+            true => Some(Arc::clone(plan)),
+            false => plan.children().into_iter().find_map(find),
+        }
+    }
+    // A host in another library, such as DataFusion's Python bindings, polls
+    // the operator through DataFusion's FFI on its own threads, where this
+    // library's Tokio sees no runtime.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let ctx = context(1, 8192, None);
+    tables(&ctx, 3);
+    // A plan's operators run once, so each run plans the query anew.
+    let plan = || {
+        runtime.block_on(async {
+            let plan = fold_plan(&ctx).await;
+            let physical = ctx.state().create_physical_plan(&plan).await.unwrap();
+            find(&physical).unwrap()
+        })
+    };
+    let (first, exec) = (plan(), plan());
+    assert!(
+        exec.children()
+            .iter()
+            .all(|c| c.properties().partitioning.partition_count() > 1),
+        "the operator's inputs should have several partitions"
+    );
+    let with = runtime
+        .block_on(physical_plan::collect(first, ctx.task_ctx()))
+        .unwrap();
+    drop(runtime);
+    let stream = exec.execute(0, ctx.task_ctx()).unwrap();
+    let without: Vec<RecordBatch> = futures::executor::block_on(stream.try_collect()).unwrap();
+    assert_eq!(with, without);
+}
+
+#[test]
+fn inputs_that_spawn_tasks_run_where_there_is_no_tokio_runtime() {
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    use datafusion::physical_plan::{self, ExecutionPlan, Partitioning};
+    use futures::TryStreamExt;
+    fn find(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+        match plan.name() == "EinFoldExec" {
+            true => Some(Arc::clone(plan)),
+            false => plan.children().into_iter().find_map(find),
+        }
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let ctx = context(1, 8192, None);
+    tables(&ctx, 3);
+    // Each input behind a repartition, whose operator spawns a task per input
+    // partition when it is first read.
+    let plan = || {
+        runtime.block_on(async {
+            let plan = fold_plan(&ctx).await;
+            let physical = ctx.state().create_physical_plan(&plan).await.unwrap();
+            let exec = find(&physical).unwrap();
+            let inputs = (exec.children().into_iter())
+                .map(|c| {
+                    let spread = Partitioning::RoundRobinBatch(3);
+                    Arc::new(RepartitionExec::try_new(Arc::clone(c), spread).unwrap()) as _
+                })
+                .collect();
+            physical_plan::replace_children_if_necessary(exec, inputs).unwrap()
+        })
+    };
+    let (first, exec) = (plan(), plan());
+    let with = runtime
+        .block_on(physical_plan::collect(first, ctx.task_ctx()))
+        .unwrap();
+    drop(runtime);
+    let stream = exec.execute(0, ctx.task_ctx()).unwrap();
+    let without: Vec<RecordBatch> = futures::executor::block_on(stream.try_collect()).unwrap();
+    // The repartitions deal batches out in any order, so compare rows.
+    let rows = |batches: &[RecordBatch]| {
+        let shown = datafusion::arrow::util::pretty::pretty_format_batches(batches).unwrap();
+        let mut lines: Vec<String> = shown.to_string().lines().map(String::from).collect();
+        lines.sort();
+        lines
+    };
+    assert_eq!(rows(&with), rows(&without));
+}

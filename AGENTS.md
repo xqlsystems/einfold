@@ -21,7 +21,7 @@ The design matters for planning, but code must not depend on it: comments and do
 3. **Branch** per pull request, named `<milestone>/<topic>`, such as `m1/hash-kernel`.
 4. **Ready for review** once CI is green.
 5. **Approval and merge.** Automated review checks the code: CodeRabbit, an automated reviewer configured in [`.coderabbit.yaml`](.coderabbit.yaml), reviews every pull request that isn't a draft, stacked ones included, and approves once its findings are resolved. A maintainer or code owner ([`.github/CODEOWNERS`](.github/CODEOWNERS)) reads every description, and reviews sketches, public APIs (the Python package, SQL behavior, `EXPLAIN` output, errors) and performance claims. A maintainer may let an agent merge once CodeRabbit approves and CI is green.
-6. **Releases.** Python pre-releases are acceptance-tested by their users, such as xarray-sql (a project that queries Xarray datasets, the labeled N-dimensional arrays of scientific Python, with SQL). Their findings, not the claims in a pull request, decide whether a release is ready.
+6. **Releases.** Python pre-releases are acceptance-tested by their users, such as [xarray-sql](https://github.com/xqlsystems/xarray-sql) (an XQL Systems project that queries Xarray datasets, the labeled N-dimensional arrays of scientific Python, with SQL). Their findings, not the claims in a pull request, decide whether a release is ready.
 
 ## Size
 
@@ -60,7 +60,7 @@ einfold's Rust follows [Google's Rust style guide](https://google.github.io/styl
 - use `expect` or patterns rather than `unwrap` outside tests, and mark pure public functions `#[must_use]`;
 - name each file after its primary item, and keep crate roots to modules and re-exports.
 
-Exceptions: `Arc` where Arrow or DataFusion require it, and rustfmt options that need nightly Rust, which are followed by hand.
+Exceptions: `Arc` where [Arrow](https://arrow.apache.org/rust/) (the columnar in-memory format einfold's data travels in) or [DataFusion](https://datafusion.apache.org/) (the Rust SQL engine einfold extends) require it, and rustfmt options that need nightly Rust, which are followed by hand.
 
 ## Introduce every reference
 

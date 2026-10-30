@@ -50,7 +50,8 @@
 //! - **`[threads]`** where einfold computed every sum itself (no host plan ran
 //!   and no other aggregate is in the plan), the same bits on another number
 //!   of partitions and another batch size, where einfold computed every sum
-//!   there too: short of memory, it hands a fold to the host's plan.
+//!   there too: short of memory, it hands a fold to the host's plan. With
+//!   exact values, the same bits wherever the second run's sums were done.
 //! - **`[partition]`** a mask comparing two of a fold's outputs (`WHERE
 //!   l.a <= r.b`, with both grouped by) decides each group whole, so the
 //!   groups of the mask, of its negation and of its `IS NULL` case are,
@@ -724,10 +725,11 @@ async fn run_case(case: &Case) -> Outcome {
         register(&other, &case.tables);
         // Under a small memory pool, einfold can run short of memory here
         // where the first run didn't, and hand its fold to the host's plan,
-        // whose sums depend on the partitions: then there is nothing of
-        // einfold's to compare.
+        // whose sums depend on the partitions: then only exact values, whose
+        // sums are the same in any order, must keep their bits.
         let ran = check::run(&other, sql).await;
-        if let (Ok(b), 0) = (&ran.result, ran.routes().host) {
+        let einfolds = ran.routes().host == 0 || case.values == Values::Exact;
+        if let (Ok(b), true) = (&ran.result, einfolds) {
             if check::exact(b) != check::exact(got) {
                 fail(
                     "threads",

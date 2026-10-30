@@ -48,10 +48,12 @@
 //! - **`[rerun]`** running the same physical plan again gives the same rows,
 //!   as ddx does when it runs a prepared program for each training step.
 //! - **`[threads]`** where einfold computed every sum itself (no host plan ran
-//!   and no other aggregate is in the plan), the same bits on another number
-//!   of partitions and another batch size, where einfold computed every sum
-//!   there too: short of memory, it hands a fold to the host's plan. With
-//!   exact values, the same bits wherever the second run's sums were done.
+//!   and no other aggregate is in the plan), it gives the same bits on
+//!   another number of partitions and another batch size. Short of memory,
+//!   einfold hands a fold to the host's plan, whose float sums depend on the
+//!   partitions, so inexact values are compared only where the second run
+//!   computed every sum in einfold too. Exact values, whose sums are the
+//!   same in any order, are always compared.
 //! - **`[partition]`** a mask comparing two of a fold's outputs (`WHERE
 //!   l.a <= r.b`, with both grouped by) decides each group whole, so the
 //!   groups of the mask, of its negation and of its `IS NULL` case are,

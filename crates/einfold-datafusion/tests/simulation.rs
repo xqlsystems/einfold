@@ -49,7 +49,8 @@
 //!   as ddx does when it runs a prepared program for each training step.
 //! - **`[threads]`** where einfold computed every sum itself (no host plan ran
 //!   and no other aggregate is in the plan), the same bits on another number
-//!   of partitions and another batch size.
+//!   of partitions and another batch size, where einfold computed every sum
+//!   there too: short of memory, it hands a fold to the host's plan.
 //! - **`[partition]`** a mask comparing two of a fold's outputs (`WHERE
 //!   l.a <= r.b`, with both grouped by) decides each group whole, so the
 //!   groups of the mask, of its negation and of its `IS NULL` case are,
@@ -721,11 +722,16 @@ async fn run_case(case: &Case) -> Outcome {
             case.settings,
         );
         register(&other, &case.tables);
-        if let Ok(b) = check::run(&other, sql).await.result {
-            if check::exact(&b) != check::exact(got) {
+        // Under a small memory pool, einfold can run short of memory here
+        // where the first run didn't, and hand its fold to the host's plan,
+        // whose sums depend on the partitions: then there is nothing of
+        // einfold's to compare.
+        let ran = check::run(&other, sql).await;
+        if let (Ok(b), 0) = (&ran.result, ran.routes().host) {
+            if check::exact(b) != check::exact(got) {
                 fail(
                     "threads",
-                    diff(&check::exact(&b), &check::exact(got)),
+                    diff(&check::exact(b), &check::exact(got)),
                     Some(&mine),
                 );
             }

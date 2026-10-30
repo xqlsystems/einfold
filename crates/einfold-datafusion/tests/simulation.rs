@@ -48,8 +48,12 @@
 //! - **`[rerun]`** running the same physical plan again gives the same rows,
 //!   as ddx does when it runs a prepared program for each training step.
 //! - **`[threads]`** where einfold computed every sum itself (no host plan ran
-//!   and no other aggregate is in the plan), the same bits on another number
-//!   of partitions and another batch size.
+//!   and no other aggregate is in the plan), it gives the same bits on
+//!   another number of partitions and another batch size. Short of memory,
+//!   einfold hands a fold to the host's plan, whose float sums depend on the
+//!   partitions, so inexact values are compared only where the second run
+//!   computed every sum in einfold too. Exact values, whose sums are the
+//!   same in any order, are always compared.
 //! - **`[partition]`** a mask comparing two of a fold's outputs (`WHERE
 //!   l.a <= r.b`, with both grouped by) decides each group whole, so the
 //!   groups of the mask, of its negation and of its `IS NULL` case are,
@@ -721,11 +725,17 @@ async fn run_case(case: &Case) -> Outcome {
             case.settings,
         );
         register(&other, &case.tables);
-        if let Ok(b) = check::run(&other, sql).await.result {
-            if check::exact(&b) != check::exact(got) {
+        // Under a small memory pool, einfold can run short of memory here
+        // where the first run didn't, and hand its fold to the host's plan,
+        // whose sums depend on the partitions: then only exact values, whose
+        // sums are the same in any order, must keep their bits.
+        let ran = check::run(&other, sql).await;
+        let einfolds = ran.routes().host == 0 || case.values == Values::Exact;
+        if let (Ok(b), true) = (&ran.result, einfolds) {
+            if check::exact(b) != check::exact(got) {
                 fail(
                     "threads",
-                    diff(&check::exact(&b), &check::exact(got)),
+                    diff(&check::exact(b), &check::exact(got)),
                     Some(&mine),
                 );
             }

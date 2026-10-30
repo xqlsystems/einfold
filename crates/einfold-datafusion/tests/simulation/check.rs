@@ -157,12 +157,26 @@ pub async fn run(ctx: &SessionContext, sql: &str) -> Ran {
     .await
     {
         Ok(r) => r.map_err(|e| e.to_string()),
-        Err(e) => Err(format!("panicked: {e}")),
+        Err(e) => Err(panicked(e)),
     };
     Ran {
         result,
         schema,
         plan: Some(plan),
+    }
+}
+
+/// A panicked task's failure, as its panic's message: Tokio's own text for
+/// it names the task's ID, which differs between runs of the same panic.
+pub fn panicked(e: tokio::task::JoinError) -> String {
+    match e.try_into_panic() {
+        Ok(payload) => {
+            let message = (payload.downcast_ref::<&str>().map(|m| m.to_string()))
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a panic without a message".to_string());
+            format!("panicked: {message}")
+        }
+        Err(e) => format!("panicked: {e}"),
     }
 }
 
@@ -181,7 +195,7 @@ pub async fn rerun(ctx: &SessionContext, ran: &Ran) -> Option<Result<Vec<RecordB
         tokio::spawn(async move { datafusion::physical_plan::collect(plan, task).await });
     Some(match collected.await {
         Ok(r) => r.map_err(|e| e.to_string()),
-        Err(e) => Err(format!("panicked: {e}")),
+        Err(e) => Err(panicked(e)),
     })
 }
 

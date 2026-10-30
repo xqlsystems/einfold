@@ -10,7 +10,7 @@ build-backend = "maturin"
 name = "einfold"
 description = "Array algorithms for tensor computations written in SQL: matrix products, contractions and attention, run fast inside your SQL engine"
 requires-python = ">=3.10"
-version = "0.1.0rc2"
+version = "0.1.0"
 license = "Apache-2.0"
 readme = "README.md"
 dependencies = []

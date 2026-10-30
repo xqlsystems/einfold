@@ -38,6 +38,7 @@ mod stack;
 /// The native part of the `einfold` Python package.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    allocator::pin_mmap_threshold();
     m.add_class::<ein_fold::EinFold>()?;
     m.add_class::<logical_codec::LogicalCodec>()?;
     m.add_class::<physical_codec::PhysicalCodec>()?;

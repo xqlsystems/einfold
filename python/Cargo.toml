@@ -34,6 +34,10 @@ futures = "0.3"
 # Its version 2, because version 3 crashes on macOS arm64 when a second copy
 # of mimalloc runs in the same process, as PyArrow 24 (Apache Arrow's Python
 # library) loads one: apache/datafusion-python#1607, microsoft/mimalloc#1287.
+# Version 3 is also avoided because its 3.3.0 to 3.3.2, which the crate bundles
+# beside version 2, crash from several threads on Linux too, and the fix isn't
+# released yet. Blocks of 8 MiB and more go to the system's allocator (see
+# `src/allocator.rs`).
 mimalloc = { version = "0.1", default-features = false, features = ["v2"] }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3", "abi3-py310"] }
 # A session hands einfold each logical plan as protobuf, and prost's decoder

@@ -920,6 +920,21 @@ fn simulation() {
     }
 }
 
+/// Two runs of the same panic fail alike, with its message: the host's and
+/// einfold's panics are compared by what their failures say.
+#[test]
+fn panics_fail_alike() {
+    let rt = runtime();
+    let fail = || {
+        rt.block_on(async {
+            let joined = tokio::spawn(async { panic!("boom") }).await;
+            check::panicked(joined.expect_err("a panic"))
+        })
+    };
+    assert_eq!(fail(), "panicked: boom");
+    assert_eq!(fail(), fail());
+}
+
 /// Fails if the generator stopped reaching what the properties are about.
 fn check_coverage(tally: &Tally) {
     let fired = |s: Shape| tally.get(s, 1);

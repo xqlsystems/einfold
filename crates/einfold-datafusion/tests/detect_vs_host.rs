@@ -57,6 +57,8 @@ use datafusion::arrow::util::display;
 use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
@@ -716,6 +718,89 @@ async fn folds_whose_fallback_runs_recur() {
                  WHERE it.n < 4) \
                SELECT * FROM it";
     assert!(same_answer(&TEXT_TABLES, sql).await > 0);
+}
+
+/// A physical optimizer rule that changes nothing and keeps every leaf of
+/// every plan it is given, to tell whether it is given one twice.
+#[derive(Debug, Default)]
+struct Leaves {
+    seen: std::sync::Mutex<Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>>>,
+}
+
+impl Leaves {
+    fn collect(
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        into: &mut Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+    ) {
+        match plan.children().as_slice() {
+            [] => into.push(Arc::clone(plan)),
+            children => children.iter().for_each(|c| Leaves::collect(c, into)),
+        }
+    }
+}
+
+impl PhysicalOptimizerRule for Leaves {
+    fn optimize(
+        &self,
+        plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        _config: &datafusion::config::ConfigOptions,
+    ) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        let mut leaves = Vec::new();
+        Leaves::collect(&plan, &mut leaves);
+        let mut seen = self
+            .seen
+            .lock()
+            .expect("no test thread panicked holding it");
+        for leaf in &leaves {
+            assert!(
+                !seen.iter().any(|s| Arc::ptr_eq(s, leaf)),
+                "the physical optimizer was given a plan it had optimized"
+            );
+        }
+        seen.extend(leaves);
+        Ok(plan)
+    }
+
+    fn name(&self) -> &str {
+        "leaves"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// The physical optimizer optimizes each part of a plan once, a fold's
+/// fallback included: given it again, `JoinSelection` can swap a hash join
+/// that already has dynamic filters, and planning fails (einfold#66). The
+/// rule above runs first on every plan the session optimizes, and fails on a
+/// leaf it has seen before.
+#[tokio::test]
+async fn the_optimizer_sees_a_fallback_once() {
+    let mut rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
+        vec![Arc::new(Leaves::default())];
+    rules.extend(PhysicalOptimizer::new().rules);
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_config(SessionConfig::new().with_target_partitions(4))
+        .with_physical_optimizer_rules(rules)
+        .with_query_planner(Arc::new(EinFoldQueryPlanner::detecting(
+            DetectFolds::with_host_fallback(),
+        )))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    for s in TEXT_TABLES {
+        ctx.sql(s).await.unwrap().collect().await.unwrap();
+    }
+    let sql = "SELECT l.a, r.b, SUM(l.v * r.v) AS v FROM l JOIN r ON l.b = r.a GROUP BY l.a, r.b";
+    let frame = ctx.sql(sql).await.unwrap();
+    let state = Arc::new(frame.task_ctx());
+    let plan = frame.create_physical_plan().await.unwrap();
+    assert_eq!(exec_folds(&plan).0, 1);
+    let got = datafusion::physical_plan::collect(plan, state)
+        .await
+        .unwrap();
+    assert_eq!(got.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
 }
 
 /// A session variable, `@t`, a `DOUBLE`.

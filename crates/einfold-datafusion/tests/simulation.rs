@@ -122,10 +122,6 @@ enum Known {
     /// … LIMIT` over a float column depends on timing. The sort's keys
     /// include the sum, a float, so: no `LIMIT` (einfold#63, upstream).
     TopKSignedZeros,
-    /// `EinFoldExec`'s fallback is optimized when planned, then again as a
-    /// child of the plan, and `JoinSelection` can't swap a join that already
-    /// has dynamic filters: that planning error isn't reported (einfold#66).
-    FallbackOptimizedTwice,
     /// DataFusion's sort-merge join on a float key and another key drops
     /// matches when a side holds both `-0.0` and `0.0`: no sort-merge joins
     /// over float keys (einfold#67, upstream).
@@ -158,7 +154,6 @@ enum Known {
 
 const KNOWN: &[Known] = &[
     Known::TopKSignedZeros,
-    Known::FallbackOptimizedTwice,
     Known::SortMergeSignedZeros,
     Known::SortMergeFilterProjection,
     Known::ResetRerunUnderPool,
@@ -558,12 +553,6 @@ async fn run_case(case: &Case) -> Outcome {
         }
         (Err(e), Ok(_)) if out_of_memory(e) => {
             out.memory = Memory::HostOnly;
-            return out;
-        }
-        (Ok(_), Err(e))
-            if avoids(Known::FallbackOptimizedTwice)
-                && e.contains("Cannot swap HashJoinExec inputs after dynamic filters") =>
-        {
             return out;
         }
         (Ok(_), Err(e)) => {

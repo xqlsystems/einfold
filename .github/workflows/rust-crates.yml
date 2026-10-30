@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Checks einfold's published Rust crates as their users get them: packaged
+# as crates.io holds them, and built and tested against the newest
+# dependencies their version ranges allow, such as the newest DataFusion 55,
+# rather than the versions in Cargo.lock that ci.yml tests. Only a change to
+# the crates' manifests or lockfile can change either, so pull requests run
+# it only then, and it also runs weekly, to catch a new release of a
+# dependency. Action versions are pinned by commit, as in ci.yml.
+name: Rust crates
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/rust-crates.yml
+      - Cargo.toml
+      - Cargo.lock
+      - crates/*/Cargo.toml
+  schedule:
+    - cron: "41 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: rust-crates-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: package the crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # Packages each published crate and builds it from its package, with
+      # the crates it depends on from their packages too, without uploading.
+      - name: package and build
+        run: cargo publish --workspace --dry-run
+
+  newest:
+    name: tests (newest dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # tests/datafusion_behaviors.rs checks the DataFusion behaviors einfold
+      # relies on, so a 55.x that changes one fails here.
+      - name: update to the newest compatible versions
+        run: cargo update
+      - name: tests
+        run: cargo test --workspace --no-fail-fast

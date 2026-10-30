@@ -28,7 +28,7 @@ The rows are the same as the engine's, up to the rounding of floating-point sums
 einfold plugs into a SQL engine. Today that's [Apache DataFusion](https://datafusion.apache.org/python/)'s Python bindings:
 
 ```sh
-python -m pip install "einfold[datafusion]"
+python -m pip install --upgrade "einfold[datafusion]"
 ```
 
 ```python

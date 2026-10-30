@@ -32,7 +32,7 @@ Next is M3: the backward pass of attention fused the same way, chains of three o
 ## Use it from Python
 
 ```sh
-python -m pip install "einfold[datafusion]"
+python -m pip install --upgrade "einfold[datafusion]"
 ```
 
 Wheels are built for Linux (x86_64, aarch64) and macOS (Apple silicon, Intel), for Python 3.10 and later. Windows isn't supported yet ([#118](https://github.com/xqlsystems/einfold/pull/118)).

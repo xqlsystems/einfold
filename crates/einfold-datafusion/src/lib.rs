@@ -62,8 +62,14 @@ pub const HOST: einfold_kernels::Host = einfold_kernels::Host {
 mod tests {
     use super::*;
 
+    /// einfold supports DataFusion 55 from 55.2 (see the workspace's
+    /// `Cargo.toml`): a new major version is a deliberate change.
     #[test]
-    fn pinned_datafusion_version() {
-        assert_eq!(DATAFUSION_VERSION, "55.2.0");
+    fn supported_datafusion_version() {
+        let parts: Vec<u64> = (DATAFUSION_VERSION.split('.'))
+            .map(|p| p.parse().expect("DataFusion's version is numeric"))
+            .collect();
+        assert_eq!(parts[0], 55, "{DATAFUSION_VERSION}");
+        assert!(parts[1] >= 2, "{DATAFUSION_VERSION}");
     }
 }

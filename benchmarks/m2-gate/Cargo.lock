@@ -1344,7 +1344,7 @@ dependencies = [
 
 [[package]]
 name = "einfold-datafusion"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -1356,11 +1356,11 @@ dependencies = [
 
 [[package]]
 name = "einfold-ir"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "einfold-kernels"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "arrow",
  "einfold-ir",

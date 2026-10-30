@@ -59,13 +59,13 @@ Every query in the session is now planned by einfold. Whatever it doesn't recogn
 
 ## Use it from Rust
 
-`einfold-datafusion` isn't on crates.io yet. Depend on it from git, with the same DataFusion it pins (55.2.0):
-
 ```toml
 [dependencies]
-datafusion = "=55.2.0"
-einfold-datafusion = { git = "https://github.com/xqlsystems/einfold" }
+datafusion = "55.2"
+einfold-datafusion = "0.1"
 ```
+
+einfold 0.1 supports DataFusion 55, from 55.2.
 
 ```rust
 use datafusion::execution::SessionStateBuilder;

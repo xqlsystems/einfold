@@ -4,13 +4,17 @@
 
 [package]
 name = "einfold-datafusion"
-description = "einfold for Apache DataFusion: detection, the optimizer rule, and the reference executor EinFoldExec"
+description = "einfold for Apache DataFusion: finds matrix products, contractions and attention in DataFusion's plans, and runs them with array algorithms"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
 
 [dependencies]
 async-trait = "0.1"

@@ -13,28 +13,33 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/xqlsystems/einfold"
+homepage = "https://github.com/xqlsystems/einfold"
+keywords = ["sql", "datafusion", "tensor", "einsum", "attention"]
+categories = ["database", "science", "mathematics"]
 authors = ["Alexander Merose <al@merose.com>", "einfold Authors"]
 # MSRV, matching ddx. Enforced by the CI `msrv` matrix entry.
 rust-version = "1.94"
 
 [workspace.dependencies]
-# Pinned exactly, and in lockstep with ddx (xqlsystems/ddx Cargo.toml).
-# einfold-datafusion's public API takes and returns DataFusion's own types, and
-# ddx's DataFusion adapter is to link einfold-datafusion to run the folds it
-# emits, so both must resolve the identical `datafusion`. A bump is a
-# deliberate change made together with ddx.
-datafusion = { version = "=55.2.0" }
+# Any DataFusion 55 from 55.2, as DataFusion's extensions require it: a
+# project using einfold can then be on any later 55.x, and Cargo resolves one
+# DataFusion for it, einfold and ddx (xqlsystems/ddx) together. einfold's
+# public API takes and returns DataFusion's own types, so a new major version
+# of DataFusion is a new minor version of einfold. 55.2 is the version einfold's
+# tests of DataFusion's behaviors (tests/datafusion_behaviors.rs) ran on; the
+# lockfile stays there, and CI also tests the newest 55.x.
+datafusion = { version = "55.2" }
 
-# Arrow at the version `datafusion` uses: einfold-kernels takes and returns
-# its arrays, and einfold-datafusion hands it DataFusion's batches.
-arrow = { version = "=59.3.1", default-features = false }
+# Arrow from the version DataFusion 55.2 requires: einfold-kernels takes and
+# returns its arrays, and einfold-datafusion hands it DataFusion's batches.
+arrow = { version = "59.2", default-features = false }
 
-einfold-ir = { path = "crates/einfold-ir", version = "0.0.0" }
-einfold-kernels = { path = "crates/einfold-kernels", version = "0.0.0" }
+einfold-ir = { path = "crates/einfold-ir", version = "0.1.0" }
+einfold-kernels = { path = "crates/einfold-kernels", version = "0.1.0" }
 einfold-testkit = { path = "crates/einfold-testkit" }
 
 [workspace.lints.rust]

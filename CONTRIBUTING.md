@@ -90,6 +90,15 @@ A maintainer, or an agent a maintainer asks, releases einfold for Python:
 
 A release candidate is installed with `pip install --pre einfold`, and is accepted by testing it in the projects that use einfold.
 
+## Releasing the Rust crates
+
+`einfold-ir`, `einfold-kernels` and `einfold-datafusion` are published to crates.io together, at one version, set in the workspace's `Cargo.toml` (`einfold-testkit` isn't published). To release them:
+
+1. Set `version` in `[workspace.package]`, and the versions of `einfold-ir` and `einfold-kernels` in `[workspace.dependencies]`, and merge that. The [Rust crates workflow](.github/workflows/rust-crates.yml) packages them and tests them against the newest dependencies their ranges allow.
+2. From that commit, a maintainer logged in to crates.io (`cargo login`) runs `cargo publish --workspace`, which publishes them in dependency order. Then push a tag `rust-v<version>` on the commit.
+
+einfold depends on any DataFusion of one major version, from the minor its behavior tests ran on, as DataFusion's extensions do, such as `55.2` for 55.2 up to 56. A new major version of DataFusion is a new minor version of einfold.
+
 ## What reviewers look for
 
 einfold rewrites other engines' query plans, so above all it must never change a query's answer. Reviewers check that:

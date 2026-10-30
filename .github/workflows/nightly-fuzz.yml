@@ -71,7 +71,10 @@ jobs:
           REGION: ${{ matrix.region }}
         run: |
           case "$SECS" in ''|*[!0-9]*) echo "duration_secs must be a number"; exit 1;; esac
-          if [ "$SECS" -gt 3000 ]; then echo "duration_secs must be at most 3000"; exit 1; fi
+          # Checked by length first: the shell's arithmetic wraps on more
+          # digits than a 64-bit number holds.
+          if [ "${#SECS}" -gt 4 ] || [ "$SECS" -gt 3000 ]; then echo "duration_secs must be at most 3000"; exit 1; fi
+          if [ "${#OVERRIDE}" -gt 15 ]; then echo "base_override must have at most 15 digits"; exit 1; fi
           case "$OVERRIDE" in *[!0-9]*) echo "base_override must be a number"; exit 1;; esac
           # Disjoint seed windows that never repeat across runs: runs are
           # 1e8 seeds apart and regions 1e7, and a region explores far fewer.

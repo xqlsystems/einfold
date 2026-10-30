@@ -30,10 +30,11 @@
 //!   can answer is one einfold must answer too: moving an expression below a
 //!   join must not make it fail on rows the join drops.
 //! - **`[masks-error]`** einfold fails wherever the host does, rather than
-//!   answering a query whose answer is an error. For both, the host also
-//!   runs on einfold's partitions and batch size, since where an error
-//!   happens can depend on DataFusion's own plan; einfold is blamed only
-//!   where it differs from that run too.
+//!   answering a query whose answer is an error, and with the same error.
+//!   Where an error happens can depend on DataFusion's own plan, so where
+//!   only one of them fails, the host on einfold's partitions and batch size
+//!   is the oracle instead, for these and every later check. A panic in
+//!   einfold is always its failure, unless the host panicked the same way.
 //! - **`[schema]`** the same columns, in order: names, types, nullability and
 //!   metadata, both as planned and as the batches carry them.
 //! - **`[rows]`** the same rows, as a multiset. With exact values (small
@@ -152,8 +153,8 @@ enum Known {
     /// `0.0` is greater than `-0.0` and the two are separate groups, while
     /// plain floats' `0.0` and `-0.0` are equal. A mask comparing such a key
     /// with another float key then splits a group of the unmasked fold
-    /// between the mask and its negation: no `[partition]` over
-    /// dictionary-encoded floats (einfold#41, upstream).
+    /// between the mask and its negation: no `[partition]` where a mask
+    /// compares a dictionary-encoded float (einfold#41, upstream).
     DictionaryFloatZeros,
 }
 
@@ -421,13 +422,18 @@ fn register(ctx: &SessionContext, tables: &[Table]) {
     }
 }
 
-/// Whether the host, on einfold's partitions, batch size and settings,
-/// succeeds where einfold failed, or fails where it succeeded.
-async fn differs_from_control(case: &Case, sql: &str, einfold_succeeded: bool) -> bool {
+/// The host's run on einfold's partitions, batch size and settings.
+async fn control(case: &Case, sql: &str) -> check::Ran {
     trace("host, on einfold's partitions");
     let control = check::session(case.threads[1], None, case.batch_sizes[1], case.settings);
     register(&control, &case.tables);
-    check::run(&control, sql).await.result.is_ok() != einfold_succeeded
+    check::run(&control, sql).await
+}
+
+/// An error's message without the values it quotes, such as the text a cast
+/// couldn't read, which depend on which row a plan reached first.
+fn error_kind(e: &str) -> String {
+    e.split('\'').step_by(2).collect::<Vec<_>>().join("'…'")
 }
 
 /// A failure report: the tag, what differed, and how to replay it.
@@ -535,14 +541,14 @@ async fn run_case(case: &Case) -> Outcome {
     // An error can depend on the plan, not only on einfold: a cast of text
     // that doesn't read as a number fails only where a row reaches it, and
     // DataFusion's own plan on other partitions can reach rows the host's
-    // plan didn't. So the host on einfold's partitions and batch size is the
-    // control: einfold is to blame only where it fails, or succeeds, unlike
-    // the control.
-    let einfold_to_blame = match (&theirs.result, &mine.result) {
-        (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
-            differs_from_control(case, sql, mine.result.is_ok()).await
-        }
-        _ => true,
+    // plan didn't. So where only one of the host and einfold fails, the host
+    // on einfold's partitions and batch size is the oracle instead: einfold
+    // must succeed where it does, match its answer, and fail where it does
+    // with the same error.
+    let controlled = theirs.result.is_ok() != mine.result.is_ok();
+    let theirs = match controlled {
+        true => control(case, sql).await,
+        false => theirs,
     };
     let (want, got) = match (&theirs.result, &mine.result) {
         (Ok(w), Ok(g)) => (w, g),
@@ -562,10 +568,6 @@ async fn run_case(case: &Case) -> Outcome {
         {
             return out;
         }
-        (Ok(_), Err(_)) | (Err(_), Ok(_)) if !einfold_to_blame => {
-            out.host_failed = theirs.result.is_err();
-            return out;
-        }
         (Ok(_), Err(e)) => {
             fail(
                 "error",
@@ -579,6 +581,23 @@ async fn run_case(case: &Case) -> Outcome {
             fail(
                 "masks-error",
                 format!("einfold answered where the host failed: {e}"),
+                Some(&mine),
+            );
+            return out;
+        }
+        // A panic in einfold is einfold's, unless the host panicked the
+        // same way; and the control must fail as einfold did. Running out of
+        // memory is tallied, as above, whatever the other side's error.
+        (Err(w), Err(g))
+            if error_kind(w) != error_kind(g)
+                && (controlled || g.starts_with("panicked"))
+                && !out_of_memory(w)
+                && !out_of_memory(g) =>
+        {
+            out.host_failed = true;
+            fail(
+                "error",
+                format!("einfold failed unlike the host: {g}\n  the host: {w}"),
                 Some(&mine),
             );
             return out;
@@ -623,11 +642,13 @@ async fn run_case(case: &Case) -> Outcome {
         let nulls_equal = (m.condition.contains(" = ") || m.condition.contains(" <> "))
             && case.query.sql.contains("IS NOT DISTINCT FROM")
             && avoids(Known::WhereEqualityNullsEqual);
+        // The mask's columns, as `l.a`: the tables' aliases are their names.
         let dictionary_floats = (case.tables.iter())
-            .flat_map(|t| t.schema.fields().iter())
-            .any(
-                |f| matches!(f.data_type(), DataType::Dictionary(_, v) if **v == DataType::Float64),
-            )
+            .flat_map(|t| t.schema.fields().iter().map(move |f| (t.name, f)))
+            .any(|(table, f)| {
+                matches!(f.data_type(), DataType::Dictionary(_, v) if **v == DataType::Float64)
+                    && m.condition.contains(&format!("{table}.{}", f.name()))
+            })
             && avoids(Known::DictionaryFloatZeros);
         if m.partitions && !nulls_equal && !dictionary_floats {
             trace("einfold, partition");

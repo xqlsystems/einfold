@@ -154,6 +154,21 @@ def test_runs_the_sessions_functions_and_datafusions_alike():
         assert _same_value(w[1], g[1]) and _same_value(w[3], g[3]), (w, g)
 
 
+def test_runs_functions_with_the_sessions_configuration():
+    """A function that reads the session's configuration when it runs, as
+    to_unixtime reads the time zone of text without an offset, answers as
+    on DataFusion alone."""
+    def tables(ctx):
+        ctx.sql("SET datafusion.execution.time_zone = '+05:00'").collect()
+        ctx.register_record_batches(
+            "t", [[pa.record_batch({"s": pa.array(["2024-03-04 05:06:07"])})]])
+
+    off, on, _ = _pair(tables)
+    sql = "SELECT to_unixtime(t.s) AS u FROM t"
+    want = off.sql(sql).to_arrow_table().column(0).to_pylist()
+    assert on.sql(sql).to_arrow_table().column(0).to_pylist() == want == [1709510767]
+
+
 def _rows_all(table: pa.Table):
     return list(zip(*[table.column(i).to_pylist() for i in range(table.num_columns)]))
 

@@ -13,7 +13,8 @@ use einfold_ir::{ColumnIndex, DimensionId, Fold, Key, Pipeline, RowValue};
 use crate::{bad, Result};
 
 /// The schema of `fold`'s result over inputs of these schemas: its two
-/// operands, then its domain if it has one.
+/// operands, then its domain if it has one; or its three operands, for a
+/// chain of products (see [`fold_chain`](crate::fold_chain)).
 ///
 /// Without a domain, the result has one key column per output, typed as the
 /// dimension's columns are, then the value. With a domain, it has the
@@ -37,9 +38,12 @@ pub fn schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Res
 /// [`schema`] for a `SUM` of products or of a row expression, whose columns
 /// must then be `Float64`.
 fn fold_schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Result<SchemaRef> {
-    if fold.operands().len() != 2 || operands.len() != 2 {
+    // Three operands are a chain of products (see `fold_chain`), which has
+    // no domain.
+    let chain = fold.operands().len() == 3 && fold.domain().is_none();
+    if !(fold.operands().len() == 2 || chain) || operands.len() != fold.operands().len() {
         return bad(format!(
-            "EinFold computes folds of two operands, not {}",
+            "EinFold computes folds of two operands, or chains of three, not {}",
             fold.operands().len()
         ));
     }

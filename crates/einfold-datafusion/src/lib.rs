@@ -22,6 +22,7 @@
 //! [`install`] adds einfold to a session. This is the only einfold crate
 //! that depends on a query engine.
 
+mod detect_chains;
 mod detect_folds;
 mod detect_pipelines;
 mod ein_fold_exec;

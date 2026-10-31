@@ -28,6 +28,7 @@
 use arrow::error::ArrowError;
 
 mod algorithm;
+mod chain;
 mod dense;
 mod discriminate;
 mod expression;
@@ -38,7 +39,7 @@ mod options;
 mod relation;
 mod schema;
 
-pub use algorithm::{fold, fold_dense, pipeline, Algorithm, Folded};
+pub use algorithm::{fold, fold_chain, fold_dense, pipeline, Algorithm, Folded};
 pub use fused::Piped;
 pub use options::{Budget, DomainRows, FloatKeys, Host, Options};
 pub use relation::Relation;

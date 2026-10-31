@@ -16,9 +16,10 @@
 //! widths, unsigned keys too large for `BIGINT`, text, dictionary-encoded
 //! text, and floats that include `-0.0` beside `0.0` and NaNs of both signs
 //! and two payloads. Rows go missing, repeat their keys, have NULL keys, and
-//! values that are NULL, NaN, ±inf and `-0.0`. A NULL slot holds a random
-//! value underneath, as Arrow allows, so code that reads a slot without
-//! checking its validity shows. Rows are shuffled and split into partitions
+//! values that are NULL, NaN, ±inf and `-0.0` (or, in some cases, only
+//! finite or NULL, as the dense algorithm needs to take missing rows). A
+//! NULL slot holds a random value underneath, as Arrow allows, so code that
+//! reads a slot without checking its validity shows. Rows are shuffled and split into partitions
 //! and batches, empty batches included.
 
 use std::fmt::Write as _;
@@ -196,9 +197,10 @@ pub enum Values {
     Inexact,
 }
 
-fn value(rng: &mut Rng, values: Values) -> Option<f64> {
+fn value(rng: &mut Rng, values: Values, finite: bool) -> Option<f64> {
     match rng.below(100) {
         0..=5 => None,
+        6..=11 if finite => Some(0.0),
         6..=8 => Some(f64::NAN),
         9..=10 => Some(f64::INFINITY),
         11 => Some(f64::NEG_INFINITY),
@@ -225,6 +227,11 @@ pub struct Rows {
     pub wild: bool,
     /// The chance that `t` doesn't read as a number.
     pub bad_text: f64,
+    /// Whether every value is finite or NULL. The dense algorithm takes an
+    /// operand with missing rows only then, and only where the query fills
+    /// a group no row reached, as ddx's gradients do with `0.0`: a NaN or an
+    /// infinity in a product would make such a group NaN, not the fill.
+    pub finite: bool,
 }
 
 impl Rows {
@@ -235,6 +242,7 @@ impl Rows {
         null_key: 0.0,
         wild: false,
         bad_text: 0.0,
+        finite: false,
     };
 
     pub fn draw(rng: &mut Rng) -> Self {
@@ -250,6 +258,7 @@ impl Rows {
             null_key: *rng.pick(&[0.0, 0.0, 0.08]),
             wild: rng.chance(0.15),
             bad_text: 0.0,
+            finite: false,
         }
     }
 }
@@ -313,7 +322,7 @@ pub fn table(
         let key = |k: usize, rng: &mut Rng| (!rng.chance(rows.null_key)).then_some(k);
         a.push(key(i, rng));
         b.push(key(j, rng));
-        let val = value(rng, values);
+        let val = value(rng, values, rows.finite);
         v.push(val);
         x.push(match extra {
             // Text that reads as the value, or that doesn't read as a number.

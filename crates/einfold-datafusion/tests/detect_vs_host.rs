@@ -9,7 +9,8 @@
 //! Each case draws two operand tables `l` and `r`, and a domain table `d`,
 //! with `BIGINT` or `VARCHAR` keys (NULL keys, duplicate tuples, missing rows,
 //! keys too large or negative for the dense algorithm) and `DOUBLE` values that
-//! are NULL, NaN, ±inf, `-0.0` or small integers, split across partitions.
+//! are NULL, NaN, ±inf, `-0.0` or small integers (in some tables, only finite
+//! ones), split across partitions.
 //! Every sum is then exact in any order, so results compare exactly. The
 //! queries are written in several spellings:
 //!
@@ -34,9 +35,14 @@
 //!   which the rule must turn into a fold from `d` that checks `d`'s keys are
 //!   unique when it runs, and their look-alikes, which keep the fold alone.
 //!
+//! Both shapes with a domain read the fold's sum through a fill, such as
+//! ddx's `CASE … WHEN s.v IS NULL THEN 0.0 ELSE s.v END` or `COALESCE`, or
+//! through a look-alike of one.
+//!
 //! Invariants: the same rows, as a multiset, bit for bit (every NaN alike), as
 //! without einfold; the rule fires on every fold, fold from a domain and fold
-//! joined back, and never on a look-alike. A second test draws only folds
+//! joined back, and never on a look-alike; and a fold with a domain computes
+//! its query's fill where no row reaches a group, and NULL under a look-alike. A second test draws only folds
 //! joined back, over operands the dense algorithm takes and a domain whose
 //! keys are duplicated half the time, so that both outcomes of the
 //! uniqueness check are exercised. Half the cases run every fold the rule finds through einfold's
@@ -87,6 +93,9 @@ fn table(
     messy: bool,
 ) {
     let present = if messy || rng.chance(0.4) { 0.85 } else { 1.0 };
+    // Sometimes only finite values, with which the dense algorithm can take
+    // an operand with missing rows under a domain's default.
+    let finite = rng.chance(0.3);
     let (mut a, mut b, mut v) = (Vec::new(), Vec::new(), Vec::new());
     for i in 0..ea {
         for j in 0..eb {
@@ -107,8 +116,8 @@ fn table(
                 b.push(key(j, rng));
                 v.push(match rng.below(20) {
                     0 => None,
-                    1 => Some(f64::NAN),
-                    2 => Some(f64::INFINITY),
+                    1 if !finite => Some(f64::NAN),
+                    2 if !finite => Some(f64::INFINITY),
                     3 => Some(-0.0),
                     _ => Some((rng.below(7) as f64) - 3.0),
                 });
@@ -153,6 +162,31 @@ fn table(
     }
 }
 
+/// How a query reads a fold's sum `s.v` from its domain's side of a left
+/// join, and the default a fold from the domain gets for it: ddx's fill
+/// and `COALESCE`, which give a missing group a constant, and look-alikes,
+/// which read the sum elsewhere too or test it again, and get none. `-0.0`
+/// is a default of its own, which a fold joined back can't keep, since it
+/// computes `0.0 +` its value.
+const FILLS: [(&str, Option<f64>); 7] = [
+    (
+        "CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 ELSE s.v END",
+        Some(0.0),
+    ),
+    ("s.v", None),
+    ("COALESCE(s.v, 0.0)", Some(0.0)),
+    ("COALESCE(s.v, -0.0)", Some(-0.0)),
+    ("CASE WHEN s.v IS NULL THEN 1.0 ELSE s.v END", Some(1.0)),
+    // Tests of the sum other than `IS NULL` compare no NaN: DataFusion
+    // orders a NaN by its sign, which the order of additions decides.
+    (
+        "CASE WHEN s.v IS NULL THEN 0.0 WHEN s.v IS NOT NULL AND d.v IS NULL THEN 9.0 \
+         ELSE s.v END",
+        None,
+    ),
+    ("COALESCE(s.v, 0.0) + s.v", None),
+];
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum Expect {
     /// A fold, with no domain.
@@ -169,11 +203,12 @@ enum Expect {
     Decline,
 }
 
-/// A random query over `l`, `r` and `d`, and whether the rule must fire;
-/// with `joined_back`, always a fold joined back to `d` or a look-alike.
+/// A random query over `l`, `r` and `d`, whether the rule must fire, and the
+/// default a fold with a domain must have where a group is missing, its
+/// bits; with `joined_back`, always a fold joined back to `d` or a look-alike.
 /// With `small_integers`, keys whose differences SQL computes without
 /// overflow, masks may be bands with offsets.
-fn query(rng: &mut Rng, joined_back: bool, small_integers: bool) -> (String, Expect) {
+fn query(rng: &mut Rng, joined_back: bool, small_integers: bool) -> (String, Expect, Option<u64>) {
     let eq = |x: &str, y: &str, safe: bool| match safe {
         true => format!("({x} IS NOT DISTINCT FROM {y})"),
         false => format!("{x} = {y}"),
@@ -232,7 +267,9 @@ fn query(rng: &mut Rng, joined_back: bool, small_integers: bool) -> (String, Exp
     };
     let product = format!("SUM({fl} * {fr})");
     let shape = rng.below(10);
-    match if joined_back { 8 } else { shape } {
+    let (fill, default) = FILLS[rng.below(FILLS.len())];
+    let bits = default.map(f64::to_bits);
+    let (sql, expect) = match if joined_back { 8 } else { shape } {
         0..=2 => (fold(&product, false), Expect::Fold),
         8..=9 if groups.len() == 2 => {
             // ddx's gradient step: the fold joined back to d, grouped again by
@@ -286,19 +323,14 @@ fn query(rng: &mut Rng, joined_back: bool, small_integers: bool) -> (String, Exp
                 // between them keeps it a fold.
                 fold(&product, rng.chance(0.3))
             );
-            // The value as ddx reads it, masked by d's own row, or plainly;
-            // d.v is read either way, so that the test's column is d's.
-            let value = [
-                "CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 ELSE s.v END",
-                "s.v",
-                "COALESCE(s.v, 0.0)",
-            ][rng.below(3)];
-            (
-                format!(
-                    "SELECT d.a, {reads}, d.v AS w, {value} AS v FROM d LEFT JOIN ({regroup}) s ON {outer_keys}"
-                ),
-                expect,
-            )
+            // The value as ddx reads it, masked by d's own row, or another
+            // way; d.v is read either way, so that the test's column is d's.
+            let sql = format!(
+                "SELECT d.a, {reads}, d.v AS w, {fill} AS v FROM d LEFT JOIN ({regroup}) s ON {outer_keys}"
+            );
+            // A fold joined back adds its value to 0.0, which keeps no -0.0.
+            let bits = bits.filter(|&b| b != (-0.0f64).to_bits());
+            return (sql, expect, bits);
         }
         3..=4 if groups.len() == 2 => {
             // A fold from a domain, as ddx writes it: every row of d gets its group's sum, 0 where none.
@@ -317,14 +349,11 @@ fn query(rng: &mut Rng, joined_back: bool, small_integers: bool) -> (String, Exp
                 ("d.b", "LEFT JOIN") => Expect::FromDomain,
                 _ => Expect::FoldOnly,
             };
-            (
-                format!(
-                    "SELECT d.a, {reads}, CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 \
-                     ELSE s.v END AS v FROM d {join} ({}) s ON {keys}",
-                    fold(&product, rng.chance(0.3))
-                ),
-                expect,
-            )
+            let sql = format!(
+                "SELECT d.a, {reads}, {fill} AS v FROM d {join} ({}) s ON {keys}",
+                fold(&product, rng.chance(0.3))
+            );
+            return (sql, expect, bits);
         }
         3..=4 | 8..=9 => (fold(&product, false), Expect::Fold),
         // A mask between two group keys is a masked fold; any other mask
@@ -346,7 +375,8 @@ fn query(rng: &mut Rng, joined_back: bool, small_integers: bool) -> (String, Exp
             Expect::Decline,
         ),
         _ => (fold(&format!("SUM({fl} + {fr})"), false), Expect::Decline),
-    }
+    };
+    (sql, expect, None)
 }
 
 fn host(threads: usize) -> SessionContext {
@@ -390,6 +420,18 @@ fn pooled(threads: usize, with_einfold: Option<DetectFolds>, bytes: usize) -> Se
         None => state,
     };
     SessionContext::new_with_state(state.build())
+}
+
+/// The default of each `EinFoldExec` with a domain in a physical plan, as
+/// bits: what it computes where no row reaches a group.
+fn exec_defaults(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> Vec<Option<u64>> {
+    let any: &dyn Any = plan.as_ref();
+    let own = (any.downcast_ref::<EinFoldExec>())
+        .and_then(|e| e.fold())
+        .and_then(|f| f.domain())
+        .map(|d| d.missing.map(f64::to_bits));
+    let below = plan.children().into_iter().flat_map(exec_defaults);
+    own.into_iter().chain(below).collect()
 }
 
 /// How many `EinFoldExec`s a physical plan has, and how many of them have a
@@ -535,7 +577,7 @@ async fn sweep(default_seed: u64, joined_back: bool) -> Ran {
         // keys meets operands the dense algorithm can take.
         let d_messy = messy || rng.chance(if joined_back { 0.5 } else { 0.3 });
         table(&mut rng, &ctxs, "d", [ea + 1, ec + 1], keys, d_messy);
-        let (sql, expect) = query(&mut rng, joined_back, matches!(keys, Keys::Dense));
+        let (sql, expect, default) = query(&mut rng, joined_back, matches!(keys, Keys::Dense));
         let fail = |what: String| panic!("seed {seed}: {what}\nSQL: {sql}");
 
         let df = ours.sql(&sql).await.unwrap();
@@ -559,6 +601,13 @@ async fn sweep(default_seed: u64, joined_back: bool) -> Ran {
             let shown = datafusion::physical_plan::displayable(physical.as_ref()).indent(true);
             fail(format!(
                 "expected {expect:?}, found {found} folds, {domains} with a domain:\n{shown}"
+            ));
+        }
+        // A fold from its domain computes the query's fill where it has one.
+        let defaults = exec_defaults(&physical);
+        if domains == 1 && defaults != [default] {
+            fail(format!(
+                "expected the default {default:?}, found {defaults:?}"
             ));
         }
         fired += usize::from(found > 0);
@@ -1197,6 +1246,120 @@ async fn masked_folds_over_heads_run_dense() {
     assert!(!shown.contains("host_plans=1"), "{shown}");
 }
 
+/// A session's own function named `coalesce` isn't a fill: here it doubles
+/// a value that isn't NULL, so a group that no row reached, given the
+/// default 1.0, would come out 2.0 rather than 1.0. The fold from the domain
+/// gets no default, and answers as DataFusion does.
+#[tokio::test]
+async fn a_sessions_own_coalesce_is_no_fill() {
+    use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
+    let doubled = create_udf(
+        "coalesce",
+        vec![DataType::Float64, DataType::Float64],
+        DataType::Float64,
+        Volatility::Immutable,
+        Arc::new(|args: &[ColumnarValue]| {
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let (v, c) = (
+                arrays[0].as_any().downcast_ref::<Float64Array>().unwrap(),
+                arrays[1].as_any().downcast_ref::<Float64Array>().unwrap(),
+            );
+            let out: Float64Array = (0..v.len())
+                .map(|i| match v.is_valid(i) {
+                    true => Some(2.0 * v.value(i)),
+                    false => c.is_valid(i).then(|| c.value(i)),
+                })
+                .collect();
+            Ok(ColumnarValue::Array(Arc::new(out)))
+        }),
+    );
+    let setup = [
+        "CREATE TABLE l (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0, 0, 1.0), (1, 0, 2.0)",
+        "CREATE TABLE r (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0, 0, 3.0), (0, 1, 4.0)",
+        "CREATE TABLE d (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0, 0, 0.0), (0, 1, 0.0), (2, 0, 0.0)",
+    ];
+    let sql = "SELECT d.a, d.b, coalesce(s.v, 1.0) AS v FROM d LEFT JOIN ( \
+               SELECT l.a AS g0, r.b AS g1, SUM(l.v * r.v) AS v FROM l JOIN r ON l.b = r.a \
+               GROUP BY l.a, r.b) s ON d.a = s.g0 AND d.b = s.g1";
+    let (plain, ours) = (host(2), einfold(2, false));
+    for ctx in [&plain, &ours] {
+        ctx.register_udf(doubled.clone());
+        for statement in setup {
+            ctx.sql(statement).await.unwrap().collect().await.unwrap();
+        }
+    }
+    let frame = ours.sql(sql).await.unwrap();
+    let ctx = Arc::new(frame.task_ctx());
+    let plan = frame.create_physical_plan().await.unwrap();
+    assert_eq!(exec_defaults(&plan), [None]);
+    let got = datafusion::physical_plan::collect(plan, ctx).await.unwrap();
+    let want = plain.sql(sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(rows(&got), rows(&want));
+}
+
+/// The gradient of causal attention's keys as ddx writes it: `dK = dSᵀ·Q`,
+/// where the cotangent `ds` holds only the lower triangle `i >= j`, joined
+/// back to `k` and filled with `0.0` where no row reached. The fill is the
+/// domain's default, so the dense algorithm takes the triangle's missing rows
+/// as zeros, rather than declining and leaving the step to the host's plan.
+#[tokio::test]
+async fn masked_gradients_from_their_domain_run_dense() {
+    use datafusion::physical_plan;
+    let (n, features) = (6, 3);
+    let (mut q, mut k, mut ds) = (Vec::new(), Vec::new(), Vec::new());
+    for t in 0..n {
+        for d in 0..features {
+            // Small integers, so that every order of the sums is exact.
+            q.push(format!("({t}, {d}, {:?})", ((t * 3 + d) % 7) as f64 - 3.0));
+            k.push(format!("({t}, {d}, {:?})", ((t + d * 2) % 5) as f64 - 2.0));
+        }
+        for j in 0..=t {
+            ds.push(format!("({t}, {j}, {:?})", ((t * 5 + j) % 4) as f64 - 1.0));
+        }
+    }
+    let setup = [
+        format!(
+            "CREATE TABLE q (t BIGINT, d BIGINT, x DOUBLE) AS VALUES {}",
+            q.join(", ")
+        ),
+        format!(
+            "CREATE TABLE k (t BIGINT, d BIGINT, x DOUBLE) AS VALUES {}",
+            k.join(", ")
+        ),
+        format!(
+            "CREATE TABLE ds (i BIGINT, j BIGINT, v DOUBLE) AS VALUES {}",
+            ds.join(", ")
+        ),
+    ];
+    let setup: Vec<&str> = setup.iter().map(String::as_str).collect();
+    let sql = "SELECT k.t, k.d, CASE WHEN k.x IS NULL THEN NULL WHEN r.v IS NULL THEN 0.0 \
+               ELSE r.v END AS x FROM k LEFT JOIN ( \
+                 SELECT k2.t AS t, k2.d AS d, SUM(CASE WHEN k2.x IS NULL THEN NULL ELSE f.v END) AS v \
+                 FROM k k2 JOIN ( \
+                   SELECT ds.j AS j, q.d AS d, SUM(ds.v * q.x) AS v \
+                   FROM ds JOIN q ON ds.i = q.t GROUP BY ds.j, q.d) f \
+                 ON k2.t = f.j AND k2.d = f.d GROUP BY k2.t, k2.d) r \
+               ON k.t = r.t AND k.d = r.d";
+    assert_eq!(same_answer(&setup, sql).await, 1);
+    let ours = einfold(4, true);
+    for s in &setup {
+        ours.sql(s).await.unwrap().collect().await.unwrap();
+    }
+    let frame = ours.sql(sql).await.unwrap();
+    let ctx = Arc::new(frame.task_ctx());
+    let plan = frame.create_physical_plan().await.unwrap();
+    assert_eq!(exec_defaults(&plan), [Some(0.0f64.to_bits())]);
+    physical_plan::collect(Arc::clone(&plan), ctx)
+        .await
+        .unwrap();
+    let shown = DisplayableExecutionPlan::with_metrics(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(shown.contains("unique domain"), "{shown}");
+    assert!(shown.contains("dense_folds=1"), "{shown}");
+    assert!(!shown.contains("host_plans=1"), "{shown}");
+}
+
 /// Property: under a small memory pool, einfold runs out of memory no more
 /// often than the host does. Each case runs a random query of the sweep's
 /// spellings with einfold, by its kernels or with the host's plan as
@@ -1245,7 +1408,7 @@ async fn einfold_runs_short_of_memory_only_where_the_host_does() {
         let d_messy = messy || rng.chance(0.3);
         table(&mut rng, &ctxs, "d", [ea + 1, ec + 1], keys, d_messy);
         let joined_back = rng.chance(0.2);
-        let (sql, _) = query(&mut rng, joined_back, matches!(keys, Keys::Dense));
+        let (sql, _, _) = query(&mut rng, joined_back, matches!(keys, Keys::Dense));
         let fail =
             |what: String| panic!("seed {seed}, a pool of {bytes} bytes: {what}\nSQL: {sql}");
         let want = match theirs.sql(&sql).await.unwrap().collect().await {

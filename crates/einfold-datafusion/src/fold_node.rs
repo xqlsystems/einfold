@@ -153,6 +153,23 @@ impl FoldNode {
         self.null_when
     }
 
+    /// This node, with its value column nullable even where its domain's
+    /// default makes the fold's value never NULL: so that the node keeps the
+    /// nullability of the plan it replaced, as an optimizer rule must, and so
+    /// that [`FoldNode::with_null_when`] can make values NULL.
+    pub(crate) fn with_nullable_value(mut self) -> Result<Self> {
+        let last = self.schema.fields().len() - 1;
+        let fields: Vec<Field> = (self.schema.fields().iter().enumerate())
+            .map(|(i, f)| {
+                f.as_ref()
+                    .clone()
+                    .with_nullable(f.is_nullable() || i == last)
+            })
+            .collect();
+        self.schema = Arc::new(DFSchema::try_from(Schema::new(fields))?);
+        Ok(self)
+    }
+
     /// Whether [`DetectFolds`](crate::DetectFolds) made this node.
     pub(crate) fn found(&self) -> bool {
         self.found

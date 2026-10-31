@@ -7,7 +7,7 @@
 //! plans there. Plans cross DataFusion's FFI (foreign function interface)
 //! as protobuf, the Protocol Buffers serialization format.
 
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt::{self, Formatter};
 use std::pin::Pin;
@@ -25,8 +25,6 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::functions_aggregate::min_max::{self, Max};
-use datafusion::functions_aggregate::sum::{self, Sum};
 use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::registry::ExtensionTypeRegistryRef;
 use datafusion::logical_expr::{
@@ -60,64 +58,178 @@ pub(crate) fn runtime() -> Handle {
     runtime.handle().clone()
 }
 
-/// DataFusion's own aggregate for a foreign one of the same name, for the
-/// aggregates detection matches by type.
-fn builtin(name: &str) -> Option<Arc<AggregateUDF>> {
-    match name {
-        "sum" => Some(sum::sum_udaf()),
-        "max" => Some(min_max::max_udaf()),
-        _ => None,
+/// DataFusion's own functions, scalar, aggregate and window, by each of
+/// their names and aliases.
+struct Builtins {
+    scalar: HashMap<String, Arc<ScalarUDF>>,
+    aggregate: HashMap<String, Arc<AggregateUDF>>,
+    window: HashMap<String, Arc<WindowUDF>>,
+}
+
+impl Builtins {
+    fn get() -> &'static Builtins {
+        static BUILTINS: OnceLock<Builtins> = OnceLock::new();
+        BUILTINS.get_or_init(|| {
+            fn by_name<F>(
+                functions: Vec<Arc<F>>,
+                names: impl Fn(&F) -> Vec<String>,
+            ) -> HashMap<String, Arc<F>> {
+                let mut map = HashMap::new();
+                for f in functions {
+                    for name in names(&f) {
+                        map.entry(name).or_insert_with(|| Arc::clone(&f));
+                    }
+                }
+                map
+            }
+            let names = |name: &str, aliases: &[String]| {
+                std::iter::once(name.to_string())
+                    .chain(aliases.iter().cloned())
+                    .collect()
+            };
+            Builtins {
+                // Not those whose result depends on the session's
+                // configuration, such as `to_timestamp`'s time zone: the
+                // session's copy is configured, and these aren't.
+                scalar: by_name(
+                    (datafusion::functions::all_default_functions().into_iter())
+                        .filter(|f| {
+                            (f.inner().with_updated_config(&ConfigOptions::default())).is_none()
+                        })
+                        .collect(),
+                    |f: &ScalarUDF| names(f.name(), f.aliases()),
+                ),
+                aggregate: by_name(
+                    datafusion::functions_aggregate::all_default_aggregate_functions(),
+                    |f: &AggregateUDF| names(f.name(), f.aliases()),
+                ),
+                window: by_name(
+                    datafusion::functions_window::all_default_window_functions(),
+                    |f: &WindowUDF| names(f.name(), f.aliases()),
+                ),
+            }
+        })
     }
 }
 
-/// Whether `function` is DataFusion's own aggregate, rather than a foreign
-/// one.
-fn is_builtin(function: &AggregateUDF) -> bool {
-    let inner: &dyn Any = function.inner().as_ref();
-    inner.is::<Sum>() || inner.is::<Max>()
+/// The type of a function's implementation: DataFusion's own, or the
+/// FFI's proxy of a foreign one.
+fn implementation(inner: &dyn Any) -> TypeId {
+    inner.type_id()
 }
 
-/// `plan` with every `SUM` and `MAX` that crossed the FFI as a foreign
-/// function, in aggregates and in windows, replaced by DataFusion's own, so
-/// that detection, which matches them by type, recognizes them.
+/// Which of the session's functions [`relink`] replaces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Relinked {
+    /// `SUM` and `MAX`, which detection matches by type.
+    SumAndMax,
+    /// Every function of the name of one of DataFusion's own.
+    Builtins,
+}
+
+/// `plan` with each function that crossed the FFI as a foreign one, and
+/// has the name of one of DataFusion's own, replaced by DataFusion's own.
+/// So detection, which matches `SUM` and `MAX` by type, recognizes them,
+/// and each call of a function runs here: a foreign function's call
+/// converts the session's whole configuration, several hundred options as
+/// strings, at every batch, and a step of a ddx gradient program calls
+/// functions such as `exp` in many of its operators.
 ///
 /// The session's functions of those names are DataFusion's built-in ones
 /// unless it registers others, which this would then replace. Through the
-/// FFI, a foreign aggregate carries only its name, its aliases and a
-/// generic signature, so a function registered as `sum` can't be told from
-/// DataFusion's.
-fn relink(plan: LogicalPlan) -> Result<LogicalPlan> {
+/// FFI, a foreign function carries only its name, its aliases and a
+/// signature, so a function registered as `exp` can't be told from
+/// DataFusion's. Functions configured by the session, such as
+/// `to_timestamp` in its time zone, are left as they are. With
+/// [`Relinked::Builtins`], it fails if any node's schema changes.
+fn relink(plan: LogicalPlan, which: Relinked) -> Result<LogicalPlan> {
+    let builtins = Builtins::get();
+    let wanted = |name: &str| which == Relinked::Builtins || matches!(name, "sum" | "max");
+    let aggregate = |f: &Arc<AggregateUDF>| -> Option<Arc<AggregateUDF>> {
+        let own = builtins
+            .aggregate
+            .get(f.name())
+            .filter(|_| wanted(f.name()))?;
+        let differs = implementation(f.inner().as_ref()) != implementation(own.inner().as_ref());
+        differs.then(|| Arc::clone(own))
+    };
+    // Whether a node's schema changed: a function of the session's that
+    // returns another type than DataFusion's own of its name.
+    let changed = std::cell::Cell::new(false);
     let relinked = plan.transform_up(|node| {
-        node.map_expressions(|expression| {
+        let before = Arc::clone(node.schema());
+        let node = node.map_expressions(|expression| {
             expression.transform(|expression| match expression {
-                Expr::AggregateFunction(mut aggregate) if !is_builtin(&aggregate.func) => {
-                    match builtin(aggregate.func.name()) {
+                Expr::ScalarFunction(mut call) if which == Relinked::Builtins => {
+                    let own = builtins.scalar.get(call.func.name()).filter(|own| {
+                        implementation(call.func.inner().as_ref())
+                            != implementation(own.inner().as_ref())
+                    });
+                    match own {
                         Some(own) => {
-                            aggregate.func = own;
-                            Ok(Transformed::yes(Expr::AggregateFunction(aggregate)))
+                            call.func = Arc::clone(own);
+                            Ok(Transformed::yes(Expr::ScalarFunction(call)))
                         }
-                        None => Ok(Transformed::no(Expr::AggregateFunction(aggregate))),
+                        None => Ok(Transformed::no(Expr::ScalarFunction(call))),
                     }
                 }
-                Expr::WindowFunction(mut window) => match &window.fun {
-                    WindowFunctionDefinition::AggregateUDF(function) if !is_builtin(function) => {
-                        match builtin(function.name()) {
-                            Some(own) => {
-                                window.fun = WindowFunctionDefinition::AggregateUDF(own);
-                                Ok(Transformed::yes(Expr::WindowFunction(window)))
-                            }
-                            None => Ok(Transformed::no(Expr::WindowFunction(window))),
-                        }
+                Expr::AggregateFunction(mut call) => match aggregate(&call.func) {
+                    Some(own) => {
+                        call.func = own;
+                        Ok(Transformed::yes(Expr::AggregateFunction(call)))
                     }
-                    _ => Ok(Transformed::no(Expr::WindowFunction(window))),
+                    None => Ok(Transformed::no(Expr::AggregateFunction(call))),
                 },
+                Expr::WindowFunction(mut window) => {
+                    let own = match &window.fun {
+                        WindowFunctionDefinition::AggregateUDF(f) => {
+                            aggregate(f).map(WindowFunctionDefinition::AggregateUDF)
+                        }
+                        WindowFunctionDefinition::WindowUDF(f) if which == Relinked::Builtins => {
+                            (builtins.window.get(f.name()))
+                                .filter(|own| {
+                                    implementation(f.inner().as_ref())
+                                        != implementation(own.inner().as_ref())
+                                })
+                                .map(|own| WindowFunctionDefinition::WindowUDF(Arc::clone(own)))
+                        }
+                        _ => None,
+                    };
+                    match own {
+                        Some(own) => {
+                            window.fun = own;
+                            Ok(Transformed::yes(Expr::WindowFunction(window)))
+                        }
+                        None => Ok(Transformed::no(Expr::WindowFunction(window))),
+                    }
+                }
                 other => Ok(Transformed::no(other)),
             })
-        })
+        })?;
+        // Each node's schema, from its expressions and its inputs', which
+        // were recomputed before it.
+        if !node.transformed {
+            return Ok(node);
+        }
+        let recomputed = node.data.recompute_schema()?;
+        changed.set(changed.get() || recomputed.schema() != &before);
+        Ok(Transformed::yes(recomputed))
     })?;
-    // Expressions that changed type change their columns' names, which
-    // DataFusion derives from the expression: recompute the schemas.
-    relinked.data.recompute_schema()
+    if which == Relinked::Builtins && changed.get() {
+        return datafusion::common::plan_err!("relinking changed a schema");
+    }
+    Ok(relinked.data)
+}
+
+/// `plan` relinked (see [`relink`]): every function DataFusion has its own
+/// of, where that leaves every node's schema exactly as it was, names,
+/// types and nullability; otherwise, or if relinking them fails, only `SUM`
+/// and `MAX`, as detection needs.
+fn relinked(plan: &LogicalPlan) -> Result<LogicalPlan> {
+    match relink(plan.clone(), Relinked::Builtins) {
+        Ok(all) => Ok(all),
+        Err(_) => relink(plan.clone(), Relinked::SumAndMax),
+    }
 }
 
 /// `plan`, made ready to be explained here if it is an `EXPLAIN`. One
@@ -186,7 +298,7 @@ impl QueryPlanner for Bridge {
         self.counts.plans.fetch_add(1, Ordering::Relaxed);
         // Copying the session's in-memory tables only saves time: if it
         // fails, the plan reads them as the session would.
-        let relinked = relink(plan.clone())?;
+        let relinked = relinked(plan)?;
         let plan = match lean::localize(relinked.clone(), session).await {
             Ok(localized) => localized,
             Err(_) => relinked,

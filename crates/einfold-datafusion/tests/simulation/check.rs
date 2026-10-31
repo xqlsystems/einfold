@@ -248,20 +248,24 @@ pub fn rows(batches: &[RecordBatch]) -> Vec<Row> {
         }
     }
     // Rows with the same keys in the order of their values' classes and
-    // then values, so that two runs pair them alike.
+    // then values, so that two runs pair them alike. Values compare in
+    // IEEE 754's total order, which puts `-0.0` before `0.0`: rows that
+    // differ only in a zero's sign, as a domain's duplicate keys can, would
+    // otherwise keep the order each plan made them in.
     out.sort_by(|x, y| {
-        let class = |r: &Row| -> Vec<(u8, f64)> {
-            (r.values.iter())
-                .map(|v| match v {
-                    None => (0, 0.0),
-                    Some(f) if f.is_nan() => (1, 0.0),
-                    Some(f) => (2, *f),
-                })
-                .collect()
+        let class = |v: &Option<f64>| match v {
+            None => (0, 0.0),
+            Some(f) if f.is_nan() => (1, 0.0),
+            Some(f) => (2, *f),
         };
-        (&x.keys, class(x))
-            .partial_cmp(&(&y.keys, class(y)))
-            .expect("no NaN compared")
+        let values = (x.values.iter().zip(&y.values))
+            .map(|(a, b)| {
+                let (a, b) = (class(a), class(b));
+                a.0.cmp(&b.0).then(a.1.total_cmp(&b.1))
+            })
+            .find(|o| o.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal);
+        x.keys.cmp(&y.keys).then(values)
     });
     out
 }

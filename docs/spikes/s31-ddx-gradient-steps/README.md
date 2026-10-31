@@ -115,3 +115,23 @@ In order of time saved per unit of work:
 4. **FlashAttention's backward pass** needs ddx to recompute the scores in the backward pass rather than save them. Then each backward step is one query, in which einfold can find a pipeline over `Q` and `K`, as it does for the forward pass. Until then, a gradient stores `N²/2` scores, so at 16,384 tokens it holds 134 million rows, about 3 GB, in each of several tables.
 
 Chains of three or more products, M3's other benchmark, aren't among the steps that take the time in either demo.
+
+## After the fixes
+
+The three changes S31 led to: #129 reads ddx's fill as the domain's default, #131 finds products over three or more relations by regrouping the joins (and computes float `/` on an operand's rows), and #132 runs DataFusion's own functions in einfold's library rather than through the FFI. With all three, from a local build, on the same machine, as medians of 3 runs of the demos themselves:
+
+| | einfold 0.1.0 | with the three | DataFusion | DuckDB |
+|---|---:|---:|---:|---:|
+| attention gradient, 1,024 tokens, window | 2.30 s | 0.90 s | 4.03 s | 5.42 s |
+| attention gradient, 1,024 tokens, `GROUP BY` | 1.89 s | 0.59 s | 4.67 s | 7.60 s |
+| GPT training step, nanoGPT's CPU size | 4.03 s | 2.61 s | 12.05 s | |
+
+That's 4.5× and 7.9× DataFusion on attention's gradient, and 4.6× on the GPT step. The steps that changed:
+
+- dQ and dK: 418 ms → 32 ms, the dense algorithm under ddx's fill;
+- `O = softmax(S)·V` from the saved scores: 302 ms → 33 ms, and `dV`: 653 ms → 33 ms, each a fold of regrouped operands;
+- the GPT's softmax backward, which einfold doesn't plan: 335 ms → 136 ms (DataFusion: 107–129 ms). Before #132, its CPU time was 2.6× DataFusion's, a third of it converting the session's configuration for each call of a foreign function.
+
+Two costs remain that einfold can't remove alone. The window spelling's softmax backward (`cotangent_0`, 400–540 ms) is a `UNION` of four branches, two of which recompute the other two's `N²` aggregates, which is ddx's program (xqlsystems/ddx#243). And from Python, every query pays the FFI's fixed cost, a few milliseconds: on TPC-H, which einfold leaves alone (it plans none of the 22 queries, and each gives DataFusion's rows), that's 1.21× DataFusion's time at scale factor 0.1 and 1.06× at scale factor 1.
+
+A chain of three matrix products written flat (`SUM(a.v * b.v * c.v)` over three joins) is also found now, as a fold of `a JOIN b` and `c`. It's 4.2× faster than DataFusion and 7.4× faster than DuckDB at 96 × 96, but only as fast as DataFusion at 32 × 32, since `a JOIN b` still has `n³` rows. Choosing the order of contractions, M3's next item, would compute it as two matrix products instead.

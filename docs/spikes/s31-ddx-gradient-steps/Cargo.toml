@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Spike S31: where ddx's gradient programs spend their time with einfold 0.1.
+[package]
+name = "einfold-spike-s31"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+datafusion = "=55.2.0"
+einfold-datafusion = { path = "../../../crates/einfold-datafusion" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[profile.release]
+debug = false

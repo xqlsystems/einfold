@@ -88,6 +88,10 @@ async fn main() -> Result<()> {
             with * 1e3,
             without * 1e3
         );
+        if std::env::var_os("S31_LOGICAL").is_some() {
+            let plan = off.sql(&sql).await?.into_optimized_plan()?;
+            println!("{}", plan.display_indent());
+        }
         let explained = on
             .sql(&format!("EXPLAIN ANALYZE {sql}"))
             .await?

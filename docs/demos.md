@@ -95,7 +95,7 @@ Spike S27's first fused kernel had the first bug.
 | The online softmax | The output is an algebraic fold with weights `e^(s)`, summed in a scaled exponential accumulator | §8.6, §9.6 | M2 |
 | Recognize the softmax in SQL | Detect `exp(s − max)` normalized by its sum, spelled with a window or with `GROUP BY` and a join | §9.6 | M2 |
 | Skip tiles above the diagonal | The predicate `q.t >= k.t` becomes a mask; each tile pair is classified as empty, full or partial from the predicate and the tile's position bounds; empty pairs are skipped, and partial ones skip masked pairs rather than zeroing them | §9.1, §10.2 | M2 |
-| Work tile by tile with bounded memory | Tiles chosen from the shape alone, which also makes results deterministic (S24) | §8.6, §10.2 | M2 (fixed tiles); M7 (tiles under a memory budget, S20) |
+| Work tile by tile with bounded memory | Tiles chosen from the shape alone, which also makes results deterministic (S24) | §8.6, §10.2 | M2 (fixed tiles); M8 (tiles under a memory budget, S20) |
 | The backward pass recomputes scores tile by tile from a saved row statistic, `m + log z` | The gradient of the pipeline is a pipeline over the same tiles | §16 | M3 |
 
 ### Evidence

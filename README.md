@@ -27,7 +27,7 @@ einfold is part of [XQL Systems](https://xql.systems), which builds SQL access t
 - **M1, folds:** sums of products over a join, the shape of matrix products and of the gradients that [ddx](https://github.com/xqlsystems/ddx) (an XQL Systems project for automatic differentiation of SQL queries) writes.
 - **M2, fold pipelines:** a weighted sum of such a sum, run tile by tile. Attention is one, so einfold rediscovers FlashAttention's algorithm from attention written in plain SQL ([demo 1](docs/demos.md)).
 
-Next is M3: the backward pass of attention fused the same way, chains of three or more products, and wider detection ([roadmap](docs/design.md#16-roadmap)). DuckDB is planned as a second engine.
+Next is M3, gradients: the steps of ddx's gradient programs that einfold 0.1 doesn't speed up yet, such as weighted sums over attention's saved scores, then chains of three or more products, and attention's backward pass fused ([roadmap](docs/design.md#16-roadmap)). M4 brings einfold to DuckDB.
 
 ## Use it from Python
 

@@ -124,7 +124,7 @@ With the fold as the center, I reviewed every concept in the docs and in the cod
    - to an operand: size, density;
    - to an operand's use of a dimension: its coordinate map and its tiling, since two operands may tile the same dimension differently.
 
-   Fact kinds (M3) should be organized that way.
+   Fact kinds (milestone M5 in design v20's roadmap; M3 when this RFC was accepted) should be organized that way.
 
 ## Renames
 

@@ -1246,6 +1246,57 @@ async fn masked_folds_over_heads_run_dense() {
     assert!(!shown.contains("host_plans=1"), "{shown}");
 }
 
+/// A session's own function named `coalesce` isn't a fill: here it doubles
+/// a value that isn't NULL, so a group that no row reached, given the
+/// default 1.0, would come out 2.0 rather than 1.0. The fold from the domain
+/// gets no default, and answers as DataFusion does.
+#[tokio::test]
+async fn a_sessions_own_coalesce_is_no_fill() {
+    use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
+    let doubled = create_udf(
+        "coalesce",
+        vec![DataType::Float64, DataType::Float64],
+        DataType::Float64,
+        Volatility::Immutable,
+        Arc::new(|args: &[ColumnarValue]| {
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let (v, c) = (
+                arrays[0].as_any().downcast_ref::<Float64Array>().unwrap(),
+                arrays[1].as_any().downcast_ref::<Float64Array>().unwrap(),
+            );
+            let out: Float64Array = (0..v.len())
+                .map(|i| match v.is_valid(i) {
+                    true => Some(2.0 * v.value(i)),
+                    false => c.is_valid(i).then(|| c.value(i)),
+                })
+                .collect();
+            Ok(ColumnarValue::Array(Arc::new(out)))
+        }),
+    );
+    let setup = [
+        "CREATE TABLE l (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0, 0, 1.0), (1, 0, 2.0)",
+        "CREATE TABLE r (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0, 0, 3.0), (0, 1, 4.0)",
+        "CREATE TABLE d (a BIGINT, b BIGINT, v DOUBLE) AS VALUES (0, 0, 0.0), (0, 1, 0.0), (2, 0, 0.0)",
+    ];
+    let sql = "SELECT d.a, d.b, coalesce(s.v, 1.0) AS v FROM d LEFT JOIN ( \
+               SELECT l.a AS g0, r.b AS g1, SUM(l.v * r.v) AS v FROM l JOIN r ON l.b = r.a \
+               GROUP BY l.a, r.b) s ON d.a = s.g0 AND d.b = s.g1";
+    let (plain, ours) = (host(2), einfold(2, false));
+    for ctx in [&plain, &ours] {
+        ctx.register_udf(doubled.clone());
+        for statement in setup {
+            ctx.sql(statement).await.unwrap().collect().await.unwrap();
+        }
+    }
+    let frame = ours.sql(sql).await.unwrap();
+    let ctx = Arc::new(frame.task_ctx());
+    let plan = frame.create_physical_plan().await.unwrap();
+    assert_eq!(exec_defaults(&plan), [None]);
+    let got = datafusion::physical_plan::collect(plan, ctx).await.unwrap();
+    let want = plain.sql(sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(rows(&got), rows(&want));
+}
+
 /// The gradient of causal attention's keys as ddx writes it: `dK = dSᵀ·Q`,
 /// where the cotangent `ds` holds only the lower triangle `i >= j`, joined
 /// back to `k` and filled with `0.0` where no row reached. The fill is the

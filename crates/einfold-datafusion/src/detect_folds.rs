@@ -924,6 +924,7 @@ pub(crate) fn found_fold(plan: &LogicalPlan) -> Option<(&FoldNode, Vec<usize>)> 
 /// two fills differ.
 pub(crate) fn fill_default(exprs: &[Expr], value: &Column) -> Option<f64> {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::functions::core::coalesce::CoalesceFunc;
     use datafusion::logical_expr::expr::{Case, ScalarFunction};
     let is_value = |e: &Expr| matches!(e, Expr::Column(c) if c == value);
     let constant = |e: &Expr| match e {
@@ -934,8 +935,12 @@ pub(crate) fn fill_default(exprs: &[Expr], value: &Column) -> Option<f64> {
     // The constant `e` gives where `value` is NULL, if `e` is a fill.
     let fill = |e: &Expr| -> Option<f64> {
         match e {
+            // DataFusion's own `COALESCE`, by type, not by name: a session
+            // may register another function under the name.
             Expr::ScalarFunction(ScalarFunction { func, args })
-                if func.name() == "coalesce" && args.len() == 2 && is_value(&args[0]) =>
+                if (func.inner().as_ref() as &dyn Any).is::<CoalesceFunc>()
+                    && args.len() == 2
+                    && is_value(&args[0]) =>
             {
                 constant(&args[1])
             }

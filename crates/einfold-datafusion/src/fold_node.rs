@@ -20,7 +20,8 @@ use einfold_ir::{ColumnIndex, Comparison, DimensionId, Fold, RowValue};
 use einfold_kernels::DomainRows;
 
 /// A fold over a join in a DataFusion logical plan. Its inputs are the fold's
-/// two operands, then its domain if it has one; its schema is
+/// operands (two, or three for a chain of products), then its domain if it
+/// has one; its schema is
 /// [`einfold_kernels::schema`]'s.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FoldNode {
@@ -250,10 +251,11 @@ impl UserDefinedLogicalNodeCore for FoldNode {
             return plan_err!("a Fold node has no expressions");
         }
         let mut operands = inputs;
+        let n = self.fold.operands().len();
         let domain = match (self.fold.domain(), operands.len()) {
-            (None, 2) => None,
-            (Some(_), 3) => operands.pop(),
-            (_, n) => return plan_err!("a Fold node has {} inputs, given {n}", self.inputs.len()),
+            (None, m) if m == n => None,
+            (Some(_), m) if m == n + 1 => operands.pop(),
+            (_, m) => return plan_err!("a Fold node has {} inputs, given {m}", self.inputs.len()),
         };
         let names = self.schema.fields().iter().map(|f| f.name().clone());
         let node = FoldNode::try_new(self.fold.clone(), operands, domain, names.collect())?;

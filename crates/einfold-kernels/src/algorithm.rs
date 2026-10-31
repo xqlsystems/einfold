@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! [`fold`] and [`fold_dense`], which run a fold by the best algorithm that
-//! applies, [`Algorithm`], which says which one ran, and [`pipeline`], which
-//! runs a fold pipeline.
+//! applies, [`fold_chain`], which runs a chain of three operands,
+//! [`Algorithm`], which says which one ran, and [`pipeline`], which runs a
+//! fold pipeline.
 
 use arrow::compute;
 use arrow::datatypes::SchemaRef;
@@ -14,7 +15,7 @@ use einfold_ir::{Fold, Pipeline};
 use crate::fused::Piped;
 use crate::options::{DomainRows, Options};
 use crate::relation::Relation;
-use crate::{bad, dense, discriminate, fused, Result};
+use crate::{bad, chain, dense, discriminate, fused, Result};
 
 /// Which algorithm computed a fold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -58,6 +59,27 @@ pub fn fold_dense(
 ) -> Result<Option<Vec<RecordBatch>>> {
     let domain = domain.map(|d| d.batches);
     dense::fold(fold, a.batches, b.batches, domain, schema, &options)
+}
+
+/// `fold`, a `SUM` of the product of three operands' factors, such as a
+/// chain of matrix products, over `operands`, as one batch of `schema` (which
+/// [`schema`](crate::schema) gives), computed as two folds of two operands
+/// by the dense algorithm, contracting first the pair that costs the least.
+/// `None` where that doesn't apply: a domain or conditions, a factor that
+/// isn't finite or sums that could overflow, or inputs the dense algorithm
+/// declines. The caller then runs something else, such as the host's plan.
+///
+/// With floats, the result is within the bound of summing the terms in any
+/// order, widened by one rounding per term. The result's bits depend only on
+/// the inputs' rows, not on how they were batched or ordered, nor on the
+/// number of threads.
+pub fn fold_chain(
+    fold: &Fold,
+    operands: [Relation; 3],
+    schema: SchemaRef,
+    options: Options,
+) -> Result<Option<Vec<RecordBatch>>> {
+    chain::fold(fold, operands, schema, &options)
 }
 
 /// `fold` over operands `a` and `b`, and its domain if it has one, as

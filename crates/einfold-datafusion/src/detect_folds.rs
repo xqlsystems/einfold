@@ -32,6 +32,9 @@
 //!    [`fill_default`]), so the dense algorithm can take operands with
 //!    missing rows, such as a causal mask's triangle.
 //!
+//! A fold may also have three operands: a chain of products, whose factors
+//! each read one of three joined relations (see [`detect_chains::chain`]).
+//!
 //! The rule runs after DataFusion's own rules, so filters are already pushed
 //! below the join, and keeps every plan's schema exactly: names, qualifiers,
 //! types and nullability. [`EinFoldExec`](crate::EinFoldExec) runs each
@@ -60,6 +63,7 @@ use einfold_ir::{
     Domain, DomainKey, Expression, Fold, Key, KeyEquality, Operand, Output, RowValue, Unary,
 };
 
+use crate::detect_chains;
 use crate::detect_pipelines;
 use crate::fold_node::FoldNode;
 use crate::join_back;
@@ -317,18 +321,26 @@ pub(crate) struct Found {
 }
 
 /// `agg` as a fold, if it is one: a [`FoldNode`] under a projection giving it
-/// `agg`'s schema. A fold whose join has a condition, a mask, always keeps
-/// the plan it replaced: the dense algorithm computes masks between outputs,
-/// and the discrimination algorithm none.
+/// `agg`'s schema. A chain of three products (see [`detect_chains::chain`])
+/// is preferred to the same product as a fold of two operands, one of them a
+/// join. A fold whose join has a condition, a mask, and a chain always keep
+/// the plan they replaced: the dense algorithm computes masks between
+/// outputs, and the discrimination algorithm none, nor chains.
 fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
+    let found = match detect_chains::chain(agg)? {
+        Some(chain) => Some(chain),
+        None => analyze(agg, false)?,
+    };
     let Some(Found {
         fold: spec,
         operands: plans,
-    }) = analyze(agg, false)?
+    }) = found
     else {
         return Ok(None);
     };
-    let masked = !spec.conditions().is_empty();
+    // A chain of three operands runs only by the dense algorithm, and needs
+    // the host's plan wherever that declines.
+    let masked = !spec.conditions().is_empty() || spec.operands().len() > 2;
     let original = LogicalPlan::Aggregate(agg.clone());
     let names: Vec<String> = (0..agg.group_expr.len())
         .map(|i| format!("{PREFIX}o{i}"))
@@ -1073,7 +1085,9 @@ pub(crate) fn found_fold(plan: &LogicalPlan) -> Option<(&FoldNode, Vec<usize>)> 
     match plan {
         LogicalPlan::Extension(e) => {
             let node = e.node.as_any().downcast_ref::<FoldNode>()?;
-            let usable = node.fold().domain().is_none() && node.found();
+            // A chain of three operands takes no domain yet.
+            let usable =
+                node.fold().domain().is_none() && node.fold().operands().len() == 2 && node.found();
             usable.then(|| (node, (0..=node.fold().outputs().len()).collect()))
         }
         LogicalPlan::SubqueryAlias(a) => found_fold(&a.input),

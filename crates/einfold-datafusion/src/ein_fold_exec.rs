@@ -58,8 +58,9 @@ enum Work {
 /// each, and emits one partition, in batches of the session's batch size. It
 /// runs `einfold_kernels`' algorithms on as many threads as the session's
 /// target partitions: for a fold, the dense algorithm when the keys and rows
-/// allow it, and the discrimination algorithm otherwise; for a pipeline, the
-/// fused algorithm. No result depends on the number of threads or on the
+/// allow it, and the discrimination algorithm otherwise; for a chain of three
+/// operands, the dense algorithm twice, in the cheaper order of contractions,
+/// counted as one dense fold; for a pipeline, the fused algorithm. No result depends on the number of threads or on the
 /// order rows arrive in.
 ///
 /// Like DataFusion's own operators, it reserves the memory it takes from the
@@ -544,7 +545,7 @@ impl ExecutionPlan for EinFoldExec {
         let inputs = self.inputs.clone();
         let schema = self.schema();
         let expected = match &work {
-            Work::Fold(fold) => 2 + usize::from(fold.domain().is_some()),
+            Work::Fold(fold) => fold.operands().len() + usize::from(fold.domain().is_some()),
             Work::Pipeline(_) => 3,
         };
         if inputs.len() != expected {
@@ -552,6 +553,10 @@ impl ExecutionPlan for EinFoldExec {
         }
         if matches!(work, Work::Pipeline(_)) && self.fallback.is_none() {
             return internal_err!("EinFoldExec computes a pipeline only with a fallback");
+        }
+        let chain = matches!(&work, Work::Fold(fold) if fold.operands().len() == 3);
+        if chain && !self.host_on_decline {
+            return internal_err!("EinFoldExec computes a chain only with the host's plan");
         }
         let batch_size = context.session_config().batch_size().max(1);
         let options = Options {
@@ -607,12 +612,14 @@ impl ExecutionPlan for EinFoldExec {
                 Err(e) => return short(e).await,
             };
             let mut read = read.into_iter();
-            // Two operands, then a fold's domain or a pipeline's values, as
-            // checked above.
+            // Two operands, then a fold's domain or a pipeline's values, or a
+            // chain's third operand, as checked above.
             let (Some(a), Some(b), third) = (read.next(), read.next(), read.next()) else {
                 return internal_err!("EinFoldExec read fewer than two inputs");
             };
-            let domain = third.clone().filter(|_| matches!(work, Work::Fold(_)));
+            let domain = third
+                .clone()
+                .filter(|_| matches!(work, Work::Fold(_)) && !chain);
             // Each domain batch's NULL mask: the kernels give one output batch
             // per domain batch, row for row.
             let masks: Option<Vec<ArrayRef>> = null_when
@@ -650,8 +657,18 @@ impl ExecutionPlan for EinFoldExec {
                         }));
                     }
                 };
-                let domain = domain.as_deref().map(|d| Relation::new(&schemas[2], d));
                 let tiles = None;
+                if chain {
+                    let c = third.as_deref().unwrap_or_default();
+                    let c = Relation::new(&schemas[2], c);
+                    let chained =
+                        einfold_kernels::fold_chain(fold, [a, b, c], kernel_out, options)?;
+                    return Ok(chained.map(|batches| {
+                        let algorithm = Algorithm::Dense;
+                        (Folded { algorithm, batches }, tiles)
+                    }));
+                }
+                let domain = domain.as_deref().map(|d| Relation::new(&schemas[2], d));
                 match host_on_decline {
                     true => einfold_kernels::fold_dense(fold, a, b, domain, kernel_out, options)
                         .map(|r| {

@@ -1443,6 +1443,63 @@ async fn products_over_saved_scores_run_dense() {
     }
 }
 
+/// A chain of three matrix products runs as one fold of three operands, by
+/// two dense products, with the host's rows, bit for bit: the values are
+/// small integers, so every sum is exact in either order. Where a factor is
+/// NaN, which could turn into a number in another order of additions, it
+/// runs the host's plan instead.
+#[tokio::test]
+async fn chains_of_three_products_contract_in_order() {
+    use datafusion::physical_plan;
+    let n = 5;
+    let matrix = |name: &str, rows: usize, columns: usize, seed: usize, nan: bool| {
+        let cells: Vec<String> = (0..rows)
+            .flat_map(|r| (0..columns).map(move |c| (r, c)))
+            .map(|(r, c)| {
+                let v = match nan && r == 1 && c == 2 {
+                    true => "'NaN'::DOUBLE".to_string(),
+                    false => format!("{:?}", ((r * 7 + c * 3 + seed) % 9) as f64 - 4.0),
+                };
+                format!("({r}, {c}, {v})")
+            })
+            .collect();
+        format!(
+            "CREATE OR REPLACE TABLE {name} (r BIGINT, c BIGINT, v DOUBLE) AS VALUES {}",
+            cells.join(", ")
+        )
+    };
+    let sql = "SELECT a.r AS i, c.c AS l, SUM(a.v * b.v * c.v) AS v \
+               FROM a JOIN b ON a.c = b.r JOIN c ON b.c = c.r GROUP BY a.r, c.c";
+    for nan in [false, true] {
+        let (plain, ours) = (host(4), einfold(4, true));
+        for ctx in [&plain, &ours] {
+            for statement in [
+                matrix("a", n, n + 1, 0, false),
+                matrix("b", n + 1, n + 2, 1, nan),
+                // A vector: the chain contracts b and c first.
+                matrix("c", n + 2, 1, 2, false),
+            ] {
+                ctx.sql(&statement).await.unwrap().collect().await.unwrap();
+            }
+        }
+        let frame = ours.sql(sql).await.unwrap();
+        let ctx = Arc::new(frame.task_ctx());
+        let plan = frame.create_physical_plan().await.unwrap();
+        let got = physical_plan::collect(Arc::clone(&plan), ctx)
+            .await
+            .unwrap();
+        let shown = DisplayableExecutionPlan::with_metrics(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(shown.contains("a,b * b,c * c,d -> a,d"), "{shown}");
+        let ran = if nan { "host_plans=1" } else { "dense_folds=1" };
+        assert!(shown.contains(ran), "{shown}");
+        let want = plain.sql(sql).await.unwrap().collect().await.unwrap();
+        assert_eq!(rows(&got), rows(&want));
+        assert_eq!(rows(&got).len(), n);
+    }
+}
+
 /// Property: under a small memory pool, einfold runs out of memory no more
 /// often than the host does. Each case runs a random query of the sweep's
 /// spellings with einfold, by its kernels or with the host's plan as

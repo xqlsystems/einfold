@@ -197,10 +197,10 @@ pub enum Values {
     Inexact,
 }
 
-fn value(rng: &mut Rng, values: Values, finite: bool) -> Option<f64> {
+fn value(rng: &mut Rng, values: Values, range: Range) -> Option<f64> {
     match rng.below(100) {
         0..=5 => None,
-        6..=11 if finite => Some(0.0),
+        6..=11 if range == Range::Finite => Some(0.0),
         6..=8 => Some(f64::NAN),
         9..=10 => Some(f64::INFINITY),
         11 => Some(f64::NEG_INFINITY),
@@ -227,11 +227,22 @@ pub struct Rows {
     pub wild: bool,
     /// The chance that `t` doesn't read as a number.
     pub bad_text: f64,
-    /// Whether every value is finite or NULL. The dense algorithm takes an
-    /// operand with missing rows only then, and only where the query fills
-    /// a group no row reached, as ddx's gradients do with `0.0`: a NaN or an
+    /// Which values a table's `v` holds.
+    pub range: Range,
+}
+
+/// Which values a table's `v` may hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Range {
+    /// NULL, NaN, ±inf, `-0.0`, and the values `Values` draws.
+    Any,
+    /// Only finite values or NULL. The dense algorithm takes an operand with
+    /// missing rows only then, and only where the query fills a group no row
+    /// reached with a constant, as the gradients of ddx (an XQL Systems
+    /// project for automatic differentiation of SQL queries,
+    /// <https://github.com/xqlsystems/ddx>) do with `0.0`: a NaN or an
     /// infinity in a product would make such a group NaN, not the fill.
-    pub finite: bool,
+    Finite,
 }
 
 impl Rows {
@@ -242,7 +253,7 @@ impl Rows {
         null_key: 0.0,
         wild: false,
         bad_text: 0.0,
-        finite: false,
+        range: Range::Any,
     };
 
     pub fn draw(rng: &mut Rng) -> Self {
@@ -258,7 +269,7 @@ impl Rows {
             null_key: *rng.pick(&[0.0, 0.0, 0.08]),
             wild: rng.chance(0.15),
             bad_text: 0.0,
-            finite: false,
+            range: Range::Any,
         }
     }
 }
@@ -322,7 +333,7 @@ pub fn table(
         let key = |k: usize, rng: &mut Rng| (!rng.chance(rows.null_key)).then_some(k);
         a.push(key(i, rng));
         b.push(key(j, rng));
-        let val = value(rng, values, rows.finite);
+        let val = value(rng, values, rows.range);
         v.push(val);
         x.push(match extra {
             // Text that reads as the value, or that doesn't read as a number.

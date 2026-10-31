@@ -583,6 +583,22 @@ fn masked(rng: &mut Rng, options: Options, ctes: &mut Vec<String>) -> (String, S
     (template, condition, false)
 }
 
+/// An equality between two of [`three_relations`]' relations, by their
+/// positions: `l`, `r` and `m`.
+struct Edge {
+    left: usize,
+    right: usize,
+    condition: String,
+}
+
+impl Edge {
+    /// Whether this joins `relation` to one of `joined`.
+    fn joins(&self, relation: usize, joined: &[usize]) -> bool {
+        (self.left == relation && joined.contains(&self.right))
+            || (self.right == relation && joined.contains(&self.left))
+    }
+}
+
 /// A `SUM` of a product whose factors read three relations: `l`, `r`, and
 /// `m`, which is `d` under another name, joined on equalities, in any
 /// order. In ddx's gradient steps, attention's softmax-weighted sums have
@@ -647,12 +663,17 @@ fn three_relations(rng: &mut Rng, options: Options, ctes: &mut Vec<String>) -> (
         ])
         .to_string();
     let relations = [source(rng, "l", "l", ctes), source(rng, "r", "r", ctes), m];
-    let mut edges = vec![(0, 1, eq.render("l.b", "r.a"))];
+    let edge = |left, right, condition| Edge {
+        left,
+        right,
+        condition,
+    };
+    let mut edges = vec![edge(0, 1, eq.render("l.b", "r.a"))];
     if joins != 1 {
-        edges.push((2, 0, m_eq.render("m.a", "l.a")));
+        edges.push(edge(2, 0, m_eq.render("m.a", "l.a")));
     }
     if joins != 0 {
-        edges.push((2, 1, m_eq.render("m.b", "r.b")));
+        edges.push(edge(2, 1, m_eq.render("m.b", "r.b")));
     }
     // A group key of `m`'s, equal to `l`'s or `r`'s on every joined row.
     let (mut g0, mut g1) = ("l.a", "r.b");
@@ -674,7 +695,7 @@ fn three_relations(rng: &mut Rng, options: Options, ctes: &mut Vec<String>) -> (
         let mut order = vec![0, 1, 2];
         rng.shuffle(&mut order);
         let from: Vec<&str> = order.iter().map(|&i| relations[i].as_str()).collect();
-        let conditions = edges.iter().map(|(_, _, c)| c.clone()).collect();
+        let conditions = edges.iter().map(|e| e.condition.clone()).collect();
         (from.join(", "), conditions)
     } else {
         // Each relation after the first joins one already joined, on every
@@ -684,18 +705,12 @@ fn three_relations(rng: &mut Rng, options: Options, ctes: &mut Vec<String>) -> (
         while joined.len() < 3 {
             let next: Vec<usize> = (0..3)
                 .filter(|i| !joined.contains(i))
-                .filter(|&i| {
-                    edges.iter().any(|&(a, b, _)| {
-                        (a == i && joined.contains(&b)) || (b == i && joined.contains(&a))
-                    })
-                })
+                .filter(|&i| edges.iter().any(|e| e.joins(i, &joined)))
                 .collect();
             let n = *rng.pick(&next);
             let on: Vec<&str> = (edges.iter())
-                .filter(|&&(a, b, _)| {
-                    (a == n && joined.contains(&b)) || (b == n && joined.contains(&a))
-                })
-                .map(|(_, _, c)| c.as_str())
+                .filter(|e| e.joins(n, &joined))
+                .map(|e| e.condition.as_str())
                 .collect();
             from += &format!(" JOIN {} ON {}", relations[n], on.join(" AND "));
             joined.push(n);

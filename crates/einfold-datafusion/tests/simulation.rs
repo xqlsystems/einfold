@@ -113,7 +113,7 @@ use datafusion::arrow::array::{Array, ArrayRef, Float64Array, RecordBatch};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::prelude::SessionContext;
 
-use data::{KeyType, Rows, Table, Values};
+use data::{KeyType, Range, Rows, Table, Values};
 use einfold_testkit::Rng;
 use queries::{Options, Query, Shape};
 
@@ -240,10 +240,14 @@ fn case(seed: u64) -> Case {
     };
     let ext = |rng: &mut Rng| 1 + rng.below(4);
     let (ei, ej, ek) = (ext(&mut rng), ext(&mut rng), ext(&mut rng));
-    let finite = rng.chance(0.3);
+    let range = if rng.chance(0.3) {
+        Range::Finite
+    } else {
+        Range::Any
+    };
     let rows = |rng: &mut Rng| {
         let mut r = Rows::draw(rng);
-        r.finite = finite;
+        r.range = range;
         if options.fallible {
             // Text that doesn't read as a number, on rows that may not join:
             // a NULL key joins nothing under `=`.
@@ -259,7 +263,7 @@ fn case(seed: u64) -> Case {
     // d repeats keys more often: a domain with duplicate keys is where folds
     // joined back must fall back to the host's plan.
     let mut dr = Rows {
-        finite,
+        range,
         ..Rows::draw(&mut rng)
     };
     if rng.chance(0.5) {
@@ -281,7 +285,7 @@ fn case(seed: u64) -> Case {
             tables.iter().map(|t| twin(t, f64::abs)).collect(),
         ]
     });
-    let holes = finite && (lr.present < 1.0 || rr.present < 1.0);
+    let holes = range == Range::Finite && (lr.present < 1.0 || rr.present < 1.0);
     let query = queries::query(&mut rng, options);
     let join_filter = query.join_filter;
     let threads = [1 + rng.below(6), 1 + rng.below(6), 1 + rng.below(6)];
@@ -996,11 +1000,12 @@ fn check_coverage(tally: &Tally) {
         ("the discrimination algorithm ran", ran(3) > 0),
         ("the host's plan ran", ran(4) > 0),
         ("some cases were deterministic", tally.deterministic > 0),
-        // A few in 1,000 cases: finite values, missing rows, keys the
-        // dense algorithm takes, and a fill.
+        // About 2 in 1,000 cases: finite values, missing rows, keys the
+        // dense algorithm takes, and a fill. So only over 10,000 cases,
+        // where none in all of them is a chance of about e⁻²⁰.
         (
             "the dense algorithm ran a fold from a domain over missing rows",
-            tally.cases < 1000 || tally.dense_with_holes > 0,
+            tally.cases < 10_000 || tally.dense_with_holes > 0,
         ),
         (
             "most cases ran on the host",

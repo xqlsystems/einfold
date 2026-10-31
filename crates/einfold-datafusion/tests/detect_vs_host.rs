@@ -1360,6 +1360,89 @@ async fn masked_gradients_from_their_domain_run_dense() {
     assert!(!shown.contains("host_plans=1"), "{shown}");
 }
 
+/// Attention's output from saved scores, as a ddx gradient step computes
+/// it: `O = softmax(S)·V`, where the causal scores `s` and the softmax's
+/// normalizer `z` are tables, and the weights' maximum a window over `s`.
+/// The product's first factor reads `s` and `z`, so the fold's operands are
+/// `s JOIN z` and `v`, and its dense algorithm computes it.
+#[tokio::test]
+async fn products_over_saved_scores_run_dense() {
+    use datafusion::physical_plan;
+    let (n, features) = (6, 3);
+    let (mut s, mut z, mut v) = (Vec::new(), Vec::new(), Vec::new());
+    for i in 0..n {
+        for j in 0..=i {
+            s.push(format!("({i}, {j}, {:?})", ((i * 5 + j) % 4) as f64 - 1.0));
+        }
+        z.push(format!("({i}, {:?})", (i % 3) as f64 + 1.0));
+        for d in 0..features {
+            v.push(format!("({i}, {d}, {:?})", ((i * 3 + d) % 7) as f64 - 3.0));
+        }
+    }
+    let setup = [
+        format!(
+            "CREATE TABLE s (i BIGINT, j BIGINT, s DOUBLE) AS VALUES {}",
+            s.join(", ")
+        ),
+        format!(
+            "CREATE TABLE z (i BIGINT, z DOUBLE) AS VALUES {}",
+            z.join(", ")
+        ),
+        format!(
+            "CREATE TABLE v (t BIGINT, d BIGINT, x DOUBLE) AS VALUES {}",
+            v.join(", ")
+        ),
+    ];
+    let setup: Vec<&str> = setup.iter().map(String::as_str).collect();
+    let sql = "WITH w AS (SELECT i, j, exp(s / 8.0 - MAX(s / 8.0) OVER (PARTITION BY i)) AS w \
+               FROM s) \
+               SELECT w.i, v.d, SUM(w.w / z.z * v.x) AS x FROM w JOIN v ON w.j = v.t \
+               JOIN z ON w.i = z.i GROUP BY w.i, v.d";
+    // Rounding: `exp` gives the same bits on both, and each sum is of the
+    // same terms; only their order may differ.
+    let (plain, ours) = (host(4), einfold(4, true));
+    for ctx in [&plain, &ours] {
+        for statement in &setup {
+            ctx.sql(statement).await.unwrap().collect().await.unwrap();
+        }
+    }
+    let frame = ours.sql(sql).await.unwrap();
+    let ctx = Arc::new(frame.task_ctx());
+    let plan = frame.create_physical_plan().await.unwrap();
+    let got = physical_plan::collect(Arc::clone(&plan), ctx)
+        .await
+        .unwrap();
+    let shown = DisplayableExecutionPlan::with_metrics(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(shown.contains("dense_folds=1"), "{shown}");
+    assert!(!shown.contains("host_plans=1"), "{shown}");
+    let want = plain.sql(sql).await.unwrap().collect().await.unwrap();
+    let close = |a: &[RecordBatch]| -> Vec<(String, f64)> {
+        let mut out: Vec<(String, f64)> = rows(a)
+            .into_iter()
+            .map(|r| {
+                let (keys, bits) = r.rsplit_once('|').unwrap();
+                (
+                    keys.to_string(),
+                    f64::from_bits(u64::from_str_radix(bits, 16).unwrap()),
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    };
+    let (got, want) = (close(&got), close(&want));
+    assert_eq!(got.len(), want.len());
+    for ((gk, g), (wk, w)) in got.iter().zip(&want) {
+        assert_eq!(gk, wk);
+        assert!(
+            (g - w).abs() <= 1e-12 * w.abs().max(1.0),
+            "{gk}: {g} against {w}"
+        );
+    }
+}
+
 /// Property: under a small memory pool, einfold runs out of memory no more
 /// often than the host does. Each case runs a random query of the sweep's
 /// spellings with einfold, by its kernels or with the host's plan as

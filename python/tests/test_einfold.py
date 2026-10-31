@@ -129,6 +129,33 @@ def test_leaves_other_queries_alone():
     assert found.plans() >= 1 and found.plans_with_einfold() == 0
 
 
+def test_runs_the_sessions_functions_and_datafusions_alike():
+    """DataFusion's own functions, scalar, aggregate and window, and a
+    function of the session's own, give the same rows with einfold, which
+    runs DataFusion's functions in its own library."""
+    from datafusion import udf
+
+    def tables(ctx):
+        _tables(ctx)
+        ctx.register_udf(udf(lambda x: pa.compute.multiply(x, 3.0), [pa.float64()],
+                             pa.float64(), "immutable", name="tripled"))
+
+    off, on, _ = _pair(tables)
+    sql = ("SELECT a.s, exp(a.val) + abs(a.val) + tripled(a.val) AS f, "
+           "ROW_NUMBER() OVER (PARTITION BY a.s ORDER BY a.k) AS r, "
+           "MAX(a.val) OVER (PARTITION BY a.s) - AVG(a.val) OVER (PARTITION BY a.s) AS m "
+           "FROM a WHERE a.k < 3")
+    want, got = off.sql(sql).to_arrow_table(), on.sql(sql).to_arrow_table()
+    key = lambda r: (r[0], r[2])
+    for w, g in zip(sorted(_rows_all(want), key=key), sorted(_rows_all(got), key=key)):
+        assert w[0] == g[0] and w[2] == g[2]
+        assert _same_value(w[1], g[1]) and _same_value(w[3], g[3]), (w, g)
+
+
+def _rows_all(table: pa.Table):
+    return list(zip(*[table.column(i).to_pylist() for i in range(table.num_columns)]))
+
+
 def test_shares_the_session_it_was_installed_in():
     ctx = SessionContext()
     found = _install(ctx)

@@ -1494,6 +1494,17 @@ async fn chains_of_three_products_contract_in_order() {
         assert!(shown.contains("a,b * b,c * c,d -> a,d"), "{shown}");
         let ran = if nan { "host_plans=1" } else { "dense_folds=1" };
         assert!(shown.contains(ran), "{shown}");
+        // Where the chain declines, it runs the product as a fold of two
+        // operands, `a JOIN b` and `c`, rather than the host's plan.
+        fn chain(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> Option<String> {
+            let any: &dyn Any = plan.as_ref();
+            match any.downcast_ref::<EinFoldExec>() {
+                Some(e) => e.fallback().map(|f| f.display_indent().to_string()),
+                None => plan.children().into_iter().find_map(chain),
+            }
+        }
+        let behind = chain(&plan).expect("the chain keeps a plan");
+        assert!(behind.contains("Fold: a,b * a,c -> b,c"), "{behind}");
         let want = plain.sql(sql).await.unwrap().collect().await.unwrap();
         assert_eq!(rows(&got), rows(&want));
         assert_eq!(rows(&got).len(), n);

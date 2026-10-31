@@ -31,7 +31,10 @@
 //! the group's number of terms and `u` the unit roundoff: each result is
 //! within `(n + 2)·u·Σ|terms|` of the exact sum, from `n − 1` roundings of
 //! additions and three of products. And coverage: the chain runs by the dense
-//! algorithm in some cases, and the host's plan in others.
+//! algorithm in some cases, and the plan behind it in others: half the cases
+//! keep the host's plan behind every fold, and half einfold's default, under
+//! which a declined chain runs the product as a fold of two operands, one of
+//! them a join, by einfold's kernels.
 //!
 //! Reproduce a failure with `EINFOLD_SEED=<seed printed>`; search longer with
 //! `EINFOLD_CASES=<n>`.
@@ -252,16 +255,15 @@ fn register(ctx: &SessionContext, name: &str, table: &Table, partitions: usize) 
     ctx.register_table(name, Arc::new(mem)).unwrap();
 }
 
-fn session(threads: usize, einfold: bool) -> SessionContext {
+/// DataFusion, without einfold, or with it under `rule`.
+fn session(threads: usize, rule: Option<DetectFolds>) -> SessionContext {
     let config = SessionConfig::new().with_target_partitions(threads);
     let state = SessionStateBuilder::new()
         .with_default_features()
         .with_config(config);
-    let state = match einfold {
-        true => state.with_query_planner(Arc::new(EinFoldQueryPlanner::detecting(
-            DetectFolds::with_host_fallback(),
-        ))),
-        false => state,
+    let state = match rule {
+        Some(rule) => state.with_query_planner(Arc::new(EinFoldQueryPlanner::detecting(rule))),
+        None => state,
     };
     SessionContext::new_with_state(state.build())
 }
@@ -310,7 +312,17 @@ struct Ran {
 /// One case: `None` if it holds, or what failed.
 async fn check(seed: u64) -> (Option<String>, Ran) {
     let case = draw(seed);
-    let (plain, ours) = (session(case.threads, false), session(case.threads, true));
+    // Half the cases with the host's plan behind every fold, and half with
+    // einfold's default, where a declined chain runs the product as a fold of
+    // two operands by einfold's kernels.
+    let rule = match seed % 2 {
+        0 => DetectFolds::with_host_fallback(),
+        _ => DetectFolds::default(),
+    };
+    let (plain, ours) = (
+        session(case.threads, None),
+        session(case.threads, Some(rule)),
+    );
     for ctx in [&plain, &ours] {
         for (name, t) in ["a", "b", "c"].into_iter().zip(&case.tables) {
             register(ctx, name, t, 1 + (seed as usize % 3));

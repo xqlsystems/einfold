@@ -323,25 +323,42 @@ pub(crate) struct Found {
 /// `agg` as a fold, if it is one: a [`FoldNode`] under a projection giving it
 /// `agg`'s schema. A chain of three products (see [`detect_chains::chain`])
 /// is preferred to the same product as a fold of two operands, one of them a
-/// join. A fold whose join has a condition, a mask, and a chain always keep
-/// the plan they replaced: the dense algorithm computes masks between
-/// outputs, and the discrimination algorithm none, nor chains.
+/// join, and keeps that fold as the plan it runs wherever the chain declines,
+/// or the host's plan where there is none.
 fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
-    let found = match detect_chains::chain(agg)? {
-        Some(chain) => Some(chain),
-        None => analyze(agg, false)?,
+    let original = LogicalPlan::Aggregate(agg.clone());
+    let pair = match analyze(agg, false)? {
+        Some(found) => node_for(agg, found, original.clone(), fallback)?,
+        None => None,
     };
-    let Some(Found {
+    let Some(chain) = detect_chains::chain(agg)? else {
+        return Ok(pair);
+    };
+    // The chain runs only by the dense algorithm, so it always needs a plan
+    // for where that declines.
+    let behind = pair.clone().unwrap_or(original);
+    match node_for(agg, chain, behind, Fallback::HostPlan)? {
+        Some(node) => Ok(Some(node)),
+        None => Ok(pair),
+    }
+}
+
+/// `found`, a fold of `agg`, as its node under a projection giving it `agg`'s
+/// schema, keeping `replaced`, a plan with `agg`'s columns, for where memory
+/// runs short, and, with [`Fallback::HostPlan`] or a mask, wherever the dense
+/// algorithm declines: the dense algorithm computes masks between outputs,
+/// and the discrimination algorithm none.
+fn node_for(
+    agg: &Aggregate,
+    found: Found,
+    replaced: LogicalPlan,
+    fallback: Fallback,
+) -> Result<Option<LogicalPlan>> {
+    let Found {
         fold: spec,
         operands: plans,
-    }) = found
-    else {
-        return Ok(None);
-    };
-    // A chain of three operands runs only by the dense algorithm, and needs
-    // the host's plan wherever that declines.
-    let masked = !spec.conditions().is_empty() || spec.operands().len() > 2;
-    let original = LogicalPlan::Aggregate(agg.clone());
+    } = found;
+    let masked = !spec.conditions().is_empty();
     let names: Vec<String> = (0..agg.group_expr.len())
         .map(|i| format!("{PREFIX}o{i}"))
         .chain([format!("{PREFIX}v")])
@@ -350,8 +367,8 @@ fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
         return Ok(None);
     };
     let node = match (fallback, masked) {
-        (Fallback::HostPlan, _) | (_, true) => node.with_fallback(original),
-        (Fallback::Kernels, false) => node.with_memory_fallback(original),
+        (Fallback::HostPlan, _) | (_, true) => node.with_fallback(replaced),
+        (Fallback::Kernels, false) => node.with_memory_fallback(replaced),
     }
     .into_plan();
     // Give the node the aggregate's schema: its names, qualifiers, types

@@ -147,6 +147,7 @@ def test_runs_the_sessions_functions_and_datafusions_alike():
            "MAX(a.val) OVER (PARTITION BY a.s) - AVG(a.val) OVER (PARTITION BY a.s) AS m "
            "FROM a WHERE a.k < 3")
     want, got = off.sql(sql).to_arrow_table(), on.sql(sql).to_arrow_table()
+    assert want.num_rows == got.num_rows > 0
     key = lambda r: (r[0], r[2])
     for w, g in zip(sorted(_rows_all(want), key=key), sorted(_rows_all(got), key=key)):
         assert w[0] == g[0] and w[2] == g[2]

@@ -88,8 +88,15 @@ impl Builtins {
                     .collect()
             };
             Builtins {
+                // Not those whose result depends on the session's
+                // configuration, such as `to_timestamp`'s time zone: the
+                // session's copy is configured, and these aren't.
                 scalar: by_name(
-                    datafusion::functions::all_default_functions(),
+                    (datafusion::functions::all_default_functions().into_iter())
+                        .filter(|f| {
+                            (f.inner().with_updated_config(&ConfigOptions::default())).is_none()
+                        })
+                        .collect(),
                     |f: &ScalarUDF| names(f.name(), f.aliases()),
                 ),
                 aggregate: by_name(
@@ -132,7 +139,9 @@ enum Relinked {
 /// unless it registers others, which this would then replace. Through the
 /// FFI, a foreign function carries only its name, its aliases and a
 /// signature, so a function registered as `exp` can't be told from
-/// DataFusion's.
+/// DataFusion's. Functions configured by the session, such as
+/// `to_timestamp` in its time zone, are left as they are. With
+/// [`Relinked::Builtins`], it fails if any node's schema changes.
 fn relink(plan: LogicalPlan, which: Relinked) -> Result<LogicalPlan> {
     let builtins = Builtins::get();
     let wanted = |name: &str| which == Relinked::Builtins || matches!(name, "sum" | "max");
@@ -144,8 +153,12 @@ fn relink(plan: LogicalPlan, which: Relinked) -> Result<LogicalPlan> {
         let differs = implementation(f.inner().as_ref()) != implementation(own.inner().as_ref());
         differs.then(|| Arc::clone(own))
     };
+    // Whether a node's schema changed: a function of the session's that
+    // returns another type than DataFusion's own of its name.
+    let changed = std::cell::Cell::new(false);
     let relinked = plan.transform_up(|node| {
-        node.map_expressions(|expression| {
+        let before = Arc::clone(node.schema());
+        let node = node.map_expressions(|expression| {
             expression.transform(|expression| match expression {
                 Expr::ScalarFunction(mut call) if which == Relinked::Builtins => {
                     let own = builtins.scalar.get(call.func.name()).filter(|own| {
@@ -192,22 +205,31 @@ fn relink(plan: LogicalPlan, which: Relinked) -> Result<LogicalPlan> {
                 }
                 other => Ok(Transformed::no(other)),
             })
-        })
+        })?;
+        // Each node's schema, from its expressions and its inputs', which
+        // were recomputed before it.
+        if !node.transformed {
+            return Ok(node);
+        }
+        let recomputed = node.data.recompute_schema()?;
+        changed.set(changed.get() || recomputed.schema() != &before);
+        Ok(Transformed::yes(recomputed))
     })?;
-    // Expressions that changed type change their columns' names, which
-    // DataFusion derives from the expression: recompute the schemas.
-    relinked.data.recompute_schema()
+    if which == Relinked::Builtins && changed.get() {
+        return datafusion::common::plan_err!("relinking changed a schema");
+    }
+    Ok(relinked.data)
 }
 
 /// `plan` relinked (see [`relink`]): every function DataFusion has its own
-/// of, where that gives the plan exactly the schema it had, names, types
-/// and nullability; otherwise only `SUM` and `MAX`, as detection needs.
+/// of, where that leaves every node's schema exactly as it was, names,
+/// types and nullability; otherwise, or if relinking them fails, only `SUM`
+/// and `MAX`, as detection needs.
 fn relinked(plan: &LogicalPlan) -> Result<LogicalPlan> {
-    let all = relink(plan.clone(), Relinked::Builtins)?;
-    if all.schema().as_ref() == plan.schema().as_ref() {
-        return Ok(all);
+    match relink(plan.clone(), Relinked::Builtins) {
+        Ok(all) => Ok(all),
+        Err(_) => relink(plan.clone(), Relinked::SumAndMax),
     }
-    relink(plan.clone(), Relinked::SumAndMax)
 }
 
 /// `plan`, made ready to be explained here if it is an `EXPLAIN`. One

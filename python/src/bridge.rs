@@ -315,6 +315,7 @@ impl QueryPlanner for Bridge {
             inner: session,
             rules: PhysicalOptimizer::new().rules,
             table_options: session.table_options().clone(),
+            execution_props: with_configuration(session),
         };
         let planner =
             DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(EinFoldPlanner)]);
@@ -415,6 +416,18 @@ struct LocalRules<'a> {
     inner: &'a dyn Session,
     rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
     table_options: TableOptions,
+    /// The session's, with its configuration (see [`with_configuration`]).
+    execution_props: ExecutionProps,
+}
+
+/// `session`'s execution properties, with its configuration. A session that
+/// crossed the FFI has props without one, and the physical planner then gives
+/// every function call DataFusion's default configuration: `to_unixtime`
+/// would read text in UTC, not in the session's time zone.
+fn with_configuration(session: &dyn Session) -> ExecutionProps {
+    let mut props = session.execution_props().clone();
+    props.config_options = Some(Arc::new(session.config_options().clone()));
+    props
 }
 
 #[async_trait]
@@ -465,7 +478,7 @@ impl Session for LocalRules<'_> {
         self.inner.runtime_env()
     }
     fn execution_props(&self) -> &ExecutionProps {
-        self.inner.execution_props()
+        &self.execution_props
     }
     fn as_any(&self) -> &dyn Any {
         self.inner.as_any()

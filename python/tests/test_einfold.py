@@ -133,11 +133,12 @@ def test_runs_the_sessions_functions_and_datafusions_alike():
     """DataFusion's own functions, scalar, aggregate and window, and a
     function of the session's own, give the same rows with einfold, which
     runs DataFusion's functions in its own library."""
+    import pyarrow.compute as pc
     from datafusion import udf
 
     def tables(ctx):
         _tables(ctx)
-        ctx.register_udf(udf(lambda x: pa.compute.multiply(x, 3.0), [pa.float64()],
+        ctx.register_udf(udf(lambda x: pc.multiply(x, 3.0), [pa.float64()],
                              pa.float64(), "immutable", name="tripled"))
 
     off, on, _ = _pair(tables)

@@ -18,8 +18,8 @@ the plans. Two settings record more:
 
 * ``S31_ANALYZE=1``: each step's ``EXPLAIN ANALYZE``, which runs it again;
 * ``S31_DUMP=1``: each step's rows as Parquet, the demo's own tables as it
-  first loads them, and each step's SQL, for ``src/main.rs`` to run again
-  from Rust.
+  first loads them, and each step's SQL and Substrait plan, to run again
+  from Rust (``src/main.rs``) or from Python.
 """
 
 from __future__ import annotations
@@ -121,6 +121,9 @@ def _record(backend, name: str, plan: bytes, run) -> None:
         except Exception as e:  # noqa: BLE001 - noted, not fatal
             (out / f"{index:04d}.sql").write_text(f"-- to_sql failed: {e}")
         pq.write_table(table, out / f"{name}.parquet")
+        # The step's plan as ddxdb hands it to the backend, to run again
+        # from Python (`ddxdb.ad._dataframe`).
+        (out / f"{index:04d}.substrait").write_bytes(plan)
     entry = {
         "index": index,
         "name": name,

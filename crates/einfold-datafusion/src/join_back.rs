@@ -27,7 +27,9 @@
 //! where no group matched. The node computes `e`'s tests as a column of its
 //! domain, and makes the value NULL where one holds, so that the host's plan,
 //! when it runs instead, isn't given them a second time. `e` is NULL where `f`'s value is, so a missing
-//! group and a group with a NULL sum agree. Whether the keys are unique is
+//! group and a group with a NULL sum agree. Where the projection fills a
+//! missing sum with a constant, as ddx's does with `0.0`, the node computes
+//! the constant there instead, as the fold from a domain does. Whether the keys are unique is
 //! known only when the query runs, so the node checks it then, and runs the
 //! host's own plan where they aren't.
 
@@ -317,7 +319,10 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
         fold.aggregate().clone(),
         Some(Domain {
             carry: (0..width).map(ColumnIndex).collect(),
-            missing: None,
+            // Where `p` fills a missing sum, the node computes the fill, if
+            // `0.0 +` below keeps it: it turns `-0.0` into `0.0`.
+            missing: detect_folds::fill_default(&p.expr, &sum)
+                .filter(|c| (0.0 + c).to_bits() == c.to_bits()),
         }),
     )
     // The inner fold's conditions, such as a causal mask, hold here too.
@@ -356,6 +361,7 @@ pub(crate) fn joined_back(p: &Projection) -> Result<Option<LogicalPlan>> {
         return Ok(None);
     };
     let new = new
+        .with_nullable_value()?
         .with_fallback(original.clone())
         .requiring_unique_domain();
     let new = match null_when {

@@ -25,7 +25,12 @@
 //!    only `d`'s columns and `f`'s sum. The fold gets `d` as its domain, the
 //!    relation whose rows its output has. This is how ddx, an XQL Systems
 //!    project for automatic differentiation of SQL queries, gives every row
-//!    of a table its gradient; ddx calls these rows its "fill".
+//!    of a table its gradient; ddx calls these rows its "fill". Where the
+//!    projection reads the sum only through `COALESCE(sum, c)` or ddx's
+//!    `CASE … WHEN sum IS NULL THEN c ELSE sum END`, the fold computes `c`
+//!    for a group no row reached, as the projection would make of it (see
+//!    [`fill_default`]), so the dense algorithm can take operands with
+//!    missing rows, such as a causal mask's triangle.
 //!
 //! The rule runs after DataFusion's own rules, so filters are already pushed
 //! below the join, and keeps every plan's schema exactly: names, qualifiers,
@@ -901,6 +906,85 @@ pub(crate) fn found_fold(plan: &LogicalPlan) -> Option<(&FoldNode, Vec<usize>)> 
     }
 }
 
+/// The value `exprs` give a fold's sum `value` where it is NULL, if each of
+/// their reads of `value` is a *fill* that gives one `DOUBLE` constant `c`
+/// there and `value` everywhere else:
+///
+/// - `COALESCE(value, c)`;
+/// - `CASE … WHEN value IS NULL THEN c ELSE value END`, or `CASE … WHEN value
+///   IS NOT NULL THEN value ELSE c END`, as DataFusion writes `COALESCE`,
+///   where the test of `value` is the last and no earlier branch reads it.
+///
+/// ddx writes the first form of `CASE` for each gradient, to give every row
+/// of a table its gradient, 0 where none reached it. A fold from a domain can
+/// then compute `c` where no row reached a group, or where every product of
+/// one was NULL, rather than NULL (the domain's `missing`): each fill gives
+/// `c` for `c` as it did for NULL, and the dense algorithm can take operands
+/// with missing rows. `None` if any read of `value` is anything else, or if
+/// two fills differ.
+pub(crate) fn fill_default(exprs: &[Expr], value: &Column) -> Option<f64> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::expr::{Case, ScalarFunction};
+    let is_value = |e: &Expr| matches!(e, Expr::Column(c) if c == value);
+    let constant = |e: &Expr| match e {
+        Expr::Literal(ScalarValue::Float64(Some(c)), _) => Some(*c),
+        _ => None,
+    };
+    let reads = |e: &Expr| e.column_refs().contains(value);
+    // The constant `e` gives where `value` is NULL, if `e` is a fill.
+    let fill = |e: &Expr| -> Option<f64> {
+        match e {
+            Expr::ScalarFunction(ScalarFunction { func, args })
+                if func.name() == "coalesce" && args.len() == 2 && is_value(&args[0]) =>
+            {
+                constant(&args[1])
+            }
+            Expr::Case(Case {
+                expr: None,
+                when_then_expr,
+                else_expr: Some(otherwise),
+            }) => {
+                let (last, earlier) = when_then_expr.split_last()?;
+                if earlier.iter().any(|(w, t)| reads(w) || reads(t)) {
+                    return None;
+                }
+                match (last.0.as_ref(), last.1.as_ref(), otherwise.as_ref()) {
+                    (Expr::IsNull(v), then, other) if is_value(v) && is_value(other) => {
+                        constant(then)
+                    }
+                    (Expr::IsNotNull(v), then, other) if is_value(v) && is_value(then) => {
+                        constant(other)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    };
+    let mut found: Option<f64> = None;
+    let mut ok = true;
+    for e in exprs {
+        let visited = e.apply(|x| {
+            if let Some(c) = fill(x) {
+                // Fills of one value, to its last bit: `-0.0` isn't `0.0`.
+                ok &= found.is_none_or(|f| f.to_bits() == c.to_bits());
+                found = Some(c);
+                return Ok(TreeNodeRecursion::Jump);
+            }
+            ok &= !is_value(x);
+            Ok(if ok {
+                TreeNodeRecursion::Continue
+            } else {
+                TreeNodeRecursion::Stop
+            })
+        });
+        if visited.is_err() || !ok {
+            return None;
+        }
+    }
+    found
+}
+
 /// `p` over a left join from a relation onto a fold, with the relation as the
 /// fold's domain, if that is what `p` is.
 fn from_domain(p: &Projection, fallback: Fallback) -> Result<Option<LogicalPlan>> {
@@ -971,7 +1055,8 @@ fn from_domain(p: &Projection, fallback: Fallback) -> Result<Option<LogicalPlan>
     let width = domain.schema().fields().len();
     let spec = Domain {
         carry: (0..width).map(ColumnIndex).collect(),
-        missing: None,
+        // Where `p` fills a missing sum, the node computes the fill.
+        missing: fill_default(&p.expr, &value),
     };
     // Each output, now matched with its domain column.
     let outputs = fold
@@ -1019,6 +1104,9 @@ fn from_domain(p: &Projection, fallback: Fallback) -> Result<Option<LogicalPlan>
         Some(domain.as_ref().clone()),
         names.clone(),
     ) else {
+        return Ok(None);
+    };
+    let Ok(new) = new.with_nullable_value() else {
         return Ok(None);
     };
     // A mask needs the host's plan where the dense algorithm declines, as

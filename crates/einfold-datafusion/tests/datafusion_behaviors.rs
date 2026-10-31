@@ -27,6 +27,12 @@
 //! join on a float key and another key can drop a match when one side holds
 //! both `-0.0` and `0.0`.
 //!
+//! **NaN's sign in comparisons** (einfold issue #128). A NaN with its sign
+//! bit clear is greater than every number, and one with it set is less, as
+//! IEEE 754's total order has them. Arithmetic such as `inf - inf` makes the
+//! second kind, so whether a sum that is NaN passes `> 1.0` depends on the
+//! order of its additions.
+//!
 //! **Sort-merge join filters** (apache/datafusion#24414, fixed after 55.2).
 //! A sort-merge join's filter can read the wrong columns once a projection is
 //! pushed into the join.
@@ -347,4 +353,22 @@ async fn sort_merge_join_filter_reads_stale_columns() {
         0,
         "fixed: the right answer is 1 row"
     );
+}
+
+#[tokio::test]
+async fn nan_compares_by_its_sign() {
+    let ctx = SessionContext::new();
+    let batches = run(
+        &ctx,
+        "SELECT x > 1.0, x < 1.0 FROM (VALUES (CAST('NaN' AS DOUBLE), 0), \
+         (CAST('inf' AS DOUBLE) - CAST('inf' AS DOUBLE), 1)) t(x, i) ORDER BY i",
+    )
+    .await;
+    let column = |c: usize| -> Vec<bool> {
+        let values = batches[0].column(c).as_boolean();
+        (0..values.len()).map(|r| values.value(r)).collect()
+    };
+    // `NaN` is above 1.0, and the NaN that `inf - inf` makes is below it.
+    assert_eq!(column(0), [true, false]);
+    assert_eq!(column(1), [false, true]);
 }

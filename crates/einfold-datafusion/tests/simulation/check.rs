@@ -259,9 +259,17 @@ pub fn rows(batches: &[RecordBatch]) -> Vec<Row> {
                 })
                 .collect()
         };
-        (&x.keys, class(x))
-            .partial_cmp(&(&y.keys, class(y)))
-            .expect("no NaN compared")
+        // By `total_cmp`, which orders -0.0 before 0.0: compared as equal,
+        // they would stay in arrival order, and pair with the wrong row.
+        let values = |a: &[(u8, f64)], b: &[(u8, f64)]| {
+            (a.iter().zip(b))
+                .map(|(x, y)| x.0.cmp(&y.0).then(x.1.total_cmp(&y.1)))
+                .find(|o| o.is_ne())
+                .unwrap_or(a.len().cmp(&b.len()))
+        };
+        x.keys
+            .cmp(&y.keys)
+            .then_with(|| values(&class(x), &class(y)))
     });
     out
 }

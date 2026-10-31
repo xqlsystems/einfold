@@ -191,7 +191,7 @@ def _same(a, b) -> bool:
 
 
 # Differences with an open issue: (time zone, function).
-_KNOWN = {("+05:00", "to_unixtime")}  # einfold#136
+_KNOWN: set = set()
 
 
 @pytest.mark.parametrize("time_zone", [None, "+05:00"])
@@ -210,11 +210,10 @@ def test_builtins_answer_alike(time_zone):
     assert len(answered) >= 120, sorted(answered)
 
 
-@pytest.mark.xfail(strict=True, reason="einfold#136: functions planned in einfold "
-                   "run with DataFusion's default configuration (einfold#137)")
-def test_to_unixtime_ignores_the_sessions_time_zone():
-    """Pins einfold#136, and through it datafusion-ffi's gap (einfold#137):
-    fails once `to_unixtime` reads text in the session's time zone."""
+def test_to_unixtime_reads_the_sessions_time_zone():
+    """`to_unixtime` reads text without an offset in the session's time zone,
+    with einfold as without (einfold#136): einfold plans functions with the
+    session's configuration, which datafusion-ffi's session lacks (einfold#137)."""
     sql = "SELECT t.k, to_unixtime(t.s_time) AS x FROM t ORDER BY t.k"
     off, on = _session(False, "+05:00"), _session(True, "+05:00")
     assert _same(_answer(off, sql), _answer(on, sql))

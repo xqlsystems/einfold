@@ -215,15 +215,18 @@ pub(crate) fn movable(e: &Expr, schema: &DFSchema) -> bool {
     use datafusion::logical_expr::ExprSchemable;
     let ty = |e: &Expr| e.get_type(schema).ok();
     let arithmetic = |e: &Expr| ty(e).is_some_and(|t| t.is_integer() || t.is_floating());
+    let float = |e: &Expr| ty(e).is_some_and(|t| t.is_floating());
     let fails = |e: &Expr| {
         let ok = match e {
             Expr::Alias(_) | Expr::Column(_) | Expr::Literal(..) => true,
             // Integer arithmetic wraps in DataFusion, and float arithmetic
-            // gives ±inf or NaN. `/` and `%` can fail on integers.
+            // gives ±inf or NaN. `/` and `%` fail on integers, by zero, but
+            // not on floats: `1.0 / 0.0` is inf, and `1.0 % 0.0` NaN.
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
                 Operator::Plus | Operator::Minus | Operator::Multiply => {
                     arithmetic(left) && arithmetic(right)
                 }
+                Operator::Divide | Operator::Modulo => float(left) && float(right),
                 Operator::Eq
                 | Operator::NotEq
                 | Operator::Lt
@@ -377,7 +380,191 @@ pub(crate) fn analyze(agg: &Aggregate, expressions: bool) -> Result<Option<Found
     let groups = (agg.group_expr.iter())
         .map(|g| resolve(g, &projections))
         .collect::<Result<Vec<_>>>()?;
-    fold_over(join, &groups, &resolve(&arg, &projections)?, expressions)
+    let value = resolve(&arg, &projections)?;
+    if let Some(found) = fold_over(join, &groups, &value, expressions)? {
+        return Ok(Some(found));
+    }
+    match regrouped(below, &groups, &value)? {
+        Some((join, groups, value)) => fold_over(&join, &groups, &value, false),
+        None => Ok(None),
+    }
+}
+
+/// `plan`, an inner equi-join of three or more relations, joined again as
+/// two operands: the relations each factor of the product `value` reads,
+/// with each relation neither reads joined to the one it is joined with.
+/// Returns that join, and `groups` and `value` as expressions of its
+/// columns. Inner joins on equalities may be joined in any order, so the
+/// result has the same rows.
+///
+/// This is how a product whose factors read several tables is a fold. In a
+/// gradient step that ddx writes, attention's output from saved scores is
+///
+/// ```sql
+/// SELECT s.i, v.d, SUM(exp(s.s - <s's largest of i>) / z.z * v.x)
+/// FROM s JOIN v ON s.j = v.t JOIN z ON s.i = z.i GROUP BY s.i, v.d
+/// ```
+///
+/// whose first factor reads `s` and `z`: the fold of `s JOIN z` and `v`.
+/// `None` where the factors read one relation in common, or a relation joins
+/// neither or both of them, or one side's relations aren't joined together.
+fn regrouped(
+    plan: &LogicalPlan,
+    groups: &[Expr],
+    value: &Expr,
+) -> Result<Option<(Join, Vec<Expr>, Expr)>> {
+    let (mut leaves, mut on) = (Vec::new(), Vec::new());
+    if !detect_pipelines::leaves(plan, &mut leaves, &mut on)? || leaves.len() < 3 {
+        return Ok(None);
+    }
+    // Every column must name one relation, or a factor's would be ambiguous.
+    let columns: Vec<Column> = leaves.iter().flat_map(|l| l.schema().columns()).collect();
+    if (1..columns.len()).any(|i| columns[..i].contains(&columns[i])) {
+        return Ok(None);
+    }
+    let leaf_of = |c: &Column| leaves.iter().position(|l| l.schema().has_column(c));
+    // The relations an expression reads, each once.
+    let read = |e: &Expr| -> Option<Vec<usize>> {
+        let mut read = (e.column_refs().into_iter())
+            .map(leaf_of)
+            .collect::<Option<Vec<usize>>>()?;
+        read.sort_unstable();
+        read.dedup();
+        Some(read)
+    };
+    let value = detect_pipelines::trace(plan, value)?;
+    let groups = (groups.iter())
+        .map(|g| detect_pipelines::trace(plan, g))
+        .collect::<Result<Vec<_>>>()?;
+    let Expr::BinaryExpr(BinaryExpr {
+        left,
+        op: Operator::Multiply,
+        right,
+    }) = &value
+    else {
+        return Ok(None);
+    };
+    // Each relation's side: the factor that reads it.
+    let mut side: Vec<Option<usize>> = vec![None; leaves.len()];
+    for (s, factor) in [left, right].into_iter().enumerate() {
+        let Some(read) = read(factor) else {
+            return Ok(None);
+        };
+        for l in read {
+            if side[l].replace(s).is_some_and(|other| other != s) {
+                return Ok(None);
+            }
+        }
+    }
+    if !side.contains(&Some(0)) || !side.contains(&Some(1)) {
+        return Ok(None);
+    }
+    // Each equality, as the relation of each of its sides.
+    let edges = (on.iter())
+        .map(|(l, r)| match (read(l)?.as_slice(), read(r)?.as_slice()) {
+            (&[a], &[b]) if a != b => Some((a, b)),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(edges) = edges else {
+        return Ok(None);
+    };
+    // A relation no factor reads joins the side it is joined with, once
+    // that side is known; one joined with both sides, or neither, declines.
+    loop {
+        let mut changed = false;
+        for l in 0..leaves.len() {
+            if side[l].is_some() {
+                continue;
+            }
+            let mut joined = (edges.iter())
+                .filter_map(|&(a, b)| match (a == l, b == l) {
+                    (true, _) => side[b],
+                    (_, true) => side[a],
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            joined.sort_unstable();
+            joined.dedup();
+            match joined.as_slice() {
+                [s] => {
+                    side[l] = Some(*s);
+                    changed = true;
+                }
+                [] => {}
+                _ => return Ok(None),
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let Some(side) = side.into_iter().collect::<Option<Vec<usize>>>() else {
+        return Ok(None);
+    };
+    // Each side's relations, joined in order on the equalities between
+    // them. Every relation must join one already joined, so that no side
+    // is a cross product.
+    let mut operands = Vec::new();
+    for s in 0..2 {
+        let members: Vec<usize> = (0..leaves.len()).filter(|&l| side[l] == s).collect();
+        let mut joined = vec![members[0]];
+        let mut operand = leaves[members[0]].clone();
+        while joined.len() < members.len() {
+            let next = members.iter().copied().find(|&m| {
+                !joined.contains(&m)
+                    && (edges.iter()).any(|&(a, b)| {
+                        (a == m && joined.contains(&b)) || (b == m && joined.contains(&a))
+                    })
+            });
+            let Some(next) = next else {
+                return Ok(None);
+            };
+            let keys: Vec<(Expr, Expr)> = (edges.iter().zip(&on))
+                .filter_map(|(&(a, b), (l, r))| match (a == next, b == next) {
+                    (true, _) if joined.contains(&b) => Some((r.clone(), l.clone())),
+                    (_, true) if joined.contains(&a) => Some((l.clone(), r.clone())),
+                    _ => None,
+                })
+                .collect();
+            let join = Join::try_new(
+                Arc::new(operand),
+                Arc::new(leaves[next].clone()),
+                keys,
+                None,
+                JoinType::Inner,
+                datafusion::logical_expr::JoinConstraint::On,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?;
+            operand = LogicalPlan::Join(join);
+            joined.push(next);
+        }
+        operands.push(operand);
+    }
+    // The equalities between the sides are the fold's keys.
+    let keys: Vec<(Expr, Expr)> = (edges.iter().zip(&on))
+        .filter(|(&(a, b), _)| side[a] != side[b])
+        .map(|(&(a, _), (l, r))| match side[a] {
+            0 => (l.clone(), r.clone()),
+            _ => (r.clone(), l.clone()),
+        })
+        .collect();
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    let [a, b]: [LogicalPlan; 2] = operands.try_into().expect("two sides");
+    let join = Join::try_new(
+        Arc::new(a),
+        Arc::new(b),
+        keys,
+        None,
+        JoinType::Inner,
+        datafusion::logical_expr::JoinConstraint::On,
+        NullEquality::NullEqualsNothing,
+        false,
+    )?;
+    Ok(Some((join, groups, value)))
 }
 
 /// The `SUM` of `value` over `join`, an inner join, grouped by `groups`, as

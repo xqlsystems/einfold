@@ -74,7 +74,7 @@ fn strip(plan: &LogicalPlan) -> &LogicalPlan {
 /// `e`, an expression over `plan`'s columns, as an expression over the
 /// columns of the relations under `plan`'s projections and inner joins: its
 /// leaves.
-fn trace(plan: &LogicalPlan, e: &Expr) -> Result<Expr> {
+pub(crate) fn trace(plan: &LogicalPlan, e: &Expr) -> Result<Expr> {
     use datafusion::common::tree_node::{Transformed, TreeNode};
     let e = e.clone().unalias();
     match plan {
@@ -99,7 +99,7 @@ fn trace(plan: &LogicalPlan, e: &Expr) -> Result<Expr> {
 
 /// The leaves under `plan`'s projections and inner joins with no condition
 /// but equalities, and those joins' equalities, traced to the leaves.
-fn leaves<'a>(
+pub(crate) fn leaves<'a>(
     plan: &'a LogicalPlan,
     out: &mut Vec<&'a LogicalPlan>,
     on: &mut Vec<(Expr, Expr)>,

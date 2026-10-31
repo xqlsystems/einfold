@@ -13,7 +13,8 @@
 //! factors that are expressions (some of which can fail on rows the join
 //! drops), keys of eight types (see `simulation/data.rs`), domains with
 //! duplicate keys, the regroup's `CASE` testing columns other than the keys,
-//! two folds under `UNION ALL`, a fold of a fold, and masked folds.
+//! fills of a missing sum with constants, two folds under `UNION ALL`, a fold
+//! of a fold, masked folds, and products over three relations.
 //!
 //! # Properties
 //!
@@ -43,8 +44,8 @@
 //!   (ill-conditioned sums), each value is within float summation's bound
 //!   of the host's, `2·(n − 1)·u·Σ|terms|`, where the host computes `n` and
 //!   `Σ|terms|` by running the same query over twin tables holding 1.0 and
-//!   `|v|`; this is why inexact cases use only factors whose magnitude is a
-//!   fixed multiple of `|v|`.
+//!   `|v|`; this is why inexact cases use only factors whose magnitude
+//!   follows from `|v|` alone: a multiple of it, or its inverse.
 //! - **`[rerun]`** running the same physical plan again gives the same rows,
 //!   as ddx does when it runs a prepared program for each training step.
 //! - **`[threads]`** where einfold computed every sum itself (no host plan ran
@@ -112,7 +113,7 @@ use datafusion::arrow::array::{Array, ArrayRef, Float64Array, RecordBatch};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::prelude::SessionContext;
 
-use data::{KeyType, Rows, Table, Values};
+use data::{KeyType, Range, Rows, Table, Values};
 use einfold_testkit::Rng;
 use queries::{Options, Query, Shape};
 
@@ -196,6 +197,10 @@ struct Case {
     batch_sizes: [usize; 3],
     fallback: bool,
     settings: check::Settings,
+    /// Whether every value is finite or NULL and some rows of `l` or `r`
+    /// are missing: what a fold from a domain needs to run dense over
+    /// holes.
+    holes: bool,
 }
 
 fn case(seed: u64) -> Case {
@@ -235,22 +240,39 @@ fn case(seed: u64) -> Case {
     };
     let ext = |rng: &mut Rng| 1 + rng.below(4);
     let (ei, ej, ek) = (ext(&mut rng), ext(&mut rng), ext(&mut rng));
+    let range = if rng.chance(0.3) {
+        Range::Finite
+    } else {
+        Range::Any
+    };
     let rows = |rng: &mut Rng| {
         let mut r = Rows::draw(rng);
+        r.range = range;
         if options.fallible {
             // Text that doesn't read as a number, on rows that may not join:
             // a NULL key joins nothing under `=`.
             r.bad_text = 0.15;
             r.null_key = r.null_key.max(0.2);
         }
+        if rng.chance(0.2) {
+            r.null_key = r.null_key.max(0.15);
+        }
         r
     };
     let (lr, rr) = (rows(&mut rng), rows(&mut rng));
     // d repeats keys more often: a domain with duplicate keys is where folds
     // joined back must fall back to the host's plan.
-    let mut dr = Rows::draw(&mut rng);
+    let mut dr = Rows {
+        range,
+        ..Rows::draw(&mut rng)
+    };
     if rng.chance(0.5) {
         dr.duplicate = 0.25;
+    }
+    // And has NULL keys more often: joined to `l` or `r` as a third
+    // relation, a NULL key of each must join nothing.
+    if rng.chance(0.4) {
+        dr.null_key = dr.null_key.max(0.15);
     }
     let tables = vec![
         data::table(&mut rng, "l", (ti, ei), (tj, ej), lr, values, "t"),
@@ -263,6 +285,7 @@ fn case(seed: u64) -> Case {
             tables.iter().map(|t| twin(t, f64::abs)).collect(),
         ]
     });
+    let holes = range == Range::Finite && (lr.present < 1.0 || rr.present < 1.0);
     let query = queries::query(&mut rng, options);
     let join_filter = query.join_filter;
     let threads = [1 + rng.below(6), 1 + rng.below(6), 1 + rng.below(6)];
@@ -275,6 +298,7 @@ fn case(seed: u64) -> Case {
         query,
         threads,
         batch_sizes,
+        holes,
         fallback: rng.chance(0.8),
         settings: check::Settings {
             sort_merge: rng.chance(0.2)
@@ -338,6 +362,10 @@ struct Outcome {
     look_alike: bool,
     memory: Memory,
     pooled: bool,
+    /// Whether the dense algorithm ran a fold from a domain over operands
+    /// with missing rows, as it can only where the query fills a group no
+    /// row reached.
+    dense_with_holes: bool,
 }
 
 /// The tallies of a run.
@@ -353,6 +381,7 @@ struct Tally {
     /// only the host, ran out of memory.
     pooled: usize,
     out_of_memory: [usize; 2],
+    dense_with_holes: usize,
     /// Per shape: cases, cases where einfold ran a fold, and the routes.
     by_shape: BTreeMap<String, [usize; 6]>,
     deterministic: usize,
@@ -369,6 +398,7 @@ impl Tally {
         self.out_of_memory[0] += usize::from(o.memory == Memory::EinfoldOnly);
         self.out_of_memory[1] += usize::from(o.memory == Memory::HostOnly);
         self.deterministic += usize::from(o.deterministic);
+        self.dense_with_holes += usize::from(o.dense_with_holes);
         let s = self
             .by_shape
             .entry(format!("{:?}", o.shape.expect("a shape")))
@@ -395,6 +425,11 @@ impl Tally {
             s,
             "\n  memory pools: {} cases; out of memory in einfold only {}, in the host only {}",
             self.pooled, self.out_of_memory[0], self.out_of_memory[1]
+        );
+        let _ = write!(
+            s,
+            "\n  dense folds from a domain over missing rows: {}",
+            self.dense_with_holes
         );
         for (shape, [n, fired, dense, discrimination, host, domains]) in &self.by_shape {
             let _ = write!(
@@ -511,6 +546,7 @@ async fn run_case(case: &Case) -> Outcome {
     trace("einfold");
     let mine = check::run(&ours, sql).await;
     out.routes = mine.routes();
+    out.dense_with_holes = case.holes && out.routes.domains > 0 && out.routes.dense > 0;
     let mut fail = |tag: &str, what: String, ran: Option<&check::Ran>| {
         out.failures.push(report(case, tag, &what, ran));
     };
@@ -943,6 +979,7 @@ fn check_coverage(tally: &Tally) {
             Shape::Union,
             Shape::Nested,
             Shape::Masked,
+            Shape::ThreeRelations,
         ]
         .iter()
         .map(|&s| tally.get(s, slot))
@@ -955,10 +992,21 @@ fn check_coverage(tally: &Tally) {
         ),
         ("folds from a domain fired", fired(Shape::FromDomain) > 0),
         ("folds joined back fired", fired(Shape::JoinedBack) > 0),
+        (
+            "products over three relations fired",
+            fired(Shape::ThreeRelations) > 0,
+        ),
         ("the dense algorithm ran", ran(2) > 0),
         ("the discrimination algorithm ran", ran(3) > 0),
         ("the host's plan ran", ran(4) > 0),
         ("some cases were deterministic", tally.deterministic > 0),
+        // About 2 in 1,000 cases: finite values, missing rows, keys the
+        // dense algorithm takes, and a fill. So only over 10,000 cases,
+        // where none in all of them is a chance of about e⁻²⁰.
+        (
+            "the dense algorithm ran a fold from a domain over missing rows",
+            tally.cases < 10_000 || tally.dense_with_holes > 0,
+        ),
         (
             "most cases ran on the host",
             tally.host_failed * 3 <= tally.cases,

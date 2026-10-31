@@ -13,9 +13,12 @@
 //!   with the condition in `WHERE`, with its sides swapped, through
 //!   subqueries and CTEs, with filters, `HAVING`, and `=` or `IS NOT DISTINCT
 //!   FROM`; its factors are expressions, some of which can fail (a cast of
-//!   text, an integer division) on rows the join drops;
-//! - a left join from `d` onto the fold (a *domain*), with `COALESCE` or ddx's
-//!   `CASE`, or reading the fold's keys, or another kind of join;
+//!   text, an integer division) on rows the join drops, and some of which
+//!   divide floats by zero, which never fails;
+//! - a left join from `d` onto the fold (a *domain*), whose sum is read
+//!   through a fill (`COALESCE` or ddx's `CASE`, with a constant such as
+//!   `0.0`, `-0.0` or NaN) or a look-alike of one, or which reads the fold's
+//!   keys, or is another kind of join;
 //! - the fold joined back to `d`, grouped again by `d`'s keys, and left-joined
 //!   from `d`, as ddx writes each gradient step, with the inner `SUM`'s
 //!   argument the fold's value or `CASE WHEN <test of d's row> THEN NULL ELSE
@@ -23,6 +26,9 @@
 //!
 //! - a masked fold: a condition comparing two of the fold's outputs, or a
 //!   dimension it sums away, alone or left-joined from `d`;
+//! - a product whose factors read three relations, `l`, `r` and `d` (as
+//!   `m`), joined in any order, which detection finds by joining each
+//!   factor's relations into one operand;
 //!
 //! and compositions: two folds under `UNION ALL`, a fold of a fold's result,
 //! and `ORDER BY` with `LIMIT` above.
@@ -39,6 +45,8 @@ pub enum Shape {
     Nested,
     /// A fold with a mask: a condition comparing two of its columns.
     Masked,
+    /// A fold whose factors read three relations (see [`three_relations`]).
+    ThreeRelations,
 }
 
 /// How the fold's join compares keys.
@@ -93,7 +101,17 @@ fn factor(rng: &mut Rng, t: &str, options: Options) -> String {
             format!("CASE WHEN {t}.v > 0 THEN {t}.v ELSE 0.5 END"),
             // A factor from a key: NULL keys make NULL factors.
             format!("CAST({t}.a IS NULL AS DOUBLE)"),
+            // Float `/` and `%` never fail: by zero they give ±inf or NaN,
+            // so a fold may compute them on rows the join drops. These stay
+            // exact: 1 or NaN, and a remainder, which is always exact.
+            format!("({t}.v / {t}.v)"),
+            format!("(1.5 % {t}.v)"),
+            format!("({t}.v / 2.0)"),
         ]);
+    } else {
+        // |1 / v| is 1 / |v|, so the bound's twin tables still give the
+        // terms' magnitudes.
+        menu.push(format!("(1.0 / {t}.v)"));
     }
     if options.fallible {
         menu.extend([
@@ -101,6 +119,20 @@ fn factor(rng: &mut Rng, t: &str, options: Options) -> String {
             format!("CAST({t}.t AS DOUBLE)"),
             // Fails where `v` is 0 as an integer, or NaN or infinite.
             format!("CAST(CAST(6 AS BIGINT) / CAST({t}.v AS BIGINT) AS DOUBLE)"),
+        ]);
+        // Integer `/` and `%` by zero, exactly on the rows whose join key is
+        // NULL, which an `=` join drops. Every other part of these may be
+        // computed on every row, so only the division keeps them above the
+        // join; a cast of `v` to an integer can fail itself, which would keep
+        // them there anyway.
+        let key = if t == "l" { "b" } else { "a" };
+        menu.extend([
+            format!(
+                "CAST(CAST(6 AS BIGINT) / CASE WHEN {t}.{key} IS NULL THEN 0 ELSE 2 END AS DOUBLE)"
+            ),
+            format!(
+                "CAST(CAST(7 AS BIGINT) % CASE WHEN {t}.{key} IS NULL THEN 0 ELSE 2 END AS DOUBLE)"
+            ),
         ]);
     }
     rng.pick(&menu).clone()
@@ -295,13 +327,14 @@ pub struct Query {
 
 pub fn query(rng: &mut Rng, options: Options) -> Query {
     let mut ctes = Vec::new();
-    let shape = match rng.below(26) {
+    let shape = match rng.below(30) {
         0..=6 => Shape::Fold,
         7..=10 => Shape::FromDomain,
         11..=16 => Shape::JoinedBack,
         17..=18 => Shape::Union,
         19 => Shape::Nested,
-        _ => Shape::Masked,
+        20..=25 => Shape::Masked,
+        _ => Shape::ThreeRelations,
     };
     let mut mask = None;
     let (body, look_alike) = match shape {
@@ -311,6 +344,7 @@ pub fn query(rng: &mut Rng, options: Options) -> Query {
         }
         Shape::FromDomain => from_domain(rng, options, &mut ctes),
         Shape::JoinedBack => joined_back(rng, options, &mut ctes),
+        Shape::ThreeRelations => three_relations(rng, options, &mut ctes),
         Shape::Union => {
             let f = Fold::draw(rng, options, true, &mut ctes);
             let g = Fold::draw(rng, options, true, &mut ctes);
@@ -366,7 +400,11 @@ pub fn query(rng: &mut Rng, options: Options) -> Query {
     // inequality the generator writes) and a second key compared otherwise
     // than the first.
     let mixed = (sql.contains("l.b = r.a") && sql.contains("(l.a IS NOT DISTINCT FROM r.b)"))
-        || (sql.contains("(l.b IS NOT DISTINCT FROM r.a)") && sql.contains("l.a = r.b"));
+        || (sql.contains("(l.b IS NOT DISTINCT FROM r.a)") && sql.contains("l.a = r.b"))
+        // Where `m` joins both sides, a join can have a key of each kind.
+        || (shape == Shape::ThreeRelations
+            && sql.contains("IS NOT DISTINCT FROM")
+            && sql.contains(" = "));
     let join_filter = sql.contains(" >= ") || mixed || mask.is_some();
     Query {
         sql,
@@ -380,6 +418,46 @@ pub fn query(rng: &mut Rng, options: Options) -> Query {
     }
 }
 
+/// How the projection over `d LEFT JOIN (fold) s` reads the fold's sum
+/// `s.v`. Most often a *fill*: an expression that gives a constant where
+/// `s.v` is NULL, as where no row reached a group, and `s.v` elsewhere, as
+/// ddx's gradients give every row of a table a gradient, `0.0` where none
+/// reached it. A fold from a domain may then compute the constant for such
+/// a group itself, which lets the dense algorithm take operands with
+/// missing rows; `-0.0` and NaN are constants it must keep to their bits.
+/// The others read the sum otherwise, and the fold must leave NULL there:
+/// the bare sum, the sum read with two fills, or filled with a column.
+fn fill(rng: &mut Rng) -> String {
+    let c = *rng.pick(&[
+        "0.0",
+        "0.0",
+        "-0.0",
+        "1.0",
+        "-2.5",
+        "CAST('NaN' AS DOUBLE)",
+        "CAST('-inf' AS DOUBLE)",
+    ]);
+    match rng.below(14) {
+        0 => "s.v".to_string(),
+        1 => "(s.v * 2.0)".to_string(),
+        2..=4 => format!("COALESCE(s.v, {c})"),
+        // ddx's own.
+        5..=7 => {
+            format!("CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN {c} ELSE s.v END")
+        }
+        8 => format!("CASE WHEN s.v IS NULL THEN {c} ELSE s.v END"),
+        9 => format!("CASE WHEN s.v IS NOT NULL THEN s.v ELSE {c} END"),
+        // A fill inside an expression, and a fill of a fill.
+        10 => format!("(COALESCE(s.v, {c}) * 2.0)"),
+        11 => format!("COALESCE(COALESCE(s.v, {c}), 0.5)"),
+        // Two fills of one sum, which may differ. They test the sum
+        // otherwise (`IS NULL` and `IS NOT NULL`), or DataFusion would
+        // compute the common test below, and no fill would reach detection.
+        12 => format!("(CASE WHEN s.v IS NULL THEN {c} ELSE s.v END + COALESCE(s.v, 0.5))"),
+        _ => "COALESCE(s.v, d.v)".to_string(),
+    }
+}
+
 /// `d LEFT JOIN (fold) s`, and its look-alikes.
 fn from_domain(rng: &mut Rng, options: Options, ctes: &mut Vec<String>) -> (String, bool) {
     let f = Fold::draw(rng, options, true, ctes);
@@ -388,14 +466,7 @@ fn from_domain(rng: &mut Rng, options: Options, ctes: &mut Vec<String>) -> (Stri
     if rng.chance(0.5) {
         on.reverse();
     }
-    let value = rng
-        .pick(&[
-            "s.v",
-            "COALESCE(s.v, 0.0)",
-            "CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 ELSE s.v END",
-            "(s.v * 2.0)",
-        ])
-        .to_string();
+    let value = fill(rng);
     let (reads, join, look_alike) = match rng.below(10) {
         0 => ("s.g0", "LEFT JOIN", true),
         1 => ("d.b", "JOIN", true),
@@ -465,13 +536,7 @@ fn joined_back(rng: &mut Rng, options: Options, ctes: &mut Vec<String>) -> (Stri
     );
     // The outer projection: ddx's masks d's NULL rows, which hides what the
     // regroup did to them; the others don't.
-    let value = rng
-        .pick(&[
-            "s.v",
-            "COALESCE(s.v, 0.0)",
-            "CASE WHEN d.v IS NULL THEN NULL WHEN s.v IS NULL THEN 0.0 ELSE s.v END",
-        ])
-        .to_string();
+    let value = fill(rng);
     let reads = if rng.chance(0.1) {
         look_alike = true;
         "s.b"
@@ -509,10 +574,159 @@ fn masked(rng: &mut Rng, options: Options, ctes: &mut Vec<String>) -> (String, S
     }
     let eq = Eq::draw(rng);
     let template = format!(
-        "SELECT d.a, d.b, COALESCE(s.v, 0.0) AS v FROM d LEFT JOIN ({}) s ON {} AND {}",
+        "SELECT d.a, d.b, {} AS v FROM d LEFT JOIN ({}) s ON {} AND {}",
+        fill(rng),
         f.sql(),
         eq.render("d.a", "s.g0"),
         eq.render("d.b", "s.g1")
     );
     (template, condition, false)
+}
+
+/// An equality between two of [`three_relations`]' relations, by their
+/// positions: `l`, `r` and `m`.
+struct Edge {
+    left: usize,
+    right: usize,
+    condition: String,
+}
+
+impl Edge {
+    /// Whether this joins `relation` to one of `joined`.
+    fn joins(&self, relation: usize, joined: &[usize]) -> bool {
+        (self.left == relation && joined.contains(&self.right))
+            || (self.right == relation && joined.contains(&self.left))
+    }
+}
+
+/// A `SUM` of a product whose factors read three relations: `l`, `r`, and
+/// `m`, which is `d` under another name, joined on equalities, in any
+/// order. In ddx's gradient steps, attention's softmax-weighted sums have
+/// this shape: `SUM(exp(s.s - <s's largest>) / z.z * v.x)` reads the saved
+/// scores `s` and normalizer `z` in its first factor and the values `v` in
+/// its second. Inner joins on equalities give the same rows in any order,
+/// so the fold is of the relations each factor reads, joined together.
+///
+/// `m` joins `l` on `I` (`m.a = l.a`), `r` on `K` (`m.b = r.b`), or both,
+/// and the factor of the side it joins reads it, or neither factor does.
+/// Look-alikes, which detection must leave alone: both factors read `m`,
+/// or neither does and `m` joins both sides.
+fn three_relations(rng: &mut Rng, options: Options, ctes: &mut Vec<String>) -> (String, bool) {
+    // Which sides `m` joins: 0 is `l`'s, 1 `r`'s, 2 both.
+    let joins = rng.below(3);
+    let comma = rng.chance(0.2);
+    // A comma join's WHERE compares every key one way, so that DataFusion
+    // doesn't make an `=` a key of an `IS NOT DISTINCT FROM` join, which
+    // would make NULL equal NULL (einfold#21).
+    let eq = Eq::draw(rng);
+    let m_eq = if comma || rng.chance(0.7) {
+        eq
+    } else {
+        Eq::draw(rng)
+    };
+    let with_m = |rng: &mut Rng, x: String| -> String {
+        let mut menu = vec![format!("({x} * m.v)"), format!("(m.v * {x})")];
+        if options.exact {
+            menu.extend([format!("({x} - m.v)"), format!("({x} % m.v)")]);
+        } else {
+            // |x / m| is |x| / |m|, so the bound's twin tables still give
+            // the terms' magnitudes.
+            menu.push(format!("({x} / m.v)"));
+        }
+        rng.pick(&menu).clone()
+    };
+    let (fl, fr) = (factor(rng, "l", options), factor(rng, "r", options));
+    let mut look_alike = false;
+    let (fl, fr) = match (joins, rng.below(6)) {
+        (_, 0) => {
+            look_alike = joins == 2;
+            (fl, fr)
+        }
+        (_, 1) => {
+            look_alike = true;
+            (with_m(rng, fl), with_m(rng, fr))
+        }
+        (1, _) => (fl, with_m(rng, fr)),
+        _ => (with_m(rng, fl), fr),
+    };
+    let product = if rng.chance(0.5) {
+        format!("{fl} * {fr}")
+    } else {
+        format!("{fr} * {fl}")
+    };
+    // The relations, and the equalities between each pair.
+    let m = rng
+        .pick(&[
+            "d m",
+            "(SELECT * FROM d) m",
+            "(SELECT a, b, v FROM d WHERE d.v IS NOT NULL) m",
+        ])
+        .to_string();
+    let relations = [source(rng, "l", "l", ctes), source(rng, "r", "r", ctes), m];
+    let edge = |left, right, condition| Edge {
+        left,
+        right,
+        condition,
+    };
+    let mut edges = vec![edge(0, 1, eq.render("l.b", "r.a"))];
+    if joins != 1 {
+        edges.push(edge(2, 0, m_eq.render("m.a", "l.a")));
+    }
+    if joins != 0 {
+        edges.push(edge(2, 1, m_eq.render("m.b", "r.b")));
+    }
+    // A group key of `m`'s, equal to `l`'s or `r`'s on every joined row.
+    let (mut g0, mut g1) = ("l.a", "r.b");
+    if joins != 1 && rng.chance(0.25) {
+        g0 = "m.a";
+    }
+    if joins != 0 && rng.chance(0.25) {
+        g1 = "m.b";
+    }
+    let mut select = [format!("{g0} AS g0"), format!("{g1} AS g1")];
+    if rng.chance(0.5) {
+        select.reverse();
+    }
+    let mut group = [g0, g1];
+    if rng.chance(0.5) {
+        group.reverse();
+    }
+    let (from, mut conditions) = if comma {
+        let mut order = vec![0, 1, 2];
+        rng.shuffle(&mut order);
+        let from: Vec<&str> = order.iter().map(|&i| relations[i].as_str()).collect();
+        let conditions = edges.iter().map(|e| e.condition.clone()).collect();
+        (from.join(", "), conditions)
+    } else {
+        // Each relation after the first joins one already joined, on every
+        // equality with those.
+        let mut joined = vec![rng.below(3)];
+        let mut from = relations[joined[0]].clone();
+        while joined.len() < 3 {
+            let next: Vec<usize> = (0..3)
+                .filter(|i| !joined.contains(i))
+                .filter(|&i| edges.iter().any(|e| e.joins(i, &joined)))
+                .collect();
+            let n = *rng.pick(&next);
+            let on: Vec<&str> = (edges.iter())
+                .filter(|e| e.joins(n, &joined))
+                .map(|e| e.condition.as_str())
+                .collect();
+            from += &format!(" JOIN {} ON {}", relations[n], on.join(" AND "));
+            joined.push(n);
+        }
+        (from, Vec::new())
+    };
+    if rng.chance(0.15) {
+        conditions.push("m.v IS NOT NULL".to_string());
+    }
+    let mut sql = format!(
+        "SELECT {}, SUM({product}) AS v FROM {from}",
+        select.join(", ")
+    );
+    if !conditions.is_empty() {
+        sql += &format!(" WHERE {}", conditions.join(" AND "));
+    }
+    sql += &format!(" GROUP BY {}", group.join(", "));
+    (sql, look_alike)
 }

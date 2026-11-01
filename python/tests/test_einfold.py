@@ -10,6 +10,7 @@ tables and plans by reference, and the planner across the FFI."""
 
 from __future__ import annotations
 
+import gc
 import math
 import subprocess
 import sys
@@ -195,6 +196,31 @@ def test_runs_queries_again_and_tables_replaced():
         ctx.register_record_batches("w", [[pa.record_batch(
             {"k": r // 8, "o": r % 8, "val": -np.cos(r * 0.3)})]])
     _assert_same(off.sql(MATMUL).to_arrow_table(), on.sql(MATMUL).to_arrow_table())
+
+
+def test_a_dataframe_needs_its_session_context():
+    """Pins einfold#146, a bug in datafusion-python: with einfold installed,
+    a `DataFrame` that reads an in-memory table fails once its
+    `SessionContext` is dropped, as it doesn't without einfold. The session's
+    codecs reach the session's task context only through the
+    `SessionContext`, weakly, and a `DataFrame` keeps only the session's
+    state. Once that's fixed, this fails: then assert the rows instead."""
+
+    def frame(einfold):
+        ctx = SessionContext()
+        if einfold:
+            ctx.with_extensions(EinFold())
+        ctx.register_record_batches("t", [[pa.record_batch(
+            [pa.array([1, 2, 3])], names=["x"])]])
+        return ctx.sql("SELECT SUM(x) AS s FROM t")
+
+    without = frame(einfold=False)
+    gc.collect()
+    assert without.to_arrow_table().column("s").to_pylist() == [6]
+    with_einfold = frame(einfold=True)
+    gc.collect()
+    with pytest.raises(Exception, match="TaskContextProvider went out of scope"):
+        with_einfold.to_arrow_table()
 
 
 def test_in_xarray_sql():

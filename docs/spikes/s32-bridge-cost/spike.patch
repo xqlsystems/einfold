@@ -1,0 +1,159 @@
+SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & einfold Authors
+
+SPDX-License-Identifier: Apache-2.0
+
+The changes to einfold 0.2.0 this spike measured: timing output under
+EINFOLD_TIMING=1, a runtime environment per session, and a lazy task context
+in localize. Apply with `git apply` on python-v0.2.0; build with
+CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=2.
+
+diff --git a/python/src/bridge.rs b/python/src/bridge.rs
+index 0b3166e..19b2a94 100644
+--- a/python/src/bridge.rs
++++ b/python/src/bridge.rs
+@@ -284,6 +284,7 @@ fn einfold_nodes(plan: &LogicalPlan) -> Result<Nodes> {
+ #[derive(Debug)]
+ pub(crate) struct Bridge {
+     pub(crate) counts: Arc<Counts>,
++    pub(crate) runtime_env: Arc<RuntimeEnv>,
+ }
+ 
+ #[async_trait]
+@@ -296,14 +297,18 @@ impl QueryPlanner for Bridge {
+         use datafusion::physical_planner::PhysicalPlanner;
+ 
+         self.counts.plans.fetch_add(1, Ordering::Relaxed);
++        let t0 = std::time::Instant::now();
+         // Copying the session's in-memory tables only saves time: if it
+         // fails, the plan reads them as the session would.
+         let relinked = relinked(plan)?;
++        let t1 = std::time::Instant::now();
+         let plan = match lean::localize(relinked.clone(), session).await {
+             Ok(localized) => localized,
+             Err(_) => relinked,
+         };
++        let t2 = std::time::Instant::now();
+         let detected = explained(DetectFolds::default().detect(plan)?);
++        let t3 = std::time::Instant::now();
+         let nodes = einfold_nodes(&detected)?;
+         if nodes.folds + nodes.pipelines > 0 {
+             self.counts.with_einfold.fetch_add(1, Ordering::Relaxed);
+@@ -316,11 +321,26 @@ impl QueryPlanner for Bridge {
+             rules: PhysicalOptimizer::new().rules,
+             table_options: session.table_options().clone(),
+             execution_props: with_configuration(session),
++            runtime_env: Arc::clone(&self.runtime_env),
+         };
+         let planner =
+             DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(EinFoldPlanner)]);
+         let physical = planner.create_physical_plan(&detected, &local).await?;
+-        Ok(Arc::new(Opaque { plan: physical }))
++        let t4 = std::time::Instant::now();
++        if std::env::var_os("EINFOLD_TIMING").is_some() {
++            let c0 = std::time::Instant::now();
++            let _ = session.task_ctx();
++            eprintln!("einfold-task-ctx={:.0}", (std::time::Instant::now() - c0).as_secs_f64() * 1e6);
++            let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e6;
++            eprintln!(
++                "einfold-timing relink={:.0} localize={:.0} detect={:.0} physical={:.0}",
++                us(t0, t1), us(t1, t2), us(t2, t3), us(t3, t4)
++            );
++        }
++        Ok(Arc::new(Opaque {
++            plan: physical,
++            runtime_env: Arc::clone(&self.runtime_env),
++        }))
+     }
+ }
+ 
+@@ -331,6 +351,7 @@ impl QueryPlanner for Bridge {
+ #[derive(Debug)]
+ struct Opaque {
+     plan: Arc<dyn ExecutionPlan>,
++    runtime_env: Arc<RuntimeEnv>,
+ }
+ 
+ impl DisplayAs for Opaque {
+@@ -371,7 +392,10 @@ impl ExecutionPlan for Opaque {
+     /// again, as a recursive query does, resets it first.
+     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+         let reset = physical_plan::execution_plan::reset_plan_states(Arc::clone(&self.plan))?;
+-        Ok(Arc::new(Opaque { plan: reset }))
++        Ok(Arc::new(Opaque {
++            plan: reset,
++            runtime_env: Arc::clone(&self.runtime_env),
++        }))
+     }
+ 
+     fn execute(
+@@ -382,6 +406,16 @@ impl ExecutionPlan for Opaque {
+         let handle = runtime();
+         let inner = {
+             let _entered = handle.enter();
++            let context = Arc::new(TaskContext::new(
++                context.task_id(),
++                context.session_id(),
++                context.session_config().clone(),
++                context.scalar_functions().clone(),
++                context.higher_order_functions().clone(),
++                context.aggregate_functions().clone(),
++                context.window_functions().clone(),
++                Arc::clone(&self.runtime_env),
++            ));
+             self.plan.execute(partition, context)?
+         };
+         let schema = inner.schema();
+@@ -418,6 +452,7 @@ struct LocalRules<'a> {
+     table_options: TableOptions,
+     /// The session's, with its configuration (see [`with_configuration`]).
+     execution_props: ExecutionProps,
++    runtime_env: Arc<RuntimeEnv>,
+ }
+ 
+ /// `session`'s execution properties, with its configuration. A session that
+@@ -475,7 +510,7 @@ impl Session for LocalRules<'_> {
+         self.inner.extension_type_registry()
+     }
+     fn runtime_env(&self) -> &Arc<RuntimeEnv> {
+-        self.inner.runtime_env()
++        &self.runtime_env
+     }
+     fn execution_props(&self) -> &ExecutionProps {
+         &self.execution_props
+diff --git a/python/src/ein_fold.rs b/python/src/ein_fold.rs
+index 4eddfcf..d8897cb 100644
+--- a/python/src/ein_fold.rs
++++ b/python/src/ein_fold.rs
+@@ -138,6 +138,7 @@ impl EinFold {
+         let (logical, physical) = (logical.clone(), physical.clone());
+         let bridge = Bridge {
+             counts: Arc::clone(&self.counts),
++            runtime_env: Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()),
+         };
+         let ffi_planner =
+             FFI_QueryPlanner::new_with_ffi_codecs(Arc::new(bridge), logical, physical);
+diff --git a/python/src/lean.rs b/python/src/lean.rs
+index 35c93b8..05f3d6f 100644
+--- a/python/src/lean.rs
++++ b/python/src/lean.rs
+@@ -482,7 +482,9 @@ pub(crate) async fn localize(plan: LogicalPlan, session: &dyn Session) -> Result
+         Ok(TreeNodeRecursion::Continue)
+     })?;
+     let address = |source: &Arc<dyn TableSource>| Arc::as_ptr(source) as *const () as usize;
+-    let context = lean_task(&session.task_ctx());
++    // The session's task context, read only if a table is copied: across
++    // the FFI, reading it converts every function the session has.
++    let mut lean_context: Option<Arc<TaskContext>> = None;
+     let mut copies: HashMap<Data, Arc<dyn TableSource>> = HashMap::new();
+     let mut chosen: HashMap<usize, Arc<dyn TableSource>> = HashMap::new();
+     for Scanned { source, name } in scans {
+@@ -496,6 +498,9 @@ pub(crate) async fn localize(plan: LogicalPlan, session: &dyn Session) -> Result
+         let Some(SmallScan { rows, scan }) = small_scan(lean, session).await? else {
+             continue;
+         };
++        let context = Arc::clone(
++            lean_context.get_or_insert_with(|| lean_task(&session.task_ctx())),
++        );
+         // Read on this library's runtime, where the foreign scan's streams
+         // are polled.
+         let task_context = Arc::clone(&context);

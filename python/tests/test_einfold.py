@@ -274,9 +274,11 @@ def test_reads_the_sessions_object_stores(tmp_path):
     interface: with einfold installed, a table in an object store registered
     with the session, such as S3, can't be read, as it can without einfold.
     The session's runtime environment holds its object stores, and doesn't
-    cross the FFI to einfold's planner. A local directory registered under its
-    own scheme stands in for a cloud store. Once that's fixed, this fails:
-    then assert the rows instead."""
+    cross the FFI to einfold's planner, which plans and runs with a runtime
+    environment of its own. A local directory registered under its own scheme
+    stands in for a cloud store. Once the FFI passes the session's runtime
+    environment, and einfold uses it in place of its own, this fails: then
+    assert the rows instead."""
     from datafusion.object_store import LocalFileSystem
 
     pq.write_table(pa.table({"x": [1, 2, 3]}), tmp_path / "t.parquet")
@@ -288,11 +290,12 @@ def test_reads_the_sessions_object_stores(tmp_path):
         ctx.register_object_store("pinned://", LocalFileSystem(prefix=str(tmp_path)),
                                   "bucket")
         ctx.register_parquet("t", "pinned://bucket/t.parquet")
-        return ctx.sql("SELECT COUNT(*) AS n FROM t")
+        # Collected while `ctx` lives, which einfold#146 requires.
+        return ctx.sql("SELECT COUNT(*) AS n FROM t").to_arrow_table()
 
-    assert count(einfold=False).to_arrow_table()["n"][0].as_py() == 3
+    assert count(einfold=False)["n"][0].as_py() == 3
     with pytest.raises(Exception, match="No suitable object store found"):
-        count(einfold=True).to_arrow_table()
+        count(einfold=True)
 
 
 def test_in_xarray_sql():

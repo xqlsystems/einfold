@@ -482,7 +482,9 @@ pub(crate) async fn localize(plan: LogicalPlan, session: &dyn Session) -> Result
         Ok(TreeNodeRecursion::Continue)
     })?;
     let address = |source: &Arc<dyn TableSource>| Arc::as_ptr(source) as *const () as usize;
-    let context = lean_task(&session.task_ctx());
+    // The session's task context, read only if a table is copied: through
+    // the FFI, reading it converts every function the session has.
+    let mut lean_context: Option<Arc<TaskContext>> = None;
     let mut copies: HashMap<Data, Arc<dyn TableSource>> = HashMap::new();
     let mut chosen: HashMap<usize, Arc<dyn TableSource>> = HashMap::new();
     for Scanned { source, name } in scans {
@@ -496,6 +498,8 @@ pub(crate) async fn localize(plan: LogicalPlan, session: &dyn Session) -> Result
         let Some(SmallScan { rows, scan }) = small_scan(lean, session).await? else {
             continue;
         };
+        let context =
+            Arc::clone(lean_context.get_or_insert_with(|| lean_task(&session.task_ctx())));
         // Read on this library's runtime, where the foreign scan's streams
         // are polled.
         let task_context = Arc::clone(&context);

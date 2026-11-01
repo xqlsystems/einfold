@@ -18,6 +18,7 @@ import textwrap
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from datafusion import SessionContext, col
 
@@ -221,6 +222,51 @@ def test_a_dataframe_needs_its_session_context():
     gc.collect()
     with pytest.raises(Exception, match="TaskContextProvider went out of scope"):
         with_einfold.to_arrow_table()
+
+
+def test_sees_parquet_files_replaced_and_added(tmp_path):
+    """einfold keeps a session's runtime environment, and with it DataFusion's
+    caches of each Parquet file's metadata and statistics, from query to
+    query, but lists each table's files again on every query. So a file
+    replaced or added between queries is read as a table registered anew
+    reads it.
+
+    DataFusion alone keeps a directory's listing, with each file's size,
+    until the session ends: it doesn't see an added file, and fails to read a
+    replaced one of another size (einfold#151, pinned here)."""
+
+    def write(name, n, scale):
+        r = np.arange(n)
+        pq.write_table(pa.table({"i": r % 7, "j": r % 5, "v": np.sin(r * scale)}),
+                       tmp_path / name)
+
+    def session(einfold):
+        ctx = SessionContext()
+        if einfold:
+            _install(ctx)
+        ctx.register_parquet("t", str(tmp_path))
+        return ctx
+
+    queries = [
+        "SELECT t.j, SUM(t.v) AS v FROM t GROUP BY t.j",
+        "SELECT x.i, y.i AS k, SUM(x.v * y.v) AS v FROM t x JOIN t y ON x.j = y.j "
+        "GROUP BY x.i, y.i",
+    ]
+    write("0.parquet", 200, 0.7)
+    on, off = session(einfold=True), session(einfold=False)
+    rows = []
+    for change in (None, lambda: write("1.parquet", 100, 1.1),
+                   lambda: write("0.parquet", 300, 0.3)):
+        if change:
+            change()
+        fresh = session(einfold=False)
+        for sql in queries:
+            want = fresh.sql(sql).to_arrow_table()
+            _assert_same(want, on.sql(sql).to_arrow_table())
+        rows.append(fresh.sql("SELECT COUNT(*) AS n FROM t").to_arrow_table()["n"][0].as_py())
+    assert rows == [200, 300, 400]
+    with pytest.raises(Exception, match="Required field num_values is missing"):
+        off.sql(queries[0]).to_arrow_table()
 
 
 def test_in_xarray_sql():

@@ -8,6 +8,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_ffi::execution::FFI_TaskContextProvider;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::proto::physical_extension_codec::FFI_PhysicalExtensionCodec;
@@ -138,6 +139,7 @@ impl EinFold {
         let (logical, physical) = (logical.clone(), physical.clone());
         let bridge = Bridge {
             counts: Arc::clone(&self.counts),
+            runtime_env: Arc::new(RuntimeEnv::default()),
         };
         let ffi_planner =
             FFI_QueryPlanner::new_with_ffi_codecs(Arc::new(bridge), logical, physical);

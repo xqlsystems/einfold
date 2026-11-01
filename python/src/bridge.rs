@@ -284,6 +284,12 @@ fn einfold_nodes(plan: &LogicalPlan) -> Result<Nodes> {
 #[derive(Debug)]
 pub(crate) struct Bridge {
     pub(crate) counts: Arc<Counts>,
+    /// The runtime environment this session's plans are planned and run
+    /// with, kept from query to query. A session that crossed the FFI has a
+    /// new, default one in every call, so its caches, such as the Parquet
+    /// metadata DataFusion would otherwise read from each file again, would
+    /// last only as long as one query.
+    pub(crate) runtime_env: Arc<RuntimeEnv>,
 }
 
 #[async_trait]
@@ -316,11 +322,15 @@ impl QueryPlanner for Bridge {
             rules: PhysicalOptimizer::new().rules,
             table_options: session.table_options().clone(),
             execution_props: with_configuration(session),
+            runtime_env: Arc::clone(&self.runtime_env),
         };
         let planner =
             DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(EinFoldPlanner)]);
         let physical = planner.create_physical_plan(&detected, &local).await?;
-        Ok(Arc::new(Opaque { plan: physical }))
+        Ok(Arc::new(Opaque {
+            plan: physical,
+            runtime_env: Arc::clone(&self.runtime_env),
+        }))
     }
 }
 
@@ -331,6 +341,9 @@ impl QueryPlanner for Bridge {
 #[derive(Debug)]
 struct Opaque {
     plan: Arc<dyn ExecutionPlan>,
+    /// The runtime environment the plan was planned with (see
+    /// [`Bridge::runtime_env`]), which it also runs with.
+    runtime_env: Arc<RuntimeEnv>,
 }
 
 impl DisplayAs for Opaque {
@@ -371,7 +384,10 @@ impl ExecutionPlan for Opaque {
     /// again, as a recursive query does, resets it first.
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
         let reset = physical_plan::execution_plan::reset_plan_states(Arc::clone(&self.plan))?;
-        Ok(Arc::new(Opaque { plan: reset }))
+        Ok(Arc::new(Opaque {
+            plan: reset,
+            runtime_env: Arc::clone(&self.runtime_env),
+        }))
     }
 
     fn execute(
@@ -380,6 +396,18 @@ impl ExecutionPlan for Opaque {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let handle = runtime();
+        // The session's task context, with the runtime environment the plan
+        // was planned with in place of the one it crossed the FFI with.
+        let context = Arc::new(TaskContext::new(
+            context.task_id(),
+            context.session_id(),
+            context.session_config().clone(),
+            context.scalar_functions().clone(),
+            context.higher_order_functions().clone(),
+            context.aggregate_functions().clone(),
+            context.window_functions().clone(),
+            Arc::clone(&self.runtime_env),
+        ));
         let inner = {
             let _entered = handle.enter();
             self.plan.execute(partition, context)?
@@ -418,6 +446,8 @@ struct LocalRules<'a> {
     table_options: TableOptions,
     /// The session's, with its configuration (see [`with_configuration`]).
     execution_props: ExecutionProps,
+    /// See [`Bridge::runtime_env`].
+    runtime_env: Arc<RuntimeEnv>,
 }
 
 /// `session`'s execution properties, with its configuration. A session that
@@ -475,7 +505,7 @@ impl Session for LocalRules<'_> {
         self.inner.extension_type_registry()
     }
     fn runtime_env(&self) -> &Arc<RuntimeEnv> {
-        self.inner.runtime_env()
+        &self.runtime_env
     }
     fn execution_props(&self) -> &ExecutionProps {
         &self.execution_props

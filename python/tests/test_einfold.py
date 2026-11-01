@@ -269,6 +269,35 @@ def test_sees_parquet_files_replaced_and_added(tmp_path):
         off.sql(queries[0]).to_arrow_table()
 
 
+def test_reads_the_sessions_object_stores(tmp_path):
+    """Pins einfold#149, a gap in datafusion-ffi, DataFusion's foreign function
+    interface: with einfold installed, a table in an object store registered
+    with the session, such as S3, can't be read, as it can without einfold.
+    The session's runtime environment holds its object stores, and doesn't
+    cross the FFI to einfold's planner, which plans and runs with a runtime
+    environment of its own. A local directory registered under its own scheme
+    stands in for a cloud store. Once the FFI passes the session's runtime
+    environment, and einfold uses it in place of its own, this fails: then
+    assert the rows instead."""
+    from datafusion.object_store import LocalFileSystem
+
+    pq.write_table(pa.table({"x": [1, 2, 3]}), tmp_path / "t.parquet")
+
+    def count(einfold):
+        ctx = SessionContext()
+        if einfold:
+            _install(ctx)
+        ctx.register_object_store("pinned://", LocalFileSystem(prefix=str(tmp_path)),
+                                  "bucket")
+        ctx.register_parquet("t", "pinned://bucket/t.parquet")
+        # Collected while `ctx` lives, which einfold#146 requires.
+        return ctx.sql("SELECT COUNT(*) AS n FROM t").to_arrow_table()
+
+    assert count(einfold=False)["n"][0].as_py() == 3
+    with pytest.raises(Exception, match="No suitable object store found"):
+        count(einfold=True)
+
+
 def test_in_xarray_sql():
     """einfold in xarray-sql, an XQL Systems project for querying xarray
     datasets with SQL, whose context is a DataFusion session."""

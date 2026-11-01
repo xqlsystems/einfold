@@ -286,9 +286,9 @@ pub(crate) struct Bridge {
     pub(crate) counts: Arc<Counts>,
     /// The runtime environment this session's plans are planned and run
     /// with, kept from query to query. A session that crossed the FFI has a
-    /// new, default one in every call, so its caches, such as the Parquet
-    /// metadata DataFusion would otherwise read from each file again, would
-    /// last only as long as one query.
+    /// new, default one in every call, so its caches, such as the metadata
+    /// DataFusion reads from each Parquet file (a columnar file format)
+    /// once, would last only as long as one query.
     pub(crate) runtime_env: Arc<RuntimeEnv>,
 }
 

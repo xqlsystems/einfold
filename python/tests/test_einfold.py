@@ -224,29 +224,28 @@ def test_a_dataframe_needs_its_session_context():
         with_einfold.to_arrow_table()
 
 
-def _outcome(ctx, sql):
-    """`sql`'s rows, or its error, in which an error that crossed the FFI
-    says so."""
-    try:
-        return "ok", ctx.sql(sql).to_arrow_table()
-    except Exception as e:  # noqa: BLE001 - an error is an outcome
-        return "error", str(e).replace("FFI error: ", "")
-
-
 def test_sees_parquet_files_replaced_and_added(tmp_path):
     """einfold keeps a session's runtime environment, and with it DataFusion's
-    caches of each Parquet file's metadata and of each directory's files,
-    from query to query. A file replaced or added between queries is then
-    read as the session reads it.
+    caches of each Parquet file's metadata and statistics, from query to
+    query, but lists each table's files again on every query. So a file
+    replaced or added between queries is read as a table registered anew
+    reads it.
 
-    DataFusion keeps a directory's listing, with each file's size, until the
-    session ends. So a file replaced with one of another size fails to read,
-    with einfold as without: einfold#151, pinned here."""
+    DataFusion alone keeps a directory's listing, with each file's size,
+    until the session ends: it doesn't see an added file, and fails to read a
+    replaced one of another size (einfold#151, pinned here)."""
 
     def write(name, n, scale):
         r = np.arange(n)
         pq.write_table(pa.table({"i": r % 7, "j": r % 5, "v": np.sin(r * scale)}),
                        tmp_path / name)
+
+    def session(einfold):
+        ctx = SessionContext()
+        if einfold:
+            _install(ctx)
+        ctx.register_parquet("t", str(tmp_path))
+        return ctx
 
     queries = [
         "SELECT t.j, SUM(t.v) AS v FROM t GROUP BY t.j",
@@ -254,26 +253,20 @@ def test_sees_parquet_files_replaced_and_added(tmp_path):
         "GROUP BY x.i, y.i",
     ]
     write("0.parquet", 200, 0.7)
-    off, on = SessionContext(), SessionContext()
-    _install(on)
-    for ctx in (off, on):
-        ctx.register_parquet("t", str(tmp_path))
-    outcomes = []
+    on, off = session(einfold=True), session(einfold=False)
+    rows = []
     for change in (None, lambda: write("1.parquet", 100, 1.1),
                    lambda: write("0.parquet", 300, 0.3)):
         if change:
             change()
+        fresh = session(einfold=False)
         for sql in queries:
-            (want, w), (got, g) = _outcome(off, sql), _outcome(on, sql)
-            assert want == got, (w, g)
-            if want == "ok":
-                _assert_same(w, g)
-            else:
-                assert w == g
-            outcomes.append(want)
-    assert outcomes[:4] == ["ok"] * 4
-    assert outcomes[4:] == ["error"] * 2
-    assert "Required field num_values is missing" in _outcome(off, queries[0])[1]
+            want = fresh.sql(sql).to_arrow_table()
+            _assert_same(want, on.sql(sql).to_arrow_table())
+        rows.append(fresh.sql("SELECT COUNT(*) AS n FROM t").to_arrow_table()["n"][0].as_py())
+    assert rows == [200, 300, 400]
+    with pytest.raises(Exception, match="Required field num_values is missing"):
+        off.sql(queries[0]).to_arrow_table()
 
 
 def test_in_xarray_sql():

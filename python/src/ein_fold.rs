@@ -8,7 +8,8 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::cache::cache_manager::CacheManagerConfig;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion_ffi::execution::FFI_TaskContextProvider;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::proto::physical_extension_codec::FFI_PhysicalExtensionCodec;
@@ -139,10 +140,32 @@ impl EinFold {
         let (logical, physical) = (logical.clone(), physical.clone());
         let bridge = Bridge {
             counts: Arc::clone(&self.counts),
-            runtime_env: Arc::new(RuntimeEnv::default()),
+            runtime_env: session_runtime_env()?,
         };
         let ffi_planner =
             FFI_QueryPlanner::new_with_ffi_codecs(Arc::new(bridge), logical, physical);
         PyCapsule::new_with_value(py, ffi_planner, c"datafusion_query_planner")
     }
+}
+
+/// The runtime environment einfold plans and runs a session's plans with,
+/// from query to query (see `Bridge::runtime_env`), with DataFusion's caches
+/// except its cache of each directory's files.
+///
+/// The caches of each file's Parquet metadata and statistics check an entry
+/// against the file's size and time of change, which a listing of its
+/// directory gives, so they can't serve a file that changed. The listing
+/// cache is the source of those, and DataFusion clears it where the session
+/// drops or replaces a table, or where the session's own runtime settings
+/// (`SET datafusion.runtime.list_files_cache_limit`) say so, none of which
+/// reaches einfold through the FFI. Without it, einfold lists a table's
+/// files on each query, so it never reads them staler than the session
+/// does.
+fn session_runtime_env() -> PyResult<Arc<RuntimeEnv>> {
+    let caches = CacheManagerConfig::default().with_list_files_cache_limit(0);
+    let runtime_env = RuntimeEnvBuilder::new()
+        .with_cache_manager(caches)
+        .build_arc()
+        .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))?;
+    Ok(runtime_env)
 }

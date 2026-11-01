@@ -54,5 +54,11 @@ libc = "0.2"
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
 
+# As datafusion-python builds its wheels. einfold runs each plan in this
+# library, so this library's copy of DataFusion's operators is the one that
+# runs: built with Cargo's defaults instead, TPC-H runs about 1.5% slower
+# than in datafusion-python (spike S32).
 [profile.release]
 debug = false
+lto = "thin"
+codegen-units = 2

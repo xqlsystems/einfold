@@ -659,6 +659,16 @@ and use the original CPU algorithm. A host choosing lower-precision
 arithmetic must make that policy explicit. This does not change default
 SQL eligibility or the default executor.
 
+The separately invoked `einfold.dense_program` prototype lowers supported
+DataFusion logical operators to compact axes, value arrays, row-presence
+and NULL masks. Its host supplies current inputs and owns fallback before
+publishing updates. Unsupported row semantics decline. Device compilation
+requires validated input domains and retained or proven structural checks;
+it cannot replace unknown dynamic checks with assumptions. This prototype
+does not yet define a stable public array API or an unconditional planner
+rewrite. See [the optimization report](../OPTIMIZATION.md) for its scope,
+measurements and downstream integration.
+
 ## 18. References
 
 The full list of papers, systems and documentation is in supplement section 18.

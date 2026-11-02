@@ -29,6 +29,7 @@ mod allocator;
 mod bridge;
 mod by_reference;
 mod capsule;
+mod dense_backend;
 mod ein_fold;
 mod lean;
 mod logical_codec;
@@ -43,5 +44,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<logical_codec::LogicalCodec>()?;
     m.add_class::<physical_codec::PhysicalCodec>()?;
     m.add("DATAFUSION_VERSION", datafusion::DATAFUSION_VERSION)?;
+    m.add("RESET_ON_DECODE", true)?;
     Ok(())
 }

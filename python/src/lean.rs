@@ -496,6 +496,11 @@ pub(crate) async fn localize(plan: LogicalPlan, session: &dyn Session) -> Result
         let Some(SmallScan { rows, scan }) = small_scan(lean, session).await? else {
             continue;
         };
+        // Keep ordered stages on their original scan: rebuilding a plain
+        // MemTable would lose the coordinate order and introduce sorts.
+        if scan.properties().output_ordering().is_some() {
+            continue;
+        }
         // Read on this library's runtime, where the foreign scan's streams
         // are polled.
         let task_context = Arc::clone(&context);

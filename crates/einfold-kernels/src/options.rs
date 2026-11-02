@@ -71,6 +71,8 @@ pub struct Options<'a> {
     /// The memory the kernel may take beyond its inputs, or `None` for no
     /// limit.
     pub budget: Option<&'a dyn Budget>,
+    /// Optional session-local executor for validated dense arithmetic.
+    pub backend: Option<&'a dyn crate::DenseBackend>,
 }
 
 impl Options<'_> {
@@ -92,6 +94,7 @@ impl Default for Options<'_> {
             threads: 1,
             domain_rows: DomainRows::Any,
             budget: None,
+            backend: None,
         }
     }
 }

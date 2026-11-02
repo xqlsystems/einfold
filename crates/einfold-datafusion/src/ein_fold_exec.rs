@@ -87,6 +87,7 @@ enum Work {
 #[derive(Debug)]
 pub struct EinFoldExec {
     work: Work,
+    backend: Option<Arc<dyn einfold_kernels::DenseBackend>>,
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     /// The host's plan for the same rows, run instead of the discrimination
     /// algorithm, or where memory runs short, and planned only then.
@@ -140,6 +141,7 @@ impl EinFoldExec {
         );
         EinFoldExec {
             work,
+            backend: None,
             inputs,
             fallback: None,
             execution_props: None,
@@ -212,10 +214,19 @@ impl EinFoldExec {
     fn copy(&self, inputs: Vec<Arc<dyn ExecutionPlan>>) -> EinFoldExec {
         let mut exec = EinFoldExec::computing(self.work.clone(), inputs, self.schema());
         exec.fallback = self.fallback.clone();
+        exec.backend = self.backend.clone();
         exec.execution_props = self.execution_props.clone();
         exec.host_on_decline = self.host_on_decline;
         exec.domain_rows = self.domain_rows;
         exec.null_when = self.null_when;
+        exec
+    }
+
+    /// A fresh operator using this session's optional dense executor.
+    #[must_use]
+    pub fn with_backend(&self, backend: Arc<dyn einfold_kernels::DenseBackend>) -> Self {
+        let mut exec = self.copy(self.inputs.clone());
+        exec.backend = Some(backend);
         exec
     }
 
@@ -558,12 +569,14 @@ impl ExecutionPlan for EinFoldExec {
         if chain && !self.host_on_decline {
             return internal_err!("EinFoldExec computes a chain only with the host's plan");
         }
+        let backend = self.backend.clone();
         let batch_size = context.session_config().batch_size().max(1);
         let options = Options {
             host: HOST,
             threads: context.session_config().target_partitions(),
             domain_rows: self.domain_rows,
             budget: None,
+            backend: None,
         };
         if self.domain_rows == DomainRows::UniqueKeys && self.fallback.is_none() {
             return internal_err!("EinFoldExec requires a unique domain, but has no fallback");
@@ -632,6 +645,7 @@ impl ExecutionPlan for EinFoldExec {
                 let pool = Pool(&held);
                 let options = Options {
                     budget: Some(&pool),
+                    backend: backend.as_deref(),
                     ..options
                 };
                 let (a, b) = (

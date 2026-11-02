@@ -156,7 +156,9 @@ impl PhysicalExtensionCodec for ByReference {
             return plan_err!("einfold's codec holds no plan {id}");
         };
         match inputs.is_empty() {
-            true => Ok(plan),
+            // Decoding is also the prepared-query copy operation. Rebuild
+            // stateful joins while retaining the Arrow input buffers.
+            true => datafusion::physical_plan::execution_plan::reset_plan_states(plan),
             // A node whose children the decoder rebuilt.
             #[allow(deprecated)]
             false => plan.with_new_children(inputs.to_vec()),

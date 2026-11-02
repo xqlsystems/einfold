@@ -650,6 +650,15 @@ Agreed priority, highest first. Each lives in the section that owns it:
 - **gpudb gives einfold's float workloads no GPU speedup today.** On a T4, gpudb ran only an integer reduction on the GPU. It declined every `DOUBLE` sum, many-to-many joins, and subquery operands (S5). Mitigation: M9's work with gpudb's maintainer on the extension form, or on `DOUBLE` sums with S8's binned accumulator; meanwhile, the relational form's value on DuckDB+gpudb is the CPU-side plan shape.
 - **Float sums on GPU hosts.** Deterministic float sums on GPU need host support. gpudb avoids the question by never rewriting float `SUM`, which also keeps float einsums off its GPU path. Mitigation: determinism is a setting, not a default, on hosts (section 8.6); S8's binned sum is a concrete proposal for hosts, cheap even with GPU atomics.
 
+### 17.1. Optional host numerical execution
+
+The experimental Python integration permits a session-local dense backend
+after the existing contraction/attention validation. It receives packed
+numerical operands, shapes and allowed attention intervals; it may decline
+and use the original CPU algorithm. A host choosing lower-precision
+arithmetic must make that policy explicit. This does not change default
+SQL eligibility or the default executor.
+
 ## 18. References
 
 The full list of papers, systems and documentation is in supplement section 18.

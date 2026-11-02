@@ -766,6 +766,7 @@ fn check_unique_domain(case: &Case, rng: &mut Rng, fail: impl Fn(String)) -> boo
             threads: 1 + rng.below(8),
             domain_rows,
             budget: None,
+            backend: None,
         };
         let d = d.map(|batches| Relation::new(&domain.schema, batches));
         einfold_kernels::fold_dense(fold, a, b, d, schema.unwrap(), options).unwrap()

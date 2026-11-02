@@ -150,6 +150,7 @@ pub(crate) fn pipeline(
     [q, k, v]: [&[RecordBatch]; 3],
     schema: SchemaRef,
     threads: usize,
+    options: &crate::Options,
 ) -> Result<Option<Piped>> {
     if !matches!(pipeline.weight(), Weight::Exp { .. } | Weight::Of(_)) {
         return Ok(None);
@@ -163,7 +164,7 @@ pub(crate) fn pipeline(
     let n = own + pipeline.dimensions().len();
     let holds = |op: &Operand, d: usize| op.column_of(DimensionId(d)).is_some();
     let output = |d: usize| pipeline.outputs().contains(&DimensionId(d));
-    let (mut xs, mut es, mut js) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut ws, mut xs, mut es, mut js) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for d in 0..own {
         let produced = producer.output_of(DimensionId(d)).is_some();
         match (
@@ -173,6 +174,7 @@ pub(crate) fn pipeline(
             output(d),
             holds(values, d),
         ) {
+            (true, true, true, true, true) => ws.push(d),
             (true, false, true, true, false) => xs.push(d),
             (true, true, false, false, false) => es.push(d),
             (false, true, true, false, true) => js.push(d),
@@ -207,6 +209,15 @@ pub(crate) fn pipeline(
         };
         mask.push(condition);
     }
+
+    // Shared batch/head dimensions select independent attention problems.
+    // Flatten them into both query and key positions, then restrict each
+    // query's key interval to its own problem. The positional key and
+    // completeness checks below still validate every operand.
+    let local_xs = xs.clone();
+    let local_js = js.clone();
+    xs.splice(0..0, ws.iter().copied());
+    js.splice(0..0, ws.iter().copied());
 
     // The producer's columns: each operand's factor for a product, or every
     // column its expression reads.
@@ -287,6 +298,9 @@ pub(crate) fn pipeline(
     else {
         return Ok(None);
     };
+    let (Some(local_nx), Some(local_nj)) = (size(&local_xs), size(&local_js)) else {
+        return Ok(None);
+    };
     let mut matrices = Vec::new();
     for (p, batch_keys) in placements.iter().zip(all_keys) {
         let keys: Vec<Vec<(usize, Int64Array)>> = (batch_keys.into_iter())
@@ -328,8 +342,10 @@ pub(crate) fn pipeline(
     // allows `j > x - c`, and so on, worked in i128 so that no offset
     // overflows, then clamped to the J positions.
     let allowed = |x: usize| -> (usize, usize) {
+        let group_start = (x / local_nx) * local_nj;
+        let x = x % local_nx;
         let x = i128::try_from(x).expect("a position fits in i128");
-        let n = i128::try_from(nj).expect("an extent fits in i128");
+        let n = i128::try_from(local_nj).expect("an extent fits in i128");
         let (mut lo, mut hi) = (0i128, n);
         for condition in &mask {
             let bound = x - i128::from(condition.offset);
@@ -340,7 +356,8 @@ pub(crate) fn pipeline(
                 _ => lo = lo.max(bound + 1),
             }
         }
-        let clamp = |p: i128| usize::try_from(p.clamp(0, n)).expect("clamped to the extent");
+        let clamp =
+            |p: i128| group_start + usize::try_from(p.clamp(0, n)).expect("clamped to the extent");
         (clamp(lo), clamp(hi.max(lo)))
     };
     // Whether each J position's values are all finite: sums of finite terms
@@ -349,15 +366,48 @@ pub(crate) fn pipeline(
         .map(|j| v[j * ny..(j + 1) * ny].iter().all(|x| x.is_finite()))
         .collect();
     let (x_tiles, j_tiles) = (nx.div_ceil(XT), nj.div_ceil(JT));
-    let tiles = dense::par_tasks(x_tiles, threads, |t| {
-        tile(
-            pipeline,
-            t,
-            (nx, ne, nj, ny),
-            (&scores, v, &finite),
-            &allowed,
-        )
-    });
+    let accelerated = match (options.backend, &scores, pipeline.weight()) {
+        (
+            Some(backend),
+            Scores::Product { q, kt },
+            Weight::Exp {
+                scale,
+                shift: Shift::KeptMaximum,
+            },
+        ) if pipeline.normalizer() != Normalizer::None
+            && nx > 0
+            && ne > 0
+            && nj > 0
+            && ny > 0
+            && q.iter().chain(*kt).chain(v.iter()).all(|x| x.is_finite()) =>
+        {
+            options.reserve(
+                (q.len() + kt.len() + v.len() + nx * ny)
+                    .saturating_mul(32)
+                    .saturating_add(nx.min(1024).saturating_mul(nj).saturating_mul(16)),
+                "attention backend buffers",
+            )?;
+            let ranges: Vec<_> = (0..nx).map(&allowed).collect();
+            backend.attention(q, kt, v, (nx, ne, nj, ny), *scale, &ranges)?
+        }
+        _ => None,
+    };
+    if accelerated.as_ref().is_some_and(|out| out.len() != nx * ny) {
+        return crate::bad("attention backend returned the wrong shape".into());
+    }
+    let tiles = if accelerated.is_some() {
+        Vec::new()
+    } else {
+        dense::par_tasks(x_tiles, threads, |t| {
+            tile(
+                pipeline,
+                t,
+                (nx, ne, nj, ny),
+                (&scores, v, &finite),
+                &allowed,
+            )
+        })
+    };
     if tiles.iter().any(|t| t.overflowed) {
         return Ok(None);
     }
@@ -402,8 +452,12 @@ pub(crate) fn pipeline(
     }
     let mut out = Vec::with_capacity(total);
     for &x in &rows {
-        let state = &tiles[x / XT];
-        out.extend_from_slice(&state.out[(x % XT) * ny..(x % XT + 1) * ny]);
+        if let Some(result) = &accelerated {
+            out.extend_from_slice(&result[x * ny..(x + 1) * ny]);
+        } else {
+            let state = &tiles[x / XT];
+            out.extend_from_slice(&state.out[(x % XT) * ny..(x % XT + 1) * ny]);
+        }
     }
     columns.push(Arc::new(Float64Array::from(out)));
     Ok(Some(Piped {

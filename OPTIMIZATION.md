@@ -152,3 +152,8 @@ The publication stack incorporates upstream main through `a60c86f`,
 resolving its session-runtime changes while retaining ordered providers and
 backend callbacks. Benchmark records identify their earlier pinned base;
 upstream changes are not attributed to these optimization measurements.
+
+The final wheel rebuilt with that upstream integration passed 128 combined
+ddx/EinFold binding tests (6 optional skips) and all 714 xarray-sql
+non-integration tests. This supersedes the earlier 126-test binding count;
+the two additional tests came from upstream EinFold.

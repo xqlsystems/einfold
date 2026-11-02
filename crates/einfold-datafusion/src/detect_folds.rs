@@ -65,6 +65,7 @@ use einfold_ir::{
 
 use crate::detect_chains;
 use crate::detect_pipelines;
+use crate::detect_shifts;
 use crate::fold_node::FoldNode;
 use crate::join_back;
 
@@ -191,7 +192,7 @@ pub(crate) fn resolve(e: &Expr, projections: &[&Projection]) -> Result<Expr> {
 
 /// Which side of a join every column of `e` reads: `Some(0)` for the left,
 /// `Some(1)` for the right, `None` for both, neither, or a column of neither.
-fn side(e: &Expr, inputs: [&DFSchema; 2]) -> Option<usize> {
+pub(crate) fn side(e: &Expr, inputs: [&DFSchema; 2]) -> Option<usize> {
     let cols = e.column_refs();
     if cols.is_empty() {
         return None;
@@ -329,7 +330,12 @@ fn fold(agg: &Aggregate, fallback: Fallback) -> Result<Option<LogicalPlan>> {
     let original = LogicalPlan::Aggregate(agg.clone());
     let pair = match analyze(agg, false)? {
         Some(found) => node_for(agg, found, original.clone(), fallback)?,
-        None => None,
+        // A fold with shifted outputs, such as a convolution, runs only by
+        // the stencil algorithm, so it always keeps the host's plan.
+        None => match detect_shifts::shifted(agg)? {
+            Some(found) => node_for(agg, found, original.clone(), Fallback::HostPlan)?,
+            None => None,
+        },
     };
     let Some(chain) = detect_chains::chain(agg)? else {
         return Ok(pair);
@@ -843,7 +849,7 @@ pub(crate) fn closed_set(
 /// take are non-negative `Int64` positions in arrays that fit in memory, far
 /// below `2⁶²`, so SQL's arithmetic on them with such offsets can't overflow,
 /// and a condition computes exactly what SQL's comparison does.
-const MAX_OFFSET: i128 = 1 << 32;
+pub(crate) const MAX_OFFSET: i128 = 1 << 32;
 
 /// `e` as conditions between two of a fold's dimensions, each `l <op> r +
 /// offset` with `l` and `r` columns that an operand holds as keys (`columns`
@@ -1020,7 +1026,7 @@ impl<'a> Linear<'a> {
 }
 
 /// A non-NULL integer literal's value.
-fn integer(value: &ScalarValue) -> Option<i128> {
+pub(crate) fn integer(value: &ScalarValue) -> Option<i128> {
     Some(match value {
         ScalarValue::Int8(Some(v)) => i128::from(*v),
         ScalarValue::Int16(Some(v)) => i128::from(*v),
@@ -1102,9 +1108,13 @@ pub(crate) fn found_fold(plan: &LogicalPlan) -> Option<(&FoldNode, Vec<usize>)> 
     match plan {
         LogicalPlan::Extension(e) => {
             let node = e.node.as_any().downcast_ref::<FoldNode>()?;
-            // A chain of three operands takes no domain yet.
-            let usable =
-                node.fold().domain().is_none() && node.fold().operands().len() == 2 && node.found();
+            // A chain of three operands takes no domain yet, and nor does a
+            // fold with shifted outputs, such as a convolution.
+            let fold = node.fold();
+            let usable = fold.domain().is_none()
+                && fold.operands().len() == 2
+                && fold.shifts().is_empty()
+                && node.found();
             usable.then(|| (node, (0..=node.fold().outputs().len()).collect()))
         }
         LogicalPlan::SubqueryAlias(a) => found_fold(&a.input),

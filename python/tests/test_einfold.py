@@ -99,6 +99,35 @@ def test_runs_a_matrix_product():
     assert found.plans_with_einfold() >= 1
 
 
+def _image_tables(ctx, channels=3, lat=12, lon=24, out=4):
+    r = np.arange(channels * lat * lon)
+    ctx.register_record_batches("x", [[pa.record_batch(
+        {"c": r // (lat * lon), "lat": r // lon % lat, "lon": r % lon,
+         "v": np.sin(r * 0.37)})]])
+    r = np.arange(out * channels * 9)
+    ctx.register_record_batches("w", [[pa.record_batch(
+        {"co": r // (channels * 9), "ci": r // 9 % channels, "ky": r // 3 % 3,
+         "kx": r % 3, "v": np.cos(r * 0.11)})]])
+
+
+# A 3 × 3 convolution with dilation 2, zero-padded in latitude and wrapping
+# around in longitude, as a U-Net over a globe writes it.
+CONVOLUTION = (
+    "SELECT * FROM (SELECT w.co AS c, x.lat - (w.ky - 1) * 2 AS lat, "
+    "(x.lon - (w.kx - 1) * 2 + 24) % 24 AS lon, SUM(x.v * w.v) AS v "
+    "FROM x JOIN w ON x.c = w.ci GROUP BY 1, 2, 3) p WHERE p.lat BETWEEN 0 AND 11")
+
+
+def test_runs_a_convolution_by_taps():
+    """A convolution's group keys shift the image's coordinates by the
+    kernel's taps; einfold computes it one dense product per tap."""
+    off, on, found = _pair(_image_tables)
+    _assert_same(off.sql(CONVOLUTION).to_arrow_table(),
+                 on.sql(CONVOLUTION).to_arrow_table())
+    analyzed = "\n".join(on.sql("EXPLAIN ANALYZE " + CONVOLUTION).to_pydict()["plan"])
+    assert "dense_folds=1" in analyzed and "%24" in analyzed, analyzed
+
+
 def test_runs_causal_attention_as_a_pipeline():
     off, on, found = _pair(_attention_tables)
     _assert_same(off.sql(ATTENTION).to_arrow_table(), on.sql(ATTENTION).to_arrow_table())

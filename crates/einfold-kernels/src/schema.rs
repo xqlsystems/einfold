@@ -18,7 +18,8 @@ use crate::{bad, Result};
 ///
 /// Without a domain, the result has one key column per output, typed as the
 /// dimension's columns are, then the value. With a domain, it has the
-/// domain's carried columns, then the value. The value is a `Float64`,
+/// domain's carried columns, then the value. A shifted output's key (see
+/// [`ShiftedOutput`](einfold_ir::ShiftedOutput)) is an `Int64`. The value is a `Float64`,
 /// nullable unless the domain gives NULLs a value.
 ///
 /// A fold names no columns, so these are named by position: `"0"`, `"1"`, ….
@@ -129,7 +130,17 @@ fn fold_schema(fold: &Fold, operands: &[&Schema], domain: Option<&Schema>) -> Re
             for o in fold.outputs() {
                 let f = types[o.dimension.0].as_ref().expect("held by an operand");
                 let name = fields.len().to_string();
-                fields.push(Field::new(name, f.data_type().clone(), f.is_nullable()));
+                // A shifted key is the host's integer arithmetic on two keys:
+                // an `Int64`, NULL where either key is.
+                let field = match fold.shift_of(o.dimension) {
+                    Some(s) => {
+                        let by = types[s.by.0].as_ref().expect("held by an operand");
+                        let nullable = f.is_nullable() || by.is_nullable();
+                        Field::new(name, DataType::Int64, nullable)
+                    }
+                    None => Field::new(name, f.data_type().clone(), f.is_nullable()),
+                };
+                fields.push(field);
             }
         }
     }

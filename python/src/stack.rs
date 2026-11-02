@@ -22,6 +22,7 @@
 //! decoded within its size.
 
 /// The soft stack limit [`deepen`] sets: room for about 2,000 joins.
+#[cfg_attr(not(target_os = "linux"), expect(dead_code))]
 pub(crate) const MAIN_STACK: u64 = 64 << 20;
 
 /// Raises the process's soft stack limit to [`MAIN_STACK`], if it is lower,

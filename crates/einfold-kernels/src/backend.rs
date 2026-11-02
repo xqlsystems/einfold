@@ -9,7 +9,7 @@ use std::fmt;
 /// An executor of dense arithmetic, after SQL keys, duplicates and NULLs
 /// have been checked. Returning None keeps the original CPU algorithm.
 pub trait DenseBackend: Send + Sync + fmt::Debug {
-    /// Batched A[w,x,z] times B[w,z,y], flattened in row-major order.
+    /// Batched `A[w,x,z]` times `B[w,z,y]`, flattened in row-major order.
     fn matmul(
         &self,
         a: &[f64],

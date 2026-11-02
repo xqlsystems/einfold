@@ -47,6 +47,7 @@
 //! fused algorithm declines.
 
 use std::any::Any;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use datafusion::common::{Column, NullEquality, Result, ScalarValue};
@@ -233,7 +234,7 @@ fn same_scores(a: &Scores, b: &Scores) -> bool {
 struct Weights {
     scores: Scores,
     shift: Shift,
-    maximum_per: Option<usize>,
+    maximum_per: Option<Vec<usize>>,
     columns: Vec<Option<usize>>,
     map: Option<Expression>,
 }
@@ -291,7 +292,7 @@ fn weights(plan: &LogicalPlan) -> Result<Option<Weights>> {
     // The relation the weights are computed over, its scores, the score
     // column, and the shift's column if there is one.
     let below = p.input.as_ref();
-    let (s_plan, shift_col, maximum_per): (&LogicalPlan, Option<Column>, Option<usize>) =
+    let (s_plan, shift_col, maximum_per): (&LogicalPlan, Option<Column>, Option<Vec<usize>>) =
         match below {
             LogicalPlan::Window(w) => {
                 let [Expr::WindowFunction(f)] = w.window_expr.as_slice() else {
@@ -351,7 +352,11 @@ fn weights(plan: &LogicalPlan) -> Result<Option<Weights>> {
                 if column(l) != kept_col.as_ref() || column(r) != Some(&maximum.key_column) {
                     return Ok(None);
                 }
-                (j.left.as_ref(), Some(maximum.maximum_column), Some(kept))
+                (
+                    j.left.as_ref(),
+                    Some(maximum.maximum_column),
+                    Some(vec![kept]),
+                )
             }
             other => (other, None, None),
         };
@@ -569,13 +574,18 @@ fn is_exp_of(e: &Expr, score: &Column) -> bool {
 
 /// The fold output `partition_by` partitions by, if it is exactly one of
 /// the scores' outputs.
-fn partition(partition_by: &[Expr], scores: &Scores, plan: &LogicalPlan) -> Option<usize> {
-    let [e] = partition_by else {
-        return None;
-    };
-    let c = column(e)?;
-    let i = plan.schema().index_of_column(c).ok()?;
-    scores.columns.get(i).copied().flatten()
+fn partition(partition_by: &[Expr], scores: &Scores, plan: &LogicalPlan) -> Option<Vec<usize>> {
+    let mut outputs: Vec<_> = partition_by
+        .iter()
+        .map(|e| {
+            let c = column(e)?;
+            let i = plan.schema().index_of_column(c).ok()?;
+            scores.columns.get(i).copied().flatten()
+        })
+        .collect::<Option<_>>()?;
+    outputs.sort_unstable();
+    outputs.dedup();
+    (!outputs.is_empty()).then_some(outputs)
 }
 
 /// The largest score of each kept output, `MAX(s) … GROUP BY i`.
@@ -754,7 +764,7 @@ pub(crate) fn pipeline(p: &Projection) -> Result<Option<LogicalPlan>> {
     // summed one: joined with the values.
     let n_outputs = fold.outputs().len();
     if n_outputs != 2 {
-        return Ok(None);
+        return pipeline_many(p);
     }
     let mut summed = None;
     let mut values_key = None;
@@ -777,7 +787,7 @@ pub(crate) fn pipeline(p: &Projection) -> Result<Option<LogicalPlan>> {
     let kept = 1 - summed;
     // The maximum, if any, must be over the kept output's scores, or the
     // shift wouldn't cancel.
-    if weights.shift == Shift::KeptMaximum && weights.maximum_per != Some(kept) {
+    if weights.shift == Shift::KeptMaximum && weights.maximum_per != Some(vec![kept]) {
         return Ok(None);
     }
     // The normalizer: the same weights, summed by the kept output.
@@ -893,6 +903,268 @@ pub(crate) fn pipeline(p: &Projection) -> Result<Option<LogicalPlan>> {
         return Ok(None);
     };
     detect_folds::restore(node.into_plan(), &names, &p.schema)
+}
+
+/// A normalized pipeline with several kept keys, including batch and head.
+/// Only exact inner equijoins of the weights, values and matching normalizer
+/// qualify. The existing detector handles the other single-key spellings.
+fn pipeline_many(p: &Projection) -> Result<Option<LogicalPlan>> {
+    let LogicalPlan::Aggregate(agg) = p.input.as_ref() else {
+        return Ok(None);
+    };
+    if agg.aggr_expr.len() != 1 {
+        return Ok(None);
+    }
+    let groups = agg.group_expr.len();
+    let Some((value, projected)) = p.expr.split_last() else {
+        return Ok(None);
+    };
+    if value.clone().unalias() != Expr::Column(column_at(&p.input, groups))
+        || projected.len() != groups
+    {
+        return Ok(None);
+    }
+    let Some(sum) = detect_folds::sum_argument_at(agg, 0) else {
+        return Ok(None);
+    };
+    let Some((product, z)) = divided(trace(&agg.input, &sum)?) else {
+        return Ok(None);
+    };
+    let Expr::BinaryExpr(BinaryExpr {
+        left,
+        op: Operator::Multiply,
+        right,
+    }) = product
+    else {
+        return Ok(None);
+    };
+    let (mut relations, mut on) = (Vec::new(), Vec::new());
+    if !leaves(&agg.input, &mut relations, &mut on)? || relations.len() != 3 {
+        return Ok(None);
+    }
+    let mut found = None;
+    for (w, x) in [(&left, &right), (&right, &left)] {
+        let (Some(wl), Some(vl), Some(wc), Some(xc)) = (
+            leaf_of(w, &relations),
+            leaf_of(x, &relations),
+            column(w),
+            column(x),
+        ) else {
+            continue;
+        };
+        if wl != vl {
+            if let Some(weights) = weights(relations[wl])? {
+                found = Some((wl, vl, wc.clone(), xc.clone(), weights));
+                break;
+            }
+        }
+    }
+    let Some((wl, vl, wc, xc, weights)) = found else {
+        return Ok(None);
+    };
+    let Some(nl) = leaf_of(&z, &relations) else {
+        return Ok(None);
+    };
+    if nl == wl || nl == vl {
+        return Ok(None);
+    }
+    let w_rel = relations[wl];
+    let w_role = |e: &Expr| -> Option<Option<usize>> {
+        let i = w_rel.schema().index_of_column(column(e)?).ok()?;
+        weights.columns.get(i).copied()
+    };
+    if w_role(&Expr::Column(wc)) != Some(None) {
+        return Ok(None);
+    }
+    let fold = &weights.scores.found.fold;
+    let (mut joined, mut normalized) = (BTreeMap::new(), BTreeMap::new());
+    for (l, r) in &on {
+        let (a, b) = if leaf_of(l, &relations) == Some(wl) {
+            (l, r)
+        } else if leaf_of(r, &relations) == Some(wl) {
+            (r, l)
+        } else {
+            return Ok(None);
+        };
+        let (Some(Some(o)), Some(c)) = (w_role(a), column(b)) else {
+            return Ok(None);
+        };
+        let target = match leaf_of(b, &relations) {
+            Some(l) if l == vl => &mut joined,
+            Some(l) if l == nl => &mut normalized,
+            _ => return Ok(None),
+        };
+        if target.insert(o, c.clone()).is_some() {
+            return Ok(None);
+        }
+    }
+    let mut kept = BTreeSet::new();
+    let mut traced_keys = Vec::new();
+    let mut shown = BTreeSet::new();
+    for e in projected {
+        let Some(c) = column(&e.clone().unalias()).cloned() else {
+            return Ok(None);
+        };
+        let Some(g) = (0..groups).find(|&g| column_at(&p.input, g) == c) else {
+            return Ok(None);
+        };
+        if !shown.insert(g) {
+            return Ok(None);
+        }
+        let traced = trace(&agg.input, &agg.group_expr[g])?;
+        let role = match leaf_of(&traced, &relations) {
+            Some(l) if l == wl => w_role(&traced).flatten(),
+            Some(l) if l == vl => joined
+                .iter()
+                .find_map(|(&o, c)| (column(&traced) == Some(c)).then_some(o)),
+            _ => return Ok(None),
+        };
+        if let Some(o) = role {
+            kept.insert(o);
+        }
+        traced_keys.push((traced, role));
+    }
+    let kept: Vec<_> = kept.into_iter().collect();
+    if kept.is_empty()
+        || normalized.keys().copied().collect::<Vec<_>>() != kept
+        || (weights.shift == Shift::KeptMaximum && weights.maximum_per.as_ref() != Some(&kept))
+        || (0..fold.outputs().len()).any(|o| !kept.contains(&o) && !joined.contains_key(&o))
+        || !normalizes_many(relations[nl], &weights, &normalized, column(&z))?
+    {
+        return Ok(None);
+    }
+    let producer_dims = fold.dimensions().len();
+    let mut values_columns: Vec<Column> = joined.values().cloned().collect();
+    let mut keys_of_values: Vec<Key> = joined
+        .keys()
+        .enumerate()
+        .map(|(i, &o)| Key::new(fold.outputs()[o].dimension, ColumnIndex(i)))
+        .collect();
+    if keys_of_values
+        .iter()
+        .any(|k| fold.dimension(k.dimension).equality != KeyEquality::Equal)
+    {
+        return Ok(None);
+    }
+    let (mut own, mut outputs, mut names) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, (traced, role)) in traced_keys.into_iter().enumerate() {
+        let d = if let Some(o) = role {
+            fold.outputs()[o].dimension
+        } else {
+            let Some(c) = column(&traced) else {
+                return Ok(None);
+            };
+            if leaf_of(&traced, &relations) != Some(vl) {
+                return Ok(None);
+            }
+            let d = DimensionId(producer_dims + own.len());
+            own.push(Dimension {
+                equality: KeyEquality::Equal,
+            });
+            keys_of_values.push(Key::new(d, ColumnIndex(values_columns.len())));
+            values_columns.push(c.clone());
+            d
+        };
+        outputs.push(d);
+        names.push(format!("{PREFIX}o{i}"));
+    }
+    names.push(format!("{PREFIX}v"));
+    let values = Operand {
+        keys: keys_of_values,
+        factor: Some(ColumnIndex(values_columns.len())),
+    };
+    let mut exprs: Vec<Expr> = values_columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| Expr::Column(c.clone()).alias(format!("k{i}")))
+        .collect();
+    exprs.push(Expr::Column(xc).alias("f"));
+    let values_plan =
+        LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(relations[vl].clone()))?);
+    let weight = match &weights.map {
+        Some(f) => Weight::Of(of_value(f, weights.scores.scale)),
+        None => Weight::Exp {
+            scale: weights.scores.scale,
+            shift: weights.shift,
+        },
+    };
+    let Ok(pipeline) = Pipeline::try_new(
+        fold.clone(),
+        weight,
+        own,
+        values,
+        outputs,
+        Normalizer::KeptGroups,
+    ) else {
+        return Ok(None);
+    };
+    let [q, k] =
+        <[LogicalPlan; 2]>::try_from(weights.scores.found.operands.clone()).expect("two operands");
+    let Ok(node) = PipelineNode::try_new(
+        pipeline,
+        [q, k, values_plan],
+        names.clone(),
+        LogicalPlan::Projection(p.clone()),
+    ) else {
+        return Ok(None);
+    };
+    detect_folds::restore(node.into_plan(), &names, &p.schema)
+}
+
+/// A SUM of exactly the same weights, grouped by all kept keys, joined on
+/// each of those keys and with its one sum used as the denominator.
+fn normalizes_many(
+    plan: &LogicalPlan,
+    weights: &Weights,
+    keys: &BTreeMap<usize, Column>,
+    z: Option<&Column>,
+) -> Result<bool> {
+    let Some(z) = z else { return Ok(false) };
+    let LogicalPlan::Projection(p) = strip(plan) else {
+        return Ok(false);
+    };
+    let LogicalPlan::Aggregate(agg) = p.input.as_ref() else {
+        return Ok(false);
+    };
+    if agg.group_expr.len() != keys.len() || agg.aggr_expr.len() != 1 {
+        return Ok(false);
+    }
+    let Some(arg) = detect_folds::sum_argument_at(agg, 0) else {
+        return Ok(false);
+    };
+    let Some(theirs) = self::weights(&agg.input)? else {
+        return Ok(false);
+    };
+    if !same_scores(&theirs.scores, &weights.scores)
+        || theirs.shift != weights.shift
+        || theirs.maximum_per != weights.maximum_per
+    {
+        return Ok(false);
+    }
+    let role = |e: &Expr| -> Option<Option<usize>> {
+        let i = agg.input.schema().index_of_column(column(e)?).ok()?;
+        theirs.columns.get(i).copied()
+    };
+    if role(&arg) != Some(None) {
+        return Ok(false);
+    }
+    let shown = |c: Column| -> Option<Column> {
+        let i = p
+            .expr
+            .iter()
+            .position(|e| e.clone().unalias() == Expr::Column(c.clone()))?;
+        Some(column_at(plan, i))
+    };
+    let mut seen = BTreeSet::new();
+    for (i, g) in agg.group_expr.iter().enumerate() {
+        let Some(Some(o)) = role(g) else {
+            return Ok(false);
+        };
+        if !seen.insert(o) || shown(column_at(&p.input, i)).as_ref() != keys.get(&o) {
+            return Ok(false);
+        }
+    }
+    Ok(shown(column_at(&p.input, agg.group_expr.len())).as_ref() == Some(z))
 }
 
 /// `e` as a product divided by a column: `a / z * b`, `b * (a / z)` or

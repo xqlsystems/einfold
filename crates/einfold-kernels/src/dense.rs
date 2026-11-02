@@ -75,7 +75,7 @@ const ZB: usize = 4096;
 const FEW_CELLS: usize = 4096;
 /// Input rows below which a fold runs on one thread: starting threads costs
 /// tens of microseconds each, about what folding this many rows does.
-const FEW_ROWS: usize = 1 << 16;
+pub(crate) const FEW_ROWS: usize = 1 << 16;
 /// What a position of `a` holds: no row, a row with a NULL factor, or a row
 /// with a value.
 const ABSENT: u8 = 0;
@@ -86,7 +86,7 @@ const VALUED: u8 = 2;
 /// more than four cells per row, plus some slack for small inputs. Measured
 /// on CPU, a dense product beats a hash-based one once about a fifth of its
 /// cells hold rows, and one row in four cells is past that.
-fn worth(cells: usize, rows: usize) -> bool {
+pub(crate) fn worth(cells: usize, rows: usize) -> bool {
     cells <= rows.saturating_mul(4).saturating_add(FEW_CELLS) && cells < u32::MAX as usize
 }
 

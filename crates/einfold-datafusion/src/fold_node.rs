@@ -16,7 +16,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::common::{plan_err, DFSchema, DFSchemaRef, Result};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan, UserDefinedLogicalNodeCore};
-use einfold_ir::{ColumnIndex, Comparison, DimensionId, Fold, RowValue};
+use einfold_ir::{ColumnIndex, Comparison, DimensionId, Fold, RowValue, ShiftedOutput};
 use einfold_kernels::DomainRows;
 
 /// A fold over a join in a DataFusion logical plan. Its inputs are the fold's
@@ -273,7 +273,8 @@ impl UserDefinedLogicalNodeCore for FoldNode {
 /// The fold in einsum notation for `EXPLAIN`: each operand's dimensions,
 /// then the outputs, such as `a,b * b,c -> a,c` for a matrix product, with
 /// `+ domain` when there is one (`+ unique domain` when the node requires
-/// its keys to be unique), and its conditions after `where`. Dimensions are lettered by number, as the
+/// its keys to be unique), and its conditions after `where`. A shifted
+/// output is shown as its key's sum, such as `(b-2e+2) in 0..=31`. Dimensions are lettered by number, as the
 /// fold names none; past `z`, they are shown as `#26`, `#27`, ….
 pub(crate) fn describe(fold: &Fold, domain_rows: DomainRows) -> String {
     let name = |DimensionId(d): DimensionId| match u8::try_from(d) {
@@ -291,7 +292,46 @@ pub(crate) fn describe(fold: &Fold, domain_rows: DomainRows) -> String {
                 .join(",")
         })
         .collect();
-    let outputs: Vec<String> = fold.outputs().iter().map(|o| name(o.dimension)).collect();
+    // A shifted output is shown as its key's sum, such as `(b-2e+2)` for a
+    // dilated convolution's, then `%` its period or `in` its bounds.
+    let shifted = |s: &ShiftedOutput| {
+        let term = |k: i64, d: DimensionId, first: bool| {
+            let sign = match (k < 0, first) {
+                (true, _) => "-",
+                (false, true) => "",
+                (false, false) => "+",
+            };
+            let scale = match k.unsigned_abs() {
+                1 => String::new(),
+                k => k.to_string(),
+            };
+            format!("{sign}{scale}{}", name(d))
+        };
+        let offset = match s.offset {
+            0 => String::new(),
+            o if o < 0 => o.to_string(),
+            o => format!("+{o}"),
+        };
+        let sum = format!(
+            "({}{}{offset})",
+            term(s.scale, s.output, true),
+            term(s.by_scale, s.by, false)
+        );
+        match (s.period, s.low, s.high) {
+            (Some(p), _, _) => format!("{sum}%{p}"),
+            (None, None, None) => sum,
+            (None, low, high) => {
+                let at = |b: Option<i64>| b.map_or(String::new(), |b| b.to_string());
+                format!("{sum} in {}..={}", at(low), at(high))
+            }
+        }
+    };
+    let outputs: Vec<String> = (fold.outputs().iter())
+        .map(|o| match fold.shift_of(o.dimension) {
+            Some(s) => shifted(s),
+            None => name(o.dimension),
+        })
+        .collect();
     let conditions: Vec<String> = (fold.conditions().iter())
         .map(|c| {
             let op = match c.comparison {

@@ -15,7 +15,7 @@ use einfold_ir::{Fold, Pipeline};
 use crate::fused::Piped;
 use crate::options::{DomainRows, Options};
 use crate::relation::Relation;
-use crate::{bad, chain, dense, discriminate, fused, Result};
+use crate::{bad, chain, dense, discriminate, fused, stencil, Result};
 
 /// Which algorithm computed a fold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -46,9 +46,11 @@ pub struct Folded {
 
 /// [`fold`] by the dense algorithm alone, or `None` when its requirements
 /// don't hold (as for a fold with [conditions](einfold_ir::Condition) on a
-/// dimension it sums away), for a
-/// caller that would rather run something else, such as the host's plan,
-/// than the discrimination algorithm.
+/// dimension it sums away), for a caller that would rather run something
+/// else, such as the host's plan, than the discrimination algorithm. A fold
+/// with [shifted outputs](einfold_ir::ShiftedOutput), such as a
+/// convolution, runs by the stencil algorithm instead: one dense product
+/// per tap of its kernel.
 pub fn fold_dense(
     fold: &Fold,
     a: Relation,
@@ -57,6 +59,14 @@ pub fn fold_dense(
     schema: SchemaRef,
     options: Options,
 ) -> Result<Option<Vec<RecordBatch>>> {
+    // A fold with shifted outputs, such as a convolution, runs by the
+    // stencil algorithm, the dense algorithm's kin, or not at all.
+    if !fold.shifts().is_empty() {
+        return match domain {
+            Some(_) => Ok(None),
+            None => stencil::fold(fold, a.batches, b.batches, schema, &options),
+        };
+    }
     let domain = domain.map(|d| d.batches);
     dense::fold(fold, a.batches, b.batches, domain, schema, &options)
 }
@@ -79,6 +89,9 @@ pub fn fold_chain(
     schema: SchemaRef,
     options: Options,
 ) -> Result<Option<Vec<RecordBatch>>> {
+    if !fold.shifts().is_empty() {
+        return Ok(None);
+    }
     chain::fold(fold, operands, schema, &options)
 }
 
@@ -104,6 +117,9 @@ pub fn fold(
 ) -> Result<Folded> {
     if options.domain_rows == DomainRows::UniqueKeys {
         return bad("only fold_dense checks that a domain's keys are unique".into());
+    }
+    if !fold.shifts().is_empty() {
+        return bad("only fold_dense computes shifted outputs".into());
     }
     let domain = domain.map(|d| d.batches);
     let dense = dense::fold(fold, a.batches, b.batches, domain, schema.clone(), &options)?;

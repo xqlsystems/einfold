@@ -14,6 +14,6 @@ pub mod pipeline;
 pub use expression::{Binary, Constant, Expression, Unary};
 pub use fold::{
     Aggregate, ColumnIndex, Comparison, Condition, Dimension, DimensionId, Domain, DomainKey,
-    Finish, Fold, InvalidFold, Key, KeyEquality, Monoid, Operand, Output, RowValue,
+    Finish, Fold, InvalidFold, Key, KeyEquality, Monoid, Operand, Output, RowValue, ShiftedOutput,
 };
 pub use pipeline::{Normalizer, Pipeline, Scale, Shift, Weight};

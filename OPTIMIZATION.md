@@ -135,3 +135,20 @@ bridge and the optional compact array prototype. xarray-sql's
 `NANOGPT_PERFORMANCE.md` and `benchmarks/apple` contain the timing commands,
 raw evidence and limitations. No default optimizer or precision policy
 is silently changed by importing the extension.
+
+The persistent checkout passed workspace and Python-extension Clippy with
+warnings denied, Rust formatting, warning-free Rust docs and REUSE license
+checks. The rebuilt wheel passed the combined ddx/EinFold Python suite
+(126 passed, 6 optional skips), then xarray-sql passed all 714
+non-integration tests against the rebuilt dependency wheels.
+
+The full Rust workspace run had 72 passes, 4 ignored tests and one failure:
+`nan_compares_by_its_sign`, a DataFusion floating-point behavior assertion.
+Running that exact test on the unmodified pinned base reproduced the same
+`[true, true]` versus `[true, false]` failure on this macOS host. It is a
+baseline limitation, not a passing check; it is disclosed in the PRs.
+
+The publication stack incorporates upstream main through `a60c86f`,
+resolving its session-runtime changes while retaining ordered providers and
+backend callbacks. Benchmark records identify their earlier pinned base;
+upstream changes are not attributed to these optimization measurements.

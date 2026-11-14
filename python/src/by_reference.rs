@@ -11,7 +11,9 @@
 //! data, which would copy every table a query reads. The planner runs in the
 //! session's own process, so a reference is enough: a table or plan is
 //! encoded as an index into a registry here, and decoded back to the same
-//! object.
+//! object. A plan decodes with its state reset, such as a hash join's
+//! table, because decoding is also how a session copies a plan to run it
+//! again.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -156,7 +158,10 @@ impl PhysicalExtensionCodec for ByReference {
             return plan_err!("einfold's codec holds no plan {id}");
         };
         match inputs.is_empty() {
-            true => Ok(plan),
+            // A copy of the plan, as a session makes one to run a plan
+            // again: its operators' state reset, its tables' buffers shared.
+            // The plan itself may have run, so it isn't a copy.
+            true => datafusion::physical_plan::execution_plan::reset_plan_states(plan),
             // A node whose children the decoder rebuilt.
             #[allow(deprecated)]
             false => plan.with_new_children(inputs.to_vec()),

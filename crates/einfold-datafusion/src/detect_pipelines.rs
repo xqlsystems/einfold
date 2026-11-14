@@ -963,9 +963,13 @@ fn normalizes(
     let Some(theirs) = self::weights(&agg.input)? else {
         return Ok(false);
     };
+    // The same weights: the same scores, and the same expression of them. A
+    // normalizer of a sigmoid of the scores doesn't normalize their
+    // exponentials.
     let same = same_scores(&theirs.scores, &weights.scores)
         && theirs.shift == weights.shift
-        && theirs.maximum_per == weights.maximum_per;
+        && theirs.maximum_per == weights.maximum_per
+        && theirs.map == weights.map;
     let role = |e: &Expr| {
         let i = agg.input.schema().index_of_column(column(e)?).ok()?;
         theirs.columns.get(i).copied()

@@ -33,8 +33,9 @@
 //!   coordinate `d`, the Nadaraya–Watson estimator's shape;
 //! - **look-alikes** it must leave alone: a maximum partitioned by the summed
 //!   key or ordered, a normalizer of an expression of the weights
-//!   (`exp(2 * w)`), and a normalizer of weights over other scores (the same
-//!   fold, scaled differently).
+//!   (`exp(2 * w)`), a normalizer of other weights of the same scores (a
+//!   sigmoid's against an exponential's), and a normalizer of weights over
+//!   other scores (the same fold, scaled differently).
 //!
 //! Invariants: the same rows as DataFusion without einfold, values within
 //! `1e-9` of its, and the same NaNs and infinities; a pipeline found exactly
@@ -190,6 +191,26 @@ fn query(rng: &mut Rng) -> (String, Expect) {
                 Expect::Decline,
             ),
         },
+        // The normalizer sums other weights of the same scores, a sigmoid
+        // against an exponential, so it doesn't normalize the sum.
+        7 if rng.chance(0.5) => {
+            let (ours, theirs) = match rng.chance(0.5) {
+                true => (sigmoid, "exp(s)"),
+                false => (
+                    "weights AS (SELECT i, j, exp(s) AS w FROM scores)",
+                    "1.0 / (1.0 + exp(-s))",
+                ),
+            };
+            let other = format!(
+                "WITH {scores}, {ours}, \
+                 others AS (SELECT i, j, {theirs} AS w FROM scores), \
+                 norm AS (SELECT i, SUM(w) AS z FROM others GROUP BY i) \
+                 SELECT weights.i AS t, v.c, SUM(weights.w * v.x) / norm.z AS x \
+                 FROM weights JOIN v ON weights.j = v.t JOIN norm ON weights.i = norm.i \
+                 GROUP BY weights.i, v.c, norm.z"
+            );
+            (other, Expect::Decline)
+        }
         _ => {
             // The normalizer sums weights of other scores: the same fold,
             // scaled differently, so the shift doesn't cancel.

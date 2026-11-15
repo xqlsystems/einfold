@@ -36,6 +36,11 @@
 //! **Sort-merge join filters** (apache/datafusion#24414, fixed after 55.2).
 //! A sort-merge join's filter can read the wrong columns once a projection is
 //! pushed into the join.
+//!
+//! **A group returned twice** (einfold issue #165). With one target
+//! partition, a `GROUP BY` over a hash join can take its input to be ordered
+//! by a key the join doesn't keep in order, and return a group twice, its sum
+//! split between the two rows.
 
 use std::sync::Arc;
 
@@ -371,4 +376,85 @@ async fn nan_compares_by_its_sign() {
     // `NaN` is above 1.0, and the NaN that `inf - inf` makes is below it.
     assert_eq!(column(0), [true, false]);
     assert_eq!(column(1), [false, true]);
+}
+
+/// A complete table `name(b, h, t, <last>, x)` over `extents`, keys in C
+/// order and `x` the value of each row's number, as a `MemTable` of two
+/// partitions split at half its rows.
+fn complete_table(
+    ctx: &SessionContext,
+    name: &str,
+    last: &str,
+    extents: [usize; 4],
+    x: impl Fn(usize) -> f64,
+) {
+    let mut fields: Vec<Field> = (["b", "h", "t", last].iter())
+        .map(|c| Field::new(*c, DataType::Int64, false))
+        .collect();
+    fields.push(Field::new("x", DataType::Float64, false));
+    let schema = Arc::new(Schema::new(fields));
+    let rows = extents.iter().product::<usize>();
+    let key = |r: usize, c: usize| -> i64 {
+        let stride: usize = extents[c + 1..].iter().product();
+        ((r / stride) % extents[c]) as i64
+    };
+    let mut columns: Vec<ArrayRef> = (0..4)
+        .map(|c| Arc::new(Int64Array::from_iter_values((0..rows).map(|r| key(r, c)))) as _)
+        .collect();
+    columns.push(Arc::new(Float64Array::from_iter_values((0..rows).map(x))));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+    let half = rows / 2;
+    let parts = vec![
+        vec![batch.slice(0, half)],
+        vec![batch.slice(half, rows - half)],
+    ];
+    let table = MemTable::try_new(schema, parts).unwrap();
+    ctx.register_table(name, Arc::new(table)).unwrap();
+}
+
+/// Pins einfold issue #165: attention per batch and head, its normalizer
+/// joined on the batch and query but not the head, gives 116 rows for 114
+/// groups on one target partition. The final aggregate takes its input as
+/// ordered by the head, which comes from the hash join's build side, in no
+/// order. With more partitions it gives 114. Once this is fixed, this fails:
+/// then assert one row per group, and let the batched pipeline property test
+/// draw one partition again.
+#[tokio::test]
+async fn group_by_over_a_join_can_return_a_group_twice() {
+    let config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+    let ctx = SessionContext::new_with_config(config);
+    let (b, h, t) = (1, 3, 38);
+    complete_table(&ctx, "q", "d", [b, h, t, 5], |r| {
+        ((r * 7919) % 101) as f64 / 50.0 - 1.0
+    });
+    complete_table(&ctx, "k", "d", [b, h, t, 5], |r| {
+        ((r * 104_729) % 97) as f64 / 48.0 - 1.0
+    });
+    complete_table(&ctx, "v", "c", [b, h, t, 1], |r| r as f64);
+    let sql = "WITH scores AS (SELECT q.b, q.h, q.t AS i, k.t AS j, SUM(q.x * k.x) / 8.0 AS s \
+                 FROM q JOIN k ON q.b = k.b AND q.h = k.h AND q.d = k.d \
+                 GROUP BY q.b, q.h, q.t, k.t), \
+               weights AS (SELECT b, h, i, j, \
+                 exp(s - MAX(s) OVER (PARTITION BY i, h, b)) AS w FROM scores), \
+               norm AS (SELECT b, h, i, SUM(w) AS z FROM weights GROUP BY b, h, i) \
+               SELECT weights.b, weights.h, weights.i, v.c, SUM(weights.w / norm.z * v.x) AS x \
+               FROM weights JOIN v ON weights.j = v.t AND weights.b = v.b AND weights.h = v.h \
+               JOIN norm ON weights.i = norm.i AND weights.b = norm.b \
+               GROUP BY weights.b, weights.h, weights.i, v.c";
+    let mut groups = Vec::new();
+    for batch in run(&ctx, sql).await {
+        let key = |c: usize| batch.column(c).as_primitive::<Int64Type>().clone();
+        let keys = [key(0), key(1), key(2), key(3)];
+        for r in 0..batch.num_rows() {
+            groups.push(keys.iter().map(|k| k.value(r)).collect::<Vec<_>>());
+        }
+    }
+    let rows = groups.len();
+    groups.sort();
+    groups.dedup();
+    assert_eq!(groups.len(), b * h * t);
+    assert!(
+        rows > groups.len(),
+        "{rows} rows, one per group: #165 is fixed"
+    );
 }

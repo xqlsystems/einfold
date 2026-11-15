@@ -115,7 +115,8 @@ pub struct Piped {
     pub batches: Vec<RecordBatch>,
     /// Pairs of an X tile and a J tile that were computed.
     pub tiles_visited: usize,
-    /// Every pair of an X tile and a J tile.
+    /// Every pair of an X tile and a J tile in the same batch: every pair,
+    /// without batch keys.
     pub tiles: usize,
 }
 
@@ -163,7 +164,7 @@ pub(crate) fn pipeline(
     let n = own + pipeline.dimensions().len();
     let holds = |op: &Operand, d: usize| op.column_of(DimensionId(d)).is_some();
     let output = |d: usize| pipeline.outputs().contains(&DimensionId(d));
-    let (mut xs, mut es, mut js) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut ws, mut xs, mut es, mut js) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for d in 0..own {
         let produced = producer.output_of(DimensionId(d)).is_some();
         match (
@@ -173,6 +174,10 @@ pub(crate) fn pipeline(
             output(d),
             holds(values, d),
         ) {
+            // A batch key, such as attention's batch and head: in every
+            // operand and every group, so each of its positions is a
+            // pipeline of its own.
+            (true, true, true, true, true) => ws.push(d),
             (true, false, true, true, false) => xs.push(d),
             (true, true, false, false, false) => es.push(d),
             (false, true, true, false, true) => js.push(d),
@@ -207,6 +212,15 @@ pub(crate) fn pipeline(
         };
         mask.push(condition);
     }
+
+    // Batch keys lead both the X and the J positions, so that each batch's
+    // positions are a contiguous range of each, and `allowed` keeps each X
+    // position to its own batch's J positions. Placing the operands below
+    // still checks that every one has exactly one row per key tuple.
+    let local_xs = xs.clone();
+    let local_js = js.clone();
+    xs.splice(0..0, ws.iter().copied());
+    js.splice(0..0, ws.iter().copied());
 
     // The producer's columns: each operand's factor for a product, or every
     // column its expression reads.
@@ -287,6 +301,9 @@ pub(crate) fn pipeline(
     else {
         return Ok(None);
     };
+    let (Some(local_nx), Some(local_nj)) = (size(&local_xs), size(&local_js)) else {
+        return Ok(None);
+    };
     let mut matrices = Vec::new();
     for (p, batch_keys) in placements.iter().zip(all_keys) {
         let keys: Vec<Vec<(usize, Int64Array)>> = (batch_keys.into_iter())
@@ -328,8 +345,10 @@ pub(crate) fn pipeline(
     // allows `j > x - c`, and so on, worked in i128 so that no offset
     // overflows, then clamped to the J positions.
     let allowed = |x: usize| -> (usize, usize) {
+        let group_start = (x / local_nx) * local_nj;
+        let x = x % local_nx;
         let x = i128::try_from(x).expect("a position fits in i128");
-        let n = i128::try_from(nj).expect("an extent fits in i128");
+        let n = i128::try_from(local_nj).expect("an extent fits in i128");
         let (mut lo, mut hi) = (0i128, n);
         for condition in &mask {
             let bound = x - i128::from(condition.offset);
@@ -340,7 +359,8 @@ pub(crate) fn pipeline(
                 _ => lo = lo.max(bound + 1),
             }
         }
-        let clamp = |p: i128| usize::try_from(p.clamp(0, n)).expect("clamped to the extent");
+        let clamp =
+            |p: i128| group_start + usize::try_from(p.clamp(0, n)).expect("clamped to the extent");
         (clamp(lo), clamp(hi.max(lo)))
     };
     // Whether each J position's values are all finite: sums of finite terms
@@ -348,7 +368,19 @@ pub(crate) fn pipeline(
     let finite: Vec<bool> = (0..nj)
         .map(|j| v[j * ny..(j + 1) * ny].iter().all(|x| x.is_finite()))
         .collect();
-    let (x_tiles, j_tiles) = (nx.div_ceil(XT), nj.div_ceil(JT));
+    let x_tiles = nx.div_ceil(XT);
+    // The pairs of tiles that share a batch: for each X tile, the J tiles of
+    // the batches its rows are in. Without batch keys, every pair.
+    let tile_pairs = (0..x_tiles)
+        .map(|t| {
+            let (x0, x1) = (t * XT, ((t + 1) * XT).min(nx));
+            let (start, end) = (
+                x0 / local_nx * local_nj,
+                (x1 - 1) / local_nx * local_nj + local_nj,
+            );
+            end.div_ceil(JT) - start / JT
+        })
+        .sum();
     let tiles = dense::par_tasks(x_tiles, threads, |t| {
         tile(
             pipeline,
@@ -409,7 +441,7 @@ pub(crate) fn pipeline(
     Ok(Some(Piped {
         batches: vec![RecordBatch::try_new(schema, columns)?],
         tiles_visited,
-        tiles: x_tiles * j_tiles,
+        tiles: tile_pairs,
     }))
 }
 
@@ -499,7 +531,16 @@ fn tile(
     let unnormalized = pipeline.normalizer() == Normalizer::None;
     // Whether each row has summed a value that isn't finite.
     let mut special = vec![false; rows];
-    for j0 in (0..nj).step_by(JT) {
+    // The J positions any row of the tile may see, so that the loop starts
+    // and ends at the tiles they lie in: with batch keys, every other batch's
+    // tiles lie outside, and the work stays linear in the number of batches.
+    let (first, last) = (x0..x1)
+        .map(allowed)
+        .filter(|&(lo, hi)| lo < hi)
+        .fold((nj, 0), |(first, last), (lo, hi)| {
+            (first.min(lo), last.max(hi))
+        });
+    for j0 in (first - first % JT..last).step_by(JT) {
         let width = JT.min(nj - j0);
         // Each row's allowed positions within this tile, relative to j0.
         let spans: Vec<(usize, usize)> = (x0..x1)

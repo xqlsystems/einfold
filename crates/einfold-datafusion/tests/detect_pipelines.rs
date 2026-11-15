@@ -523,3 +523,275 @@ async fn the_nadaraya_watson_control_fuses() {
         assert!(p == q && (x - y).abs() <= 1e-12, "{p}: {x}, DataFusion {y}");
     }
 }
+
+/// A query over batched tables `q(b, h, t, d, x)`, `k(…)` and `v(b, h, t, c,
+/// x)`, as a transformer's attention per batch `b` and head `h`, and what it
+/// must be: a pipeline, a look-alike, or either, for a spelling detection
+/// may not prove but that it must answer as SQL does.
+fn batched_query(rng: &mut Rng) -> (String, Option<Expect>) {
+    let scale = [" / 8.0", ""][rng.below(2)];
+    let mask = [" AND q.t >= k.t", ""][rng.below(2)];
+    let scores = format!(
+        "scores AS (SELECT q.b, q.h, q.t AS i, k.t AS j, SUM(q.x * k.x){scale} AS s \
+         FROM q JOIN k ON q.b = k.b AND q.h = k.h AND q.d = k.d{mask} \
+         GROUP BY q.b, q.h, q.t, k.t)"
+    );
+    // The maximum per kept group, the keys in any order; or no shift; or a
+    // sigmoid's weights.
+    let partition = ["b, h, i", "i, h, b", "h, b, i"][rng.below(3)];
+    let shifted = format!(
+        "weights AS (SELECT b, h, i, j, exp(s - MAX(s) OVER (PARTITION BY {partition})) AS w \
+         FROM scores)"
+    );
+    let plain = "weights AS (SELECT b, h, i, j, exp(s) AS w FROM scores)".to_string();
+    let sigmoid = "weights AS (SELECT b, h, i, j, 1.0 / (1.0 + exp(-s)) AS w FROM scores)";
+    let weights = match rng.below(3) {
+        0 => shifted,
+        1 => plain,
+        _ => sigmoid.to_string(),
+    };
+    let norm = "norm AS (SELECT b, h, i, SUM(w) AS z FROM weights GROUP BY b, h, i)";
+    // The normalizer inside the sum, as ddx writes it, joined on every kept
+    // key; `on_v` and `on_norm` may leave one out, and `keys` choose the
+    // groups.
+    let average = |weights: &str, norm: &str, on_v: &str, on_norm: &str, keys: &str| {
+        format!(
+            "WITH {scores}, {weights}, {norm} \
+             SELECT {keys}, v.c, SUM(weights.w / norm.z * v.x) AS x \
+             FROM weights JOIN v ON weights.j = v.t{on_v} \
+             JOIN norm ON weights.i = norm.i{on_norm} \
+             GROUP BY {keys}, v.c"
+        )
+    };
+    let all_v = " AND weights.b = v.b AND weights.h = v.h";
+    let all_norm = " AND weights.b = norm.b AND weights.h = norm.h";
+    let kept = "weights.b, weights.h, weights.i";
+    match rng.below(8) {
+        0..=2 => (
+            average(&weights, norm, all_v, all_norm, kept),
+            Some(Expect::Pipeline),
+        ),
+        // The normalizer joined on two of its three keys, so each weight
+        // meets every head's normalizer.
+        3 => (
+            average(&weights, norm, all_v, " AND weights.b = norm.b", kept),
+            Some(Expect::Decline),
+        ),
+        // A head summed away: the groups keep only b and i.
+        4 => (
+            average(&weights, norm, all_v, all_norm, "weights.b, weights.i"),
+            Some(Expect::Decline),
+        ),
+        // The normalizer sums other weights of the same scores, a sigmoid's
+        // against an exponential's.
+        5 => {
+            let other = "others AS (SELECT b, h, i, j, exp(s) AS w FROM scores), \
+                         norm AS (SELECT b, h, i, SUM(w) AS z FROM others GROUP BY b, h, i)";
+            let weights = sigmoid;
+            (
+                average(weights, other, all_v, all_norm, kept),
+                Some(Expect::Decline),
+            )
+        }
+        // The values joined without the head, so each weight meets every
+        // head's values; or the maximum per batch and query, not per head.
+        // Either may be found, and must answer as SQL does.
+        6 => (
+            average(&weights, norm, " AND weights.b = v.b", all_norm, kept),
+            None,
+        ),
+        _ => {
+            let weights = "weights AS (SELECT b, h, i, j, \
+                           exp(s - MAX(s) OVER (PARTITION BY b, i)) AS w FROM scores)";
+            (average(weights, norm, all_v, all_norm, kept), None)
+        }
+    }
+}
+
+/// Registers `name` as a complete table of `extents` rows over `columns`,
+/// each key a position, with a value `x`, unless `damage` says otherwise, in
+/// two partitions.
+fn register_batched(
+    ctxs: &[&SessionContext],
+    name: &str,
+    columns: [&str; 4],
+    extents: [usize; 4],
+    damage: Damage,
+    rng: &mut Rng,
+) {
+    let mut fields: Vec<Field> = (columns.iter())
+        .map(|c| Field::new(*c, DataType::Int64, false))
+        .collect();
+    fields.push(Field::new("x", DataType::Float64, true));
+    let schema = Arc::new(Schema::new(fields));
+    let mut rows: Vec<usize> = (0..extents.iter().product::<usize>()).collect();
+    match damage {
+        Damage::Missing(r) => drop(rows.remove(r)),
+        Damage::Repeated(r) => rows.push(r),
+        Damage::Empty => rows.clear(),
+        _ => {}
+    }
+    let key = |r: usize, c: usize| -> i64 {
+        let stride: usize = extents[c + 1..].iter().product();
+        ((r / stride) % extents[c]) as i64
+    };
+    let mut arrays: Vec<Arc<dyn Array>> = (0..4)
+        .map(|c| {
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|&r| key(r, c)),
+            )) as _
+        })
+        .collect();
+    arrays.push(Arc::new(Float64Array::from_iter(rows.iter().map(
+        |&r| match damage {
+            Damage::NullValue(d) if d == r => None,
+            Damage::Special(d, x) if d == r => Some(x),
+            _ => Some((rng.below(2001) as f64 - 1000.0) / 500.0),
+        },
+    ))));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).unwrap();
+    let split = batch.num_rows() / 2;
+    let parts = vec![
+        vec![batch.slice(0, split)],
+        vec![batch.slice(split, batch.num_rows() - split)],
+    ];
+    for ctx in ctxs {
+        let mem = MemTable::try_new(Arc::clone(&schema), parts.clone()).unwrap();
+        ctx.register_table(name, Arc::new(mem)).unwrap();
+    }
+}
+
+/// Rows of any number of integer keys and a value, sorted by their keys.
+fn keyed_rows(batches: &[RecordBatch]) -> Vec<(Vec<i64>, Option<f64>)> {
+    let mut out = Vec::new();
+    for b in batches {
+        let keys = b.num_columns() - 1;
+        let x = b
+            .column(keys)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        for r in 0..b.num_rows() {
+            let k: Vec<i64> = (0..keys)
+                .map(|c| {
+                    let c = b.column(c).as_any().downcast_ref::<Int64Array>().unwrap();
+                    c.value(r)
+                })
+                .collect();
+            out.push((k, x.is_valid(r).then(|| x.value(r))));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Property: attention per batch and head, the normalizer inside the sum as
+/// ddx writes it, is found as one pipeline whose batch and head keys every
+/// table holds, and fused on complete tables; its look-alikes are left
+/// alone; and every query answers as DataFusion does without einfold.
+#[tokio::test]
+async fn einfold_finds_batched_pipelines_and_changes_no_answer() {
+    let seed: u64 = std::env::var("EINFOLD_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0xba7c_4ed0);
+    let cases: u64 = match std::env::var("EINFOLD_CASES") {
+        Ok(n) => n.parse().unwrap(),
+        Err(_) if std::env::var("EINFOLD_SEED").is_ok() => 1,
+        Err(_) => 120,
+    };
+    let (mut found, mut fused) = (0, 0);
+    for i in 0..cases {
+        let seed = seed.wrapping_add(i);
+        let mut rng = Rng::seeded(seed, 0);
+        // Two partitions or more: with one, DataFusion 55 can return a group
+        // of these queries twice (#165), and every answer here is checked
+        // against it.
+        let threads = [2 + rng.below(5), 2 + rng.below(5)];
+        let config = |t: usize| SessionConfig::new().with_target_partitions(t);
+        let host = SessionContext::new_with_config(config(threads[0]));
+        let builder = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(config(threads[1]));
+        let ours = SessionContext::new_with_state(einfold_datafusion::install(builder).build());
+        let (nb, nh) = (1 + rng.below(3), 1 + rng.below(3));
+        let (l, d, c) = (1 + rng.below(40), 1 + rng.below(5), 1 + rng.below(3));
+        let tables = [
+            ("q", ["b", "h", "t", "d"], [nb, nh, l, d]),
+            ("k", ["b", "h", "t", "d"], [nb, nh, l, d]),
+            ("v", ["b", "h", "t", "c"], [nb, nh, l, c]),
+        ];
+        let damaged = rng.chance(0.25).then(|| rng.below(3));
+        let mut damage = Damage::None;
+        for (i, (name, columns, extents)) in tables.into_iter().enumerate() {
+            let this = match damaged == Some(i) {
+                // No NULL keys: every key column here is non-nullable.
+                true => match Damage::draw(&mut rng, extents.iter().product::<usize>()) {
+                    Damage::NullKey(r) => Damage::Missing(r),
+                    other => other,
+                },
+                false => Damage::None,
+            };
+            if damaged == Some(i) {
+                damage = this;
+            }
+            register_batched(&[&host, &ours], name, columns, extents, this, &mut rng);
+        }
+        let (sql, expect) = batched_query(&mut rng);
+        let fail = |what: String| {
+            panic!("seed {seed}: {what} ({damage:?} in table {damaged:?})\nSQL: {sql}")
+        };
+
+        let frame = ours.sql(&sql).await.unwrap();
+        let task = Arc::new(frame.task_ctx());
+        let plan = frame.create_physical_plan().await.unwrap();
+        let got = keyed_rows(
+            &datafusion::physical_plan::collect(Arc::clone(&plan), task)
+                .await
+                .unwrap(),
+        );
+        let shown = DisplayableExecutionPlan::with_metrics(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let is_pipeline = shown.contains("softmax(") || shown.contains("weights(");
+        match (expect, is_pipeline) {
+            (Some(Expect::Pipeline), false) => fail(format!("found no pipeline:\n{shown}")),
+            (Some(Expect::Decline), true) => {
+                fail(format!("found a pipeline in a look-alike:\n{shown}"))
+            }
+            _ => {}
+        }
+        found += usize::from(is_pipeline);
+        let ran = shown.contains("fused_pipelines=1");
+        fused += usize::from(ran);
+        if expect == Some(Expect::Pipeline) && damage.complete() && !ran {
+            fail(format!(
+                "the fused algorithm didn't run on complete tables:\n{shown}"
+            ));
+        }
+        let want = keyed_rows(&host.sql(&sql).await.unwrap().collect().await.unwrap());
+        if got.len() != want.len() {
+            fail(format!(
+                "{} rows, DataFusion has {}:\n{shown}",
+                got.len(),
+                want.len()
+            ));
+        }
+        for (o, t) in got.iter().zip(&want) {
+            let same = o.0 == t.0
+                && match (o.1, t.1) {
+                    (Some(x), Some(y)) if x.is_nan() || y.is_nan() => x.is_nan() && y.is_nan(),
+                    (Some(x), Some(y)) if x.is_infinite() || y.is_infinite() => x == y,
+                    (Some(x), Some(y)) => (x - y).abs() <= 1e-9 * (1.0 + y.abs()),
+                    (None, None) => true,
+                    _ => false,
+                };
+            if !same {
+                fail(format!("row {o:?}, DataFusion has {t:?}"));
+            }
+        }
+    }
+    if cases >= 50 {
+        assert!(found > 0 && fused > 0, "found {found}, fused {fused}");
+    }
+}

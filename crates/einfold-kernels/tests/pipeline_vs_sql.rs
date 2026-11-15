@@ -6,8 +6,10 @@
 //! pipeline stands for computes on DataFusion, the host, for random
 //! attention-shaped pipelines over random tables.
 //!
-//! Each case draws tables `q(t, d, x)`, `k(t, d, x)` and `v(t, [c,] x)` with
-//! random extents, and a pipeline: scores `SUM(q.x * k.x)`, or the sum of a
+//! Each case draws tables `q([b,] t, d, x)`, `k([b,] t, d, x)` and
+//! `v([b,] t, [c,] x)` with random extents, where `b` is a batch key, such as
+//! a batch and head of attention, that all three hold and every group keeps;
+//! and a pipeline: scores `SUM(q.x * k.x)`, or the sum of a
 //! row expression of `q.x` and `k.x`, such as a Gaussian kernel's
 //! `-power(q.x - k.x, 2)`, either over `d` or, without it, over a `CROSS
 //! JOIN`'s one row per pair; scaled by a
@@ -196,27 +198,41 @@ fn case(rng: &mut Rng) -> Case {
     let (nq, nk) = (1 + rng.below(150), 1 + rng.below(150));
     let nd = if cross { 1 } else { 1 + rng.below(6) };
     let channels = (rng.chance(0.6)).then(|| 1 + rng.below(4));
+    // A batch key that every table holds: independent pipelines, one per
+    // batch, as attention's per batch and head.
+    let batch = (rng.chance(0.4)).then(|| 1 + rng.below(3));
     let specials = rng.chance(0.3);
     let spread = [1.0, 4.0, 12.0][rng.below(3)];
-    let (keys, extents): (&[&str], _) = match cross {
-        true => (&["t"], ([nq].to_vec(), [nk].to_vec())),
-        false => (&["t", "d"], ([nq, nd].to_vec(), [nk, nd].to_vec())),
+    let (mut keys, mut extents): (Vec<&str>, _) = match cross {
+        true => (vec!["t"], ([nq].to_vec(), [nk].to_vec())),
+        false => (vec!["t", "d"], ([nq, nd].to_vec(), [nk, nd].to_vec())),
     };
+    // The batch key comes first, so each column after it moves by one.
+    let b0 = usize::from(batch.is_some());
+    if let Some(nb) = batch {
+        keys.insert(0, "b");
+        extents.0.insert(0, nb);
+        extents.1.insert(0, nb);
+    }
+    let keys = keys.as_slice();
     let mut q = Table::complete(keys, &extents.0, || 0.0);
     let mut k = Table::complete(keys, &extents.1, || 0.0);
     for r in q.rows.iter_mut().chain(k.rows.iter_mut()) {
         r.1 = Some(value(rng, spread, specials));
     }
-    let mut v = match channels {
-        Some(c) => Table::complete(&["t", "c"], &[nk, c], || 0.0),
-        None => Table::complete(&["t"], &[nk], || 0.0),
+    let mut v = match (channels, batch) {
+        (Some(c), None) => Table::complete(&["t", "c"], &[nk, c], || 0.0),
+        (None, None) => Table::complete(&["t"], &[nk], || 0.0),
+        (Some(c), Some(nb)) => Table::complete(&["b", "t", "c"], &[nb, nk, c], || 0.0),
+        (None, Some(nb)) => Table::complete(&["b", "t"], &[nb, nk], || 0.0),
     };
     for r in v.rows.iter_mut() {
         r.1 = Some(value(rng, 1.0, specials));
     }
     // Rows of q whose scores are -inf: every one, which SQL turns into NaN;
     // or only those with the first 64 keys, beside a NaN score, with finite
-    // ones after. Rows are (t, d) in order, so row t·nd + d is (t, d).
+    // ones after. Rows are ([b,] t, d) in order, so row t·nd + d is (t, d),
+    // in the first batch.
     let at = |t: usize, d: usize| t * nd + d;
     let target = rng.below(nq);
     let extremes = rng.below(6);
@@ -257,9 +273,12 @@ fn case(rng: &mut Rng) -> Case {
         .filter(|x| x.is_finite())
         .fold(0.0f64, |m, x| m.max(x.abs()));
 
-    // Dimensions: 0 = i (q.t), 1 = e (d), 2 = j (k.t), then 3 = c (v.c);
-    // without d, 0 = i, 1 = j, 2 = c.
-    let (di, dj, dc) = if cross { (0, 1, 2) } else { (0, 2, 3) };
+    // Dimensions: 0 = i (q.t), 1 = e (d), 2 = j (k.t), then the batch's b,
+    // then c (v.c); without d, 0 = i, 1 = j, then b and c.
+    let (di, dj) = if cross { (0, 1) } else { (0, 2) };
+    let producer_dims = if cross { 2 } else { 3 } + b0;
+    let db = producer_dims - 1;
+    let dc = producer_dims;
     let x = keys.len();
     let (row, row_sql) = match cross {
         // A product over a CROSS JOIN is an einsum the kernel doesn't take.
@@ -288,32 +307,32 @@ fn case(rng: &mut Rng) -> Case {
         dimension: DimensionId(d),
         domain_key: None,
     };
-    let ops = match cross {
-        true => vec![
-            Operand {
-                keys: vec![key(di, 0)],
-                factor: Some(ColumnIndex(1)),
-            },
-            Operand {
-                keys: vec![key(dj, 0)],
-                factor: Some(ColumnIndex(1)),
-            },
-        ],
-        false => vec![
-            Operand {
-                keys: vec![key(di, 0), key(1, 1)],
-                factor: Some(ColumnIndex(2)),
-            },
-            Operand {
-                keys: vec![key(dj, 0), key(1, 1)],
-                factor: Some(ColumnIndex(2)),
-            },
-        ],
+    // Each operand's keys: the batch's, if any, then the others, one column
+    // later.
+    let operand = |own: &[usize]| {
+        let mut keys: Vec<Key> = (own.iter().enumerate())
+            .map(|(c, &d)| key(d, c + b0))
+            .collect();
+        if batch.is_some() {
+            keys.insert(0, key(db, 0));
+        }
+        Operand {
+            keys,
+            factor: Some(ColumnIndex(own.len() + b0)),
+        }
     };
+    let ops = match cross {
+        true => vec![operand(&[di]), operand(&[dj])],
+        false => vec![operand(&[di, 1]), operand(&[dj, 1])],
+    };
+    let mut producer_outputs = vec![out(di), out(dj)];
+    if batch.is_some() {
+        producer_outputs.insert(0, out(db));
+    }
     let mut producer = Fold::try_new(
-        vec![EQ; if cross { 2 } else { 3 }],
+        vec![EQ; producer_dims],
         ops,
-        vec![out(di), out(dj)],
+        producer_outputs,
         row,
         Aggregate::sum(),
         None,
@@ -388,7 +407,7 @@ fn case(rng: &mut Rng) -> Case {
                 scale,
                 shift: Shift::KeptMaximum,
             },
-            "exp(s - MAX(s) OVER (PARTITION BY i))",
+            "exp(s - MAX(s) OVER (PARTITION BY {b}i))",
         ),
         _ => (
             Weight::Exp {
@@ -398,61 +417,68 @@ fn case(rng: &mut Rng) -> Case {
             "exp(s)",
         ),
     };
-    let (values, outputs, c_col, c_group) = match channels {
+    let (values, mut outputs, c_col, c_group) = match channels {
         Some(_) => (
-            Operand {
-                keys: vec![key(dj, 0), key(dc, 1)],
-                factor: Some(ColumnIndex(2)),
-            },
+            operand(&[dj, dc]),
             vec![DimensionId(di), DimensionId(dc)],
             ", v.c",
             ", v.c",
         ),
-        None => (
-            Operand {
-                keys: vec![key(dj, 0)],
-                factor: Some(ColumnIndex(1)),
-            },
-            vec![DimensionId(di)],
-            "",
-            "",
-        ),
+        None => (operand(&[dj]), vec![DimensionId(di)], "", ""),
+    };
+    if batch.is_some() {
+        outputs.insert(0, DimensionId(db));
+    }
+    // The batch key in SQL: selected, joined on and grouped by wherever `i`
+    // is.
+    let b = if batch.is_some() { "b, " } else { "" };
+    let weight = weight.replace("{b}", b);
+    let (q_b, on_b, weights_b) = match batch {
+        Some(_) => ("q.b AS b, ", " AND q.b = k.b", "weights.b, "),
+        None => ("", "", ""),
+    };
+    let (v_b, norm_b, group_b) = match batch {
+        Some(_) => (" AND weights.b = v.b", " AND weights.b = norm.b", "q.b, "),
+        None => ("", "", ""),
     };
     let own = if channels.is_some() { vec![EQ] } else { vec![] };
     let pipeline =
         Pipeline::try_new(producer, weight_ir, own, values, outputs, normalizer).unwrap();
     let producer = match cross {
         true => format!(
-            "SELECT q.t AS i, k.t AS j, ({row_sql}){scale_sql} AS s \
-             FROM q CROSS JOIN k WHERE TRUE{condition}"
+            "SELECT {q_b}q.t AS i, k.t AS j, ({row_sql}){scale_sql} AS s \
+             FROM q CROSS JOIN k WHERE TRUE{on_b}{condition}"
         ),
         false => format!(
-            "SELECT q.t AS i, k.t AS j, SUM({row_sql}){scale_sql} AS s \
-             FROM q JOIN k ON q.d = k.d{condition} GROUP BY q.t, k.t"
+            "SELECT {q_b}q.t AS i, k.t AS j, SUM({row_sql}){scale_sql} AS s \
+             FROM q JOIN k ON q.d = k.d{on_b}{condition} GROUP BY {group_b}q.t, k.t"
         ),
     };
-    let scores =
-        format!("WITH scores AS ({producer}), weights AS (SELECT i, j, {weight} AS w FROM scores)");
+    let scores = format!(
+        "WITH scores AS ({producer}), weights AS (SELECT {b}i, j, {weight} AS w FROM scores)"
+    );
     let sql = match normalizer {
         Normalizer::KeptGroups => format!(
-            "{scores}, norm AS (SELECT i, SUM(w) AS z FROM weights GROUP BY i) \
-             SELECT weights.i{c_col}, SUM(weights.w * v.x) / norm.z \
-             FROM weights JOIN v ON weights.j = v.t JOIN norm ON weights.i = norm.i \
-             GROUP BY weights.i{c_group}, norm.z"
+            "{scores}, norm AS (SELECT {b}i, SUM(w) AS z FROM weights GROUP BY {b}i) \
+             SELECT {weights_b}weights.i{c_col}, SUM(weights.w * v.x) / norm.z \
+             FROM weights JOIN v ON weights.j = v.t{v_b} \
+             JOIN norm ON weights.i = norm.i{norm_b} \
+             GROUP BY {weights_b}weights.i{c_group}, norm.z"
         ),
         Normalizer::JoinedRows => format!(
-            "{scores} SELECT weights.i{c_col}, SUM(weights.w * v.x) / SUM(weights.w) \
-             FROM weights JOIN v ON weights.j = v.t GROUP BY weights.i{c_group}"
+            "{scores} SELECT {weights_b}weights.i{c_col}, SUM(weights.w * v.x) / SUM(weights.w) \
+             FROM weights JOIN v ON weights.j = v.t{v_b} \
+             GROUP BY {weights_b}weights.i{c_group}"
         ),
         _ => format!(
-            "{scores} SELECT weights.i{c_col}, SUM(weights.w * v.x) \
-             FROM weights JOIN v ON weights.j = v.t GROUP BY weights.i{c_group}"
+            "{scores} SELECT {weights_b}weights.i{c_col}, SUM(weights.w * v.x) \
+             FROM weights JOIN v ON weights.j = v.t{v_b} GROUP BY {weights_b}weights.i{c_group}"
         ),
     };
     let magnitudes = (normalizer == Normalizer::None).then(|| {
         format!(
-            "{scores} SELECT weights.i{c_col}, SUM(abs(weights.w * v.x)) \
-             FROM weights JOIN v ON weights.j = v.t GROUP BY weights.i{c_group}"
+            "{scores} SELECT {weights_b}weights.i{c_col}, SUM(abs(weights.w * v.x)) \
+             FROM weights JOIN v ON weights.j = v.t{v_b} GROUP BY {weights_b}weights.i{c_group}"
         )
     });
     Case {
@@ -592,15 +618,38 @@ async fn pipeline_matches_sql() {
     }
 }
 
-/// The pairs of tiles visited and the pairs in all, for attention over 1,024
-/// positions (16 tiles of 64) under `conditions` between `q.t` and `k.t`,
-/// checking that every average of `v.x = 1` is 1.
-fn tiles_visited(conditions: &[(Comparison, i64)]) -> (usize, usize) {
+/// The pairs of tiles visited and the pairs in all, for attention over `l`
+/// positions under `conditions` between `q.t` and `k.t`, in each of
+/// `batches` batches if there are any, checking that every average of `v.x =
+/// 1` is 1.
+fn tiles_visited(
+    l: usize,
+    batches: Option<usize>,
+    conditions: &[(Comparison, i64)],
+) -> (usize, usize) {
     let mut rng = Rng::seeded(7, 0);
-    let l = 64 * 16;
-    let q = Table::complete(&["t", "d"], &[l, 8], || rng.unit());
-    let k = Table::complete(&["t", "d"], &[l, 8], || 0.5);
-    let v = Table::complete(&["t"], &[l], || 1.0);
+    let (b0, nb) = match batches {
+        Some(nb) => (1, nb),
+        None => (0, 1),
+    };
+    // With batches, a batch key `b` comes first in every table.
+    let names = |keys: &[&'static str]| -> Vec<&'static str> {
+        let mut names = keys.to_vec();
+        if batches.is_some() {
+            names.insert(0, "b");
+        }
+        names
+    };
+    let extents = |extents: &[usize]| -> Vec<usize> {
+        let mut extents = extents.to_vec();
+        if batches.is_some() {
+            extents.insert(0, nb);
+        }
+        extents
+    };
+    let q = Table::complete(&names(&["t", "d"]), &extents(&[l, 8]), || rng.unit());
+    let k = Table::complete(&names(&["t", "d"]), &extents(&[l, 8]), || 0.5);
+    let v = Table::complete(&names(&["t"]), &extents(&[l]), || 1.0);
     const EQ: Dimension = Dimension {
         equality: KeyEquality::Equal,
     };
@@ -609,16 +658,26 @@ fn tiles_visited(conditions: &[(Comparison, i64)]) -> (usize, usize) {
         dimension: DimensionId(d),
         domain_key: None,
     };
-    let ops = vec![
+    // Dimensions: 0 = i, 1 = e, 2 = j, and with batches 3 = b.
+    let operand = |own: &[usize]| {
+        let mut keys: Vec<Key> = (own.iter().enumerate())
+            .map(|(c, &d)| key(d, c + b0))
+            .collect();
+        if batches.is_some() {
+            keys.insert(0, key(3, 0));
+        }
         Operand {
-            keys: vec![key(0, 0), key(1, 1)],
-            factor: Some(ColumnIndex(2)),
-        },
-        Operand {
-            keys: vec![key(2, 0), key(1, 1)],
-            factor: Some(ColumnIndex(2)),
-        },
-    ];
+            keys,
+            factor: Some(ColumnIndex(own.len() + b0)),
+        }
+    };
+    let ops = vec![operand(&[0, 1]), operand(&[2, 1])];
+    let mut outputs = vec![out(0), out(2)];
+    let mut kept = vec![DimensionId(0)];
+    if batches.is_some() {
+        outputs.insert(0, out(3));
+        kept.insert(0, DimensionId(3));
+    }
     let conditions = (conditions.iter())
         .map(|&(comparison, offset)| Condition {
             left: DimensionId(0),
@@ -628,9 +687,9 @@ fn tiles_visited(conditions: &[(Comparison, i64)]) -> (usize, usize) {
         })
         .collect();
     let producer = Fold::try_new(
-        vec![EQ; 3],
+        vec![EQ; 3 + b0],
         ops,
-        vec![out(0), out(2)],
+        outputs,
         RowValue::Product,
         Aggregate::sum(),
         None,
@@ -638,10 +697,6 @@ fn tiles_visited(conditions: &[(Comparison, i64)]) -> (usize, usize) {
     .unwrap()
     .with_conditions(conditions)
     .unwrap();
-    let values = Operand {
-        keys: vec![key(2, 0)],
-        factor: Some(ColumnIndex(1)),
-    };
     let pipeline = Pipeline::try_new(
         producer,
         Weight::Exp {
@@ -649,8 +704,8 @@ fn tiles_visited(conditions: &[(Comparison, i64)]) -> (usize, usize) {
             shift: Shift::KeptMaximum,
         },
         vec![],
-        values,
-        vec![DimensionId(0)],
+        operand(&[2]),
+        kept,
         Normalizer::KeptGroups,
     )
     .unwrap();
@@ -668,7 +723,7 @@ fn tiles_visited(conditions: &[(Comparison, i64)]) -> (usize, usize) {
         .unwrap();
     // Every average of v.x = 1 is 1.
     let rows = rows(&piped.batches);
-    assert_eq!(rows.len(), l);
+    assert_eq!(rows.len(), l * nb);
     assert!(rows.iter().all(|(_, x)| (x.unwrap() - 1.0).abs() < 1e-12));
     (piped.tiles_visited, piped.tiles)
 }
@@ -678,7 +733,7 @@ fn tiles_visited(conditions: &[(Comparison, i64)]) -> (usize, usize) {
 #[test]
 fn causal_masks_skip_half_the_tiles() {
     let causal = [(Comparison::GreaterOrEqual, 0)];
-    assert_eq!(tiles_visited(&causal), (16 * 17 / 2, 256));
+    assert_eq!(tiles_visited(64 * 16, None, &causal), (16 * 17 / 2, 256));
 }
 
 /// A sliding window of 64 keys, `q.t >= k.t AND q.t - k.t < 64`, visits each
@@ -686,7 +741,22 @@ fn causal_masks_skip_half_the_tiles() {
 #[test]
 fn sliding_windows_visit_a_band_of_tiles() {
     let window = [(Comparison::GreaterOrEqual, 0), (Comparison::Less, 64)];
-    assert_eq!(tiles_visited(&window), (16 + 15, 256));
+    assert_eq!(tiles_visited(64 * 16, None, &window), (16 + 15, 256));
+}
+
+/// With a batch key, as attention's batch and head, each query tile visits
+/// only its own batch's key tiles, so the work grows linearly with the
+/// number of batches: 8 batches of 4 × 4 tiles, about half of each visited
+/// under a causal mask. With batches of 100 positions, not a multiple of the
+/// tile, a tile can hold rows of two batches, and counts against both.
+#[test]
+fn batches_visit_only_their_own_tiles() {
+    let causal = [(Comparison::GreaterOrEqual, 0)];
+    assert_eq!(tiles_visited(64 * 4, Some(8), &causal), (8 * 10, 8 * 16));
+    // 800 positions, 13 tiles each way: each query tile shares a batch with
+    // 2 to 4 key tiles, of the 169 pairs in all.
+    let (visited, tiles) = tiles_visited(100, Some(8), &causal);
+    assert!(tiles <= 13 * 4 && visited <= tiles, "{visited} of {tiles}");
 }
 
 /// A pipeline may leave one of its own dimensions out of its outputs, to be

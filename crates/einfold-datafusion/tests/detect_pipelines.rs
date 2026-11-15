@@ -893,10 +893,10 @@ async fn a_normalized_sum_that_would_overflow_answers_as_sql() {
     }
 }
 
-/// Unshifted softmax weights `exp(s)` of `[5e-324, 2]` over values `[1e308,
+/// Unshifted softmax weights `exp(s)` of `[5e-324, 2]` over values `[1e300,
 /// 1e-300]`: SQL divides each weight by their sum first, rounds `5e-324 / 2`
 /// to 0, and averages to `1e-300`, where the fused sum of `w · v` would give
-/// `2.5e-16`. The fused algorithm declines it.
+/// `2.5e-24`. The fused algorithm declines it.
 #[tokio::test]
 async fn a_normalized_sum_whose_quotients_would_underflow_answers_as_sql() {
     let sql = "WITH scores AS (SELECT q.t AS i, k.t AS j, SUM(q.x * k.x) AS s \
@@ -917,7 +917,7 @@ async fn a_normalized_sum_whose_quotients_would_underflow_answers_as_sql() {
         _ => 2f64.ln(),
     });
     filled(&both, "v", &["t", "c"], &[2, 1], |k| match k[0] {
-        0 => 1e308,
+        0 => 1e300,
         _ => 1e-300,
     });
     let (shown, got) = shown_and_rows(&ours, sql).await;

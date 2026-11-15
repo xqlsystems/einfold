@@ -377,7 +377,9 @@ impl ExecutionPlan for Opaque {
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(self)
+        // DataFusion 55's FFI has no reset_state callback. Its foreign
+        // wrapper resets a leaf through with_new_children instead.
+        self.reset_state()
     }
 
     /// The plan within, with its state reset: a session that runs a plan

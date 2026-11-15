@@ -466,6 +466,83 @@ def test_sees_values_changed_in_place():
     assert found.plans_with_einfold() >= 2
 
 
+COPIED = {
+    "join": "SELECT a.i, b.j, a.v + b.v AS v FROM a JOIN b ON a.k = b.k AND a.i = b.j",
+    "fold": "SELECT a.i, b.j, SUM(a.v * b.v) AS v FROM a JOIN b ON a.k = b.k GROUP BY a.i, b.j",
+    # The build side's keys move between runs, so a dynamic filter on the
+    # Parquet probe side left from the last run would drop every row.
+    "filtered": "SELECT a.i, SUM(p.y) AS v FROM a JOIN p ON a.k = p.k GROUP BY a.i",
+}
+
+
+@pytest.mark.parametrize("query", sorted(COPIED))
+def test_runs_copies_of_a_plan_over_changed_inputs(query, tmp_path):
+    """xarray-sql reuses a query's physical plan, as ddx's prepared runs do:
+    each run is a copy of the plan, decoded from its serialized form through
+    the session's codecs, over inputs changed in place since the last run.
+    einfold's codec passes a plan by reference, so a copy must be one with
+    its state reset, such as a hash join's table, or it is the plan last
+    run: a second run then reads stale state, or the process dies. Each copy
+    must answer as a fresh plan does without einfold."""
+    script = textwrap.dedent(f"""
+        import sys
+        import numpy as np
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from datafusion import SessionContext
+        from datafusion.plan import ExecutionPlan
+        from einfold.datafusion import EinFold
+
+        if sys.platform == "linux":
+            import resource
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+        n = 32
+        cells = np.arange(n * n)
+        # Join keys, which both tables move by the same amount between runs.
+        ka, kb = cells % n, cells // n
+        va, vb = np.sin(cells * 0.7), np.cos(cells * 0.3)
+        path = {str(tmp_path / "p.parquet")!r}
+        pq.write_table(pa.table({{"k": np.arange(10 * n), "y": np.ones(10 * n)}}),
+                       path, row_group_size=n)
+        sessions = [SessionContext(), SessionContext().with_extensions(EinFold())]
+        for ctx in sessions:
+            # Each session's tables share these arrays, so a change in place
+            # reaches both.
+            ctx.register_record_batches("a", [[pa.record_batch(
+                {{"i": cells // n, "k": pa.array(ka), "v": pa.array(va)}})]])
+            ctx.register_record_batches("b", [[pa.record_batch(
+                {{"k": pa.array(kb), "j": cells % n, "v": pa.array(vb)}})]])
+            ctx.register_parquet("p", path)
+
+        def run(ctx, plan):
+            batches = [b.to_pyarrow() for p in range(plan.partition_count)
+                       for b in ctx.execute(plan, p)]
+            table = pa.Table.from_batches(batches)
+            names = table.column_names
+            # Sorted on every column: the join's (i, j) repeats once per k,
+            # and each plan may emit a tie's rows in its own order.
+            table = table.sort_by([(c, "ascending") for c in names])
+            return table.column(names[-1]).to_numpy()
+
+        plain, ours = sessions
+        plan = ours.sql({COPIED[query]!r}).execution_plan()
+        for step in range(3):
+            copy = ExecutionPlan.from_bytes(ours, plan.to_bytes(ours))
+            got = run(ours, copy)
+            want = run(plain, plain.sql({COPIED[query]!r}).execution_plan())
+            assert len(got) == len(want) > 0, (step, len(got), len(want))
+            assert np.allclose(got, want, rtol=1e-12, atol=1e-12), step
+            va *= -2.0
+            vb += 1.0
+            ka += n
+            kb += n
+        print("ok")
+        """)
+    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert done.returncode == 0 and done.stdout.strip() == "ok", done.stderr[-2000:]
+
+
 @pytest.mark.parametrize("second", ["SELECT s, AVG(val) AS mean FROM a GROUP BY s",
                                     "SELECT s, k, -val AS val FROM a"])
 def test_tells_unnamed_tables_apart(second):

@@ -67,7 +67,8 @@ pub enum DenseWork<'a> {
     /// MAX(s) OVER (PARTITION BY …))` is. `q` is `[w][x][e]`, `kt` is
     /// `[w][e][j]`, `v` is `[w][j][y]`, and the result is `[w][x][y]`, with
     /// every row computed, even one whose range is empty, which einfold
-    /// drops.
+    /// drops. einfold offers it only where no sum of weighted values can
+    /// overflow, so a backend may take the softmax first.
     Attention {
         /// The queries.
         q: &'a [f64],

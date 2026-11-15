@@ -524,14 +524,27 @@ fn host_attention(
     {
         return Ok(None);
     }
+    // A shifted softmax's weights are at most 1, so `keys` times the largest
+    // value bounds every sum of `w · v`. Below half the largest double,
+    // leaving room for rounding, no sum
+    // overflows, in either SQL's order, `SUM(w * v) / SUM(w)` or `SUM(w / z
+    // * v)`, or a backend's. With the normalizer at least 1, none of SQL's
+    // terms is larger than a backend's, so none underflows where a
+    // backend's doesn't.
+    let largest = v.iter().fold(0.0, |m: f64, x| m.max(x.abs()));
+    if !(largest * keys as f64 * 2.0).is_finite() {
+        return Ok(None);
+    }
     // The keys, transposed and batch first: einfold places them `[e][w][j]`.
     let nj = batches * keys;
     // The keys transposed, and what a backend may copy, as the Python bridge
     // does: its operands and its result, beside the result einfold keeps.
+    // Each query's range of keys too, einfold's and the backend's copy.
     let output = batches * queries * values;
     let copied = kt.len() + q.len() + kt.len() + v.len() + 2 * output;
+    let ranges = 2 * queries * std::mem::size_of::<(usize, usize)>();
     options.reserve(
-        copied * std::mem::size_of::<f64>(),
+        copied * std::mem::size_of::<f64>() + ranges,
         "attention for the host",
     )?;
     let mut batched = Vec::with_capacity(kt.len());

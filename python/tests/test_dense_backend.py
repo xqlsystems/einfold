@@ -153,6 +153,20 @@ def test_a_declining_backend_leaves_attention_to_einfold():
     assert any(kind == "attention" for kind, _ in backend.calls)
 
 
+def test_attention_that_could_overflow_isnt_offered():
+    """Values near the largest double: SQL's `SUM(w * v) / SUM(w)` overflows
+    where a softmax taken first doesn't, so einfold keeps the work, and the
+    query answers as SQL does."""
+    backend = NumpyBackend()
+    plain, ours = _sessions(backend)
+    for name, last in (("q", "d"), ("k", "d"), ("v", "c")):
+        values = np.zeros(36) if name != "v" else np.full(36, 1e308)
+        _register((plain, ours), name, ("b", "h", "t", last), (1, 2, 6, 3), values)
+    sql = _attention("", "")
+    _assert_same(plain.sql(sql).to_arrow_table(), ours.sql(sql).to_arrow_table())
+    assert not any(kind == "attention" for kind, _ in backend.calls)
+
+
 @pytest.mark.parametrize("result, error", [
     (lambda shape: (_ for _ in ()).throw(RuntimeError("the GPU is busy")), "the GPU is busy"),
     (lambda shape: pa.array([1.0, 2.0]), "gave a product 2 values"),

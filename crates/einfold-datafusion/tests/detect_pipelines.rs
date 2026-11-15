@@ -805,9 +805,15 @@ async fn einfold_finds_batched_pipelines_and_changes_no_answer() {
     }
 }
 
-/// Registers `name(<columns>, x)`, complete over `extents`, with every `x`
-/// the same, in each of `ctxs`.
-fn constant(ctxs: &[&SessionContext], name: &str, columns: &[&str], extents: &[usize], x: f64) {
+/// Registers `name(<columns>, x)`, complete over `extents`, with each row's
+/// `x` given by its keys, in each of `ctxs`.
+fn filled(
+    ctxs: &[&SessionContext],
+    name: &str,
+    columns: &[&str],
+    extents: &[usize],
+    x: impl Fn(&[i64]) -> f64,
+) {
     let mut fields: Vec<Field> = (columns.iter())
         .map(|c| Field::new(*c, DataType::Int64, false))
         .collect();
@@ -821,10 +827,14 @@ fn constant(ctxs: &[&SessionContext], name: &str, columns: &[&str], extents: &[u
     let mut arrays: Vec<Arc<dyn Array>> = (0..columns.len())
         .map(|c| Arc::new(Int64Array::from_iter_values((0..rows).map(|r| key(r, c)))) as _)
         .collect();
-    arrays.push(Arc::new(Float64Array::from(vec![x; rows])));
+    let keys = |r: usize| -> Vec<i64> { (0..columns.len()).map(|c| key(r, c)).collect() };
+    arrays.push(Arc::new(Float64Array::from_iter_values(
+        (0..rows).map(|r| x(&keys(r))),
+    )));
     let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).unwrap();
     for ctx in ctxs {
         let mem = MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]]).unwrap();
+        ctx.deregister_table(name).unwrap();
         ctx.register_table(name, Arc::new(mem)).unwrap();
     }
 }
@@ -833,7 +843,8 @@ fn constant(ctxs: &[&SessionContext], name: &str, columns: &[&str], extents: &[u
 /// normalizer inside the sum as ddx writes it, `SUM(w / norm.z * v.x)`: each
 /// term is at most `v.x`, so SQL's sum stays finite, where a sum of `w ·
 /// v.x` divided at the end overflows. The fused algorithm declines it, and
-/// the host's plan gives SQL's averages, with one kept key or with batches.
+/// the host's plan gives SQL's averages, with one kept key or with batches,
+/// also when another output's values are infinite.
 #[tokio::test]
 async fn a_normalized_sum_that_would_overflow_answers_as_sql() {
     let one = "WITH scores AS (SELECT q.t AS i, k.t AS j, SUM(q.x * k.x) AS s \
@@ -858,19 +869,83 @@ async fn a_normalized_sum_that_would_overflow_answers_as_sql() {
     // Zero scores, so every weight is 1, and every value 1e308: each average
     // is 1e308.
     let both = [&host, &ours];
-    constant(&both, "q", &["t", "d"], &[3, 2], 0.0);
-    constant(&both, "k", &["t", "d"], &[3, 2], 0.0);
-    constant(&both, "v", &["t", "c"], &[3, 2], 1e308);
-    constant(&both, "q2", &["b", "t", "d"], &[2, 3, 2], 0.0);
-    constant(&both, "k2", &["b", "t", "d"], &[2, 3, 2], 0.0);
-    constant(&both, "v2", &["b", "t", "c"], &[2, 3, 2], 1e308);
-    for sql in [one, batched] {
+    filled(&both, "q", &["t", "d"], &[3, 2], |_| 0.0);
+    filled(&both, "k", &["t", "d"], &[3, 2], |_| 0.0);
+    filled(&both, "v", &["t", "c"], &[3, 2], |_| 1e308);
+    filled(&both, "q2", &["b", "t", "d"], &[2, 3, 2], |_| 0.0);
+    filled(&both, "k2", &["b", "t", "d"], &[2, 3, 2], |_| 0.0);
+    filled(&both, "v2", &["b", "t", "c"], &[2, 3, 2], |_| 1e308);
+    // Output 0 overflows as above; output 1 is infinite in SQL too, and
+    // mustn't excuse output 0.
+    let mixed = one.replace("JOIN v ON", "JOIN v3 v ON");
+    filled(&both, "v3", &["t", "c"], &[3, 2], |k| match k[1] {
+        0 => 1e308,
+        _ => f64::INFINITY,
+    });
+    for sql in [one, batched, &mixed] {
         let got = keyed_rows(&ours.sql(sql).await.unwrap().collect().await.unwrap());
         let want = keyed_rows(&host.sql(sql).await.unwrap().collect().await.unwrap());
         assert!(
-            want.iter().all(|r| r.1.is_some_and(f64::is_finite)),
+            (want.iter()).all(|r| r.0.last() == Some(&1) || r.1.is_some_and(f64::is_finite)),
             "{want:?}"
         );
         assert_eq!(got, want, "{sql}");
+    }
+}
+
+/// The plan einfold makes of `sql`, as `EXPLAIN ANALYZE` shows it, and its
+/// rows.
+async fn shown_and_rows(ctx: &SessionContext, sql: &str) -> (String, Vec<(Vec<i64>, Option<f64>)>) {
+    let frame = ctx.sql(sql).await.unwrap();
+    let task = Arc::new(frame.task_ctx());
+    let plan = frame.create_physical_plan().await.unwrap();
+    let got = datafusion::physical_plan::collect(Arc::clone(&plan), task)
+        .await
+        .unwrap();
+    let shown = DisplayableExecutionPlan::with_metrics(plan.as_ref())
+        .indent(true)
+        .to_string();
+    (shown, keyed_rows(&got))
+}
+
+/// An unshifted softmax-weighted average, `exp(s)` with no maximum taken
+/// away, of weights near the smallest double, `exp(-744)`: SQL divides each
+/// weight by their sum before it meets a value, so every average is the
+/// value, `0.125`, where a sum of `w · v`, divided at the end, rounds to 0.
+/// The fused algorithm declines it, and runs on weights that are not as
+/// small.
+#[tokio::test]
+async fn a_normalized_sum_whose_products_would_underflow_answers_as_sql() {
+    let sql = "WITH scores AS (SELECT q.t AS i, k.t AS j, SUM(q.x * k.x) AS s \
+                 FROM q JOIN k ON q.d = k.d GROUP BY q.t, k.t), \
+               weights AS (SELECT i, j, exp(s) AS w FROM scores), \
+               norm AS (SELECT i, SUM(w) AS z FROM weights GROUP BY i) \
+               SELECT weights.i AS t, v.c, SUM(weights.w / norm.z * v.x) AS x \
+               FROM weights JOIN v ON weights.j = v.t JOIN norm ON weights.i = norm.i \
+               GROUP BY weights.i, v.c";
+    let host = SessionContext::new();
+    let builder = SessionStateBuilder::new().with_default_features();
+    let ours = SessionContext::new_with_state(einfold_datafusion::install(builder).build());
+    let both = [&host, &ours];
+    filled(&both, "q", &["t", "d"], &[3, 2], |_| 1.0);
+    filled(&both, "v", &["t", "c"], &[3, 2], |_| 0.125);
+    // Scores of -744, then of -10.
+    for (k, fused) in [(-372.0, false), (-5.0, true)] {
+        filled(&both, "k", &["t", "d"], &[3, 2], |_| k);
+        let (shown, got) = shown_and_rows(&ours, sql).await;
+        let want = keyed_rows(&host.sql(sql).await.unwrap().collect().await.unwrap());
+        assert!(shown.contains("softmax("), "found no pipeline:\n{shown}");
+        assert_eq!(shown.contains("fused_pipelines=1"), fused, "{shown}");
+        assert!(
+            want.iter()
+                .all(|r| r.1.is_some_and(|x| (x - 0.125).abs() < 1e-12)),
+            "{want:?}"
+        );
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(g.0, w.0);
+            let (g, w) = (g.1.unwrap(), w.1.unwrap());
+            assert!((g - w).abs() <= 1e-12, "{got:?}, DataFusion has {want:?}");
+        }
     }
 }

@@ -368,6 +368,12 @@ pub(crate) fn pipeline(
     let finite: Vec<bool> = (0..nj)
         .map(|j| v[j * ny..(j + 1) * ny].iter().all(|x| x.is_finite()))
         .collect();
+    // The smallest nonzero magnitude of a finite value, which bounds below
+    // every product of a weight and a value that isn't zero.
+    let smallest = (v.iter())
+        .map(|x| x.abs())
+        .filter(|&x| x > 0.0 && x.is_finite())
+        .fold(f64::INFINITY, f64::min);
     let x_tiles = nx.div_ceil(XT);
     // The pairs of tiles that share a batch: for each X tile, the J tiles of
     // the batches its rows are in. Without batch keys, every pair.
@@ -386,7 +392,12 @@ pub(crate) fn pipeline(
             pipeline,
             t,
             (nx, ne, nj, ny),
-            (&scores, v, &finite),
+            Values {
+                v,
+                finite: &finite,
+                smallest,
+            },
+            &scores,
             &allowed,
         )
     });
@@ -489,6 +500,14 @@ fn place(
     Some(matrix)
 }
 
+/// The values a pipeline weighs, `v [j][y]`, with whether each J position's
+/// are all finite, and their smallest nonzero finite magnitude.
+struct Values<'a> {
+    v: &'a [f64],
+    finite: &'a [bool],
+    smallest: f64,
+}
+
 /// One X tile's averages, `[x][y]` over its positions, and how many J tiles
 /// it visited.
 struct Tile {
@@ -500,19 +519,26 @@ struct Tile {
     /// or NaN (infinity times `exp(-800)`, which is 0): the algorithm
     /// declines. A sum that's infinite because a value is, is SQL's too.
     /// Also set where weights of an expression, rather than a softmax's,
-    /// meet a weight or value that isn't finite.
+    /// meet a weight or value that isn't finite, and where a product of a
+    /// weight and a value may have underflowed (see the end of [`tile`]).
     overflowed: bool,
 }
 
-/// X tile `t` of `pipeline`, from its `scores` and `v [j][y]`, with
+/// X tile `t` of `pipeline`, from its `scores` and `values`, with
 /// `allowed(x)` the interval of J positions that position `x` may join.
 fn tile(
     pipeline: &Pipeline,
     t: usize,
     (nx, ne, nj, ny): (usize, usize, usize, usize),
-    (scores, v, finite): (&Scores, &[f64], &[bool]),
+    values: Values<'_>,
+    scores: &Scores,
     allowed: &(impl Fn(usize) -> (usize, usize) + Sync),
 ) -> Tile {
+    let Values {
+        v,
+        finite,
+        smallest,
+    } = values;
     let (x0, x1) = (t * XT, ((t + 1) * XT).min(nx));
     let rows = x1 - x0;
     // A softmax's scale and whether it is shifted, or another weight's
@@ -529,8 +555,14 @@ fn tile(
     let mut visited = 0;
     let mut overflowed = false;
     let unnormalized = pipeline.normalizer() == Normalizer::None;
-    // Whether each row has summed a weight or value that isn't finite.
-    let mut special = vec![false; rows];
+    // Whether each row has summed a weight that isn't finite, and whether
+    // each of its outputs `[x][y]` has summed a value that isn't: a special
+    // value of one output says nothing of another's overflow.
+    let mut special_weight = vec![false; rows];
+    let mut special_value = vec![false; rows * ny];
+    // Each row's smallest nonzero weight, which with `smallest` bounds its
+    // products below.
+    let mut lightest = vec![f64::INFINITY; rows];
     // The J positions any row of the tile may see, so that the loop starts
     // and ends at the tiles they lie in: with batch keys, every other batch's
     // tiles lie outside, and the work stays linear in the number of batches.
@@ -614,6 +646,7 @@ fn tile(
                 // term by term: the host's plan gives SQL's.
                 overflowed |=
                     scores.iter().any(|w| !w.is_finite()) || (lo..hi).any(|j| !finite[j0 + j]);
+                lightest[r] = lightest_nonzero(scores, lightest[r]);
                 z[r] += scores.iter().sum::<f64>();
                 continue;
             }
@@ -640,22 +673,39 @@ fn tile(
                 sum += *s;
             }
             // A weight that isn't finite is SQL's to make what it will of.
-            let special_weight = scores.iter().any(|w| !w.is_finite());
+            let special_weights = scores.iter().any(|w| !w.is_finite());
             if shifted && rescale != 1.0 {
-                let row = &a[r * ny..(r + 1) * ny];
-                let infinite = z[r].is_infinite() || row.iter().any(|a: &f64| a.is_infinite());
-                overflowed |= infinite && !special[r];
+                overflowed |= overflows(
+                    z[r],
+                    &a[r * ny..(r + 1) * ny],
+                    special_weight[r],
+                    &special_value[r * ny..(r + 1) * ny],
+                );
                 z[r] *= rescale;
                 a[r * ny..(r + 1) * ny]
                     .iter_mut()
                     .for_each(|a| *a *= rescale);
             }
-            special[r] |= special_weight || (lo..hi).any(|j| !finite[j0 + j]);
+            special_weight[r] |= special_weights;
+            let special_values = (lo..hi).any(|j| !finite[j0 + j]);
+            if special_values {
+                let outputs = &mut special_value[r * ny..(r + 1) * ny];
+                for j in (lo..hi).filter(|&j| !finite[j0 + j]) {
+                    let row = &v[(j0 + j) * ny..(j0 + j + 1) * ny];
+                    for (special, x) in outputs.iter_mut().zip(row) {
+                        *special |= !x.is_finite();
+                    }
+                }
+            }
             // Unnormalized, there's no division by a normalizer to give a
             // special value SQL's result, so weights or values that aren't
             // finite decline, as expression weights' do.
             if unnormalized {
-                overflowed |= scores.iter().any(|w| !w.is_finite()) || special[r];
+                overflowed |= special_weights || special_values;
+            }
+            // Unshifted, each weight is its own, not rescaled later.
+            if !shifted {
+                lightest[r] = lightest_nonzero(scores, lightest[r]);
             }
             z[r] += sum;
             m[r] = shift;
@@ -700,15 +750,28 @@ fn tile(
             }
         }
         _ => {
-            for (r, z) in z.iter().enumerate() {
-                // A sum of finite terms that reached infinity overflowed
-                // where SQL's needn't: SQL may divide each term by the
-                // normalizer before adding it, as ddx writes `SUM(w / z *
-                // v)`, and so stay finite.
+            for (r, &z) in z.iter().enumerate() {
+                // SQL may divide each term by the normalizer before adding
+                // it, as ddx writes `SUM(w / z * v)`, where this sums `w ·
+                // v` and divides once. A sum of finite terms that reached
+                // infinity or NaN overflowed where SQL's needn't.
                 let row = &mut a[r * ny..(r + 1) * ny];
-                let infinite = z.is_infinite() || row.iter().any(|a| a.is_infinite());
-                overflowed |= infinite && !special[r];
+                let (weight, values) = (special_weight[r], &special_value[r * ny..(r + 1) * ny]);
+                overflowed |= overflows(z, row, weight, values);
+                // A product `w · v` below the smallest normal double loses
+                // its precision, or rounds to 0, which SQL's `w / z · v`
+                // needn't when `z < 1`: weights of about `exp(-744)` and
+                // values of `0.125` average to `0.125` in SQL, and to 0
+                // here. With `z ≥ 1`, as a shifted softmax's always is, each
+                // of SQL's terms is no larger than this one, and rounds no
+                // better. Below, the lightest weight and smallest value
+                // prove that no product was that small, or the algorithm
+                // declines.
+                overflowed |= z < 1.0 && lightest[r] * smallest < f64::MIN_POSITIVE;
                 row.iter_mut().for_each(|a| *a /= z);
+                // Dividing a finite sum by a small normalizer, as weights of
+                // either sign allow, can overflow too.
+                overflowed |= z != 0.0 && overflows(z, row, weight, values);
             }
         }
     }
@@ -717,4 +780,21 @@ fn tile(
         visited,
         overflowed,
     }
+}
+
+/// Whether a row's normalizer `z`, or one of its weighted sums `a`, isn't
+/// finite although no weight it summed was special, or, for that sum, no
+/// value either: sums of finite terms that overflowed.
+fn overflows(z: f64, a: &[f64], special_weight: bool, special_value: &[bool]) -> bool {
+    !special_weight
+        && (!z.is_finite()
+            || (a.iter().zip(special_value)).any(|(a, &special)| !special && !a.is_finite()))
+}
+
+/// The smallest of `so_far` and `weights`' nonzero magnitudes.
+fn lightest_nonzero(weights: &[f64], so_far: f64) -> f64 {
+    (weights.iter())
+        .map(|w| w.abs())
+        .filter(|&w| w > 0.0)
+        .fold(so_far, f64::min)
 }

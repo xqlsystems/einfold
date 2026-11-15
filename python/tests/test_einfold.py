@@ -520,7 +520,9 @@ def test_runs_copies_of_a_plan_over_changed_inputs(query, tmp_path):
                        for b in ctx.execute(plan, p)]
             table = pa.Table.from_batches(batches)
             names = table.column_names
-            table = table.sort_by([(c, "ascending") for c in names[:-1]])
+            # Sorted on every column: the join's (i, j) repeats once per k,
+            # and each plan may emit a tie's rows in its own order.
+            table = table.sort_by([(c, "ascending") for c in names])
             return table.column(names[-1]).to_numpy()
 
         plain, ours = sessions

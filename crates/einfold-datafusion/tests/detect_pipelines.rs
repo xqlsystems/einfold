@@ -968,19 +968,8 @@ async fn an_infinite_value_whose_weight_would_round_to_zero_answers_as_sql() {
             _ => 1.0,
         },
     );
-    for weight in ["exp(s - MAX(s) OVER (PARTITION BY b, h, i))", "exp(s)"] {
-        let sql = format!(
-            "WITH scores AS (SELECT q.b, q.h, q.t AS i, k.t AS j, SUM(q.x * k.x) AS s \
-               FROM q JOIN k ON q.b = k.b AND q.h = k.h AND q.d = k.d \
-               GROUP BY q.b, q.h, q.t, k.t), \
-             weights AS (SELECT b, h, i, j, {weight} AS w FROM scores), \
-             norm AS (SELECT b, h, i, SUM(w) AS z FROM weights GROUP BY b, h, i) \
-             SELECT weights.b, weights.h, weights.i AS t, v.c, \
-               SUM(weights.w / norm.z * v.x) AS x \
-             FROM weights JOIN v ON weights.j = v.t AND weights.b = v.b AND weights.h = v.h \
-             JOIN norm ON weights.i = norm.i AND weights.b = norm.b AND weights.h = norm.h \
-             GROUP BY weights.b, weights.h, weights.i, v.c"
-        );
+    for weight in [SHIFTED, "exp(s)"] {
+        let sql = batched_attention(weight, "");
         let (shown, got) = shown_and_rows(&ours, &sql).await;
         let want = keyed_rows(&host.sql(&sql).await.unwrap().collect().await.unwrap());
         assert!(
@@ -993,6 +982,99 @@ async fn an_infinite_value_whose_weight_would_round_to_zero_answers_as_sql() {
         assert!(nan(&want), "{weight}: {want:?}");
         assert!(nan(&got), "{weight}: {got:?}, DataFusion has {want:?}");
     }
+}
+
+/// A softmax shifted by its row's maximum.
+const SHIFTED: &str = "exp(s - MAX(s) OVER (PARTITION BY b, h, i))";
+
+/// Attention per batch `b` and head `h` over `q`, `k` and `v`, as ddx writes
+/// it, with `weight` of the score `s` and `mask` a condition on `q` and `k`.
+fn batched_attention(weight: &str, mask: &str) -> String {
+    format!(
+        "WITH scores AS (SELECT q.b, q.h, q.t AS i, k.t AS j, SUM(q.x * k.x) AS s \
+           FROM q JOIN k ON q.b = k.b AND q.h = k.h AND q.d = k.d{mask} \
+           GROUP BY q.b, q.h, q.t, k.t), \
+         weights AS (SELECT b, h, i, j, {weight} AS w FROM scores), \
+         norm AS (SELECT b, h, i, SUM(w) AS z FROM weights GROUP BY b, h, i) \
+         SELECT weights.b, weights.h, weights.i AS t, v.c, \
+           SUM(weights.w / norm.z * v.x) AS x \
+         FROM weights JOIN v ON weights.j = v.t AND weights.b = v.b AND weights.h = v.h \
+         JOIN norm ON weights.i = norm.i AND weights.b = norm.b AND weights.h = norm.h \
+         GROUP BY weights.b, weights.h, weights.i, v.c"
+    )
+}
+
+/// Whether `got` has `want`'s keys, and values within `tolerance` of them,
+/// relative to `1 + |want|`.
+fn close(
+    got: &[(Vec<i64>, Option<f64>)],
+    want: &[(Vec<i64>, Option<f64>)],
+    tolerance: f64,
+) -> bool {
+    got.len() == want.len()
+        && got.iter().zip(want).all(|(o, t)| match (o.1, t.1) {
+            (Some(x), Some(y)) => o.0 == t.0 && (x - y).abs() <= tolerance * (1.0 + y.abs()),
+            _ => false,
+        })
+}
+
+/// Causal attention whose first value is exactly 0: each batch's first
+/// query sees only that key, so its average is exactly 0. No term can
+/// underflow, so the fused algorithm runs, and answers as SQL does.
+#[tokio::test]
+async fn a_causal_average_of_exactly_zero_fuses() {
+    let host = SessionContext::new();
+    let builder = SessionStateBuilder::new().with_default_features();
+    let ours = SessionContext::new_with_state(einfold_datafusion::install(builder).build());
+    let both = [&host, &ours];
+    let small = |k: &[i64]| (k.iter().sum::<i64>() % 5) as f64 / 4.0;
+    filled(&both, "q", &["b", "h", "t", "d"], &[2, 2, 4, 2], small);
+    filled(&both, "k", &["b", "h", "t", "d"], &[2, 2, 4, 2], small);
+    filled(
+        &both,
+        "v",
+        &["b", "h", "t", "c"],
+        &[2, 2, 4, 2],
+        |k| match k[2] {
+            0 => 0.0,
+            _ => 1.0 + small(k),
+        },
+    );
+    let sql = batched_attention(SHIFTED, " AND q.t >= k.t");
+    let (shown, got) = shown_and_rows(&ours, &sql).await;
+    let want = keyed_rows(&host.sql(&sql).await.unwrap().collect().await.unwrap());
+    assert!(shown.contains("fused_pipelines=1"), "didn't fuse:\n{shown}");
+    assert!(want.iter().any(|r| r.1 == Some(0.0)), "{want:?}");
+    assert!(
+        close(&got, &want, 1e-12),
+        "{got:?}, DataFusion has {want:?}"
+    );
+}
+
+/// Values of `1.5e307` in two batches of three keys: a row adds three
+/// terms, whose sums can't overflow, though six could. The bounds count
+/// only the keys a row sees, so the fused algorithm runs.
+#[tokio::test]
+async fn large_values_fuse_by_the_keys_each_batch_sees() {
+    let host = SessionContext::new();
+    let builder = SessionStateBuilder::new().with_default_features();
+    let ours = SessionContext::new_with_state(einfold_datafusion::install(builder).build());
+    let both = [&host, &ours];
+    filled(&both, "q", &["b", "h", "t", "d"], &[2, 1, 3, 1], |_| 0.5);
+    filled(&both, "k", &["b", "h", "t", "d"], &[2, 1, 3, 1], |k| {
+        k[2] as f64
+    });
+    filled(&both, "v", &["b", "h", "t", "c"], &[2, 1, 3, 1], |_| {
+        1.5e307
+    });
+    let sql = batched_attention(SHIFTED, "");
+    let (shown, got) = shown_and_rows(&ours, &sql).await;
+    let want = keyed_rows(&host.sql(&sql).await.unwrap().collect().await.unwrap());
+    assert!(shown.contains("fused_pipelines=1"), "didn't fuse:\n{shown}");
+    assert!(
+        close(&got, &want, 1e-12),
+        "{got:?}, DataFusion has {want:?}"
+    );
 }
 
 /// The plan einfold makes of `sql`, as `EXPLAIN ANALYZE` shows it, and its

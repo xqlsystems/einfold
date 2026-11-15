@@ -279,9 +279,6 @@ fn einfold_nodes(plan: &LogicalPlan) -> Result<Nodes> {
     Ok(nodes)
 }
 
-/// The session's planner, with einfold's detection in front of it. Every
-/// plan is planned here, so that none crosses back to the session as
-/// protobuf, which copies in-memory tables.
 /// `plan` with each of its `EinFoldExec` operators given `backend`.
 fn with_backend(
     plan: Arc<dyn ExecutionPlan>,
@@ -297,6 +294,9 @@ fn with_backend(
     Ok(given.data)
 }
 
+/// The session's planner, with einfold's detection in front of it. Every
+/// plan is planned here, so that none crosses back to the session as
+/// protobuf, which copies in-memory tables.
 #[derive(Debug)]
 pub(crate) struct Bridge {
     pub(crate) counts: Arc<Counts>,

@@ -117,7 +117,8 @@ pub struct Piped {
     /// Pairs of an X tile and a J tile that were computed.
     pub tiles_visited: usize,
     /// Every pair of an X tile and a J tile in the same batch: every pair,
-    /// without batch keys.
+    /// without batch keys. Both counts are 0 where the host's
+    /// [`DenseBackend`] computed the pipeline.
     pub tiles: usize,
 }
 
@@ -482,7 +483,8 @@ pub(crate) fn pipeline(
     Ok(Some(Piped {
         batches: vec![RecordBatch::try_new(schema, columns)?],
         tiles_visited,
-        tiles: tile_pairs,
+        // The host's arithmetic computed none of einfold's tiles.
+        tiles: if hosted.is_some() { 0 } else { tile_pairs },
     }))
 }
 
@@ -524,8 +526,12 @@ fn host_attention(
     }
     // The keys, transposed and batch first: einfold places them `[e][w][j]`.
     let nj = batches * keys;
+    // The keys transposed, and what a backend may copy, as the Python bridge
+    // does: its operands and its result, beside the result einfold keeps.
+    let output = batches * queries * values;
+    let copied = kt.len() + q.len() + kt.len() + v.len() + 2 * output;
     options.reserve(
-        (kt.len() + batches * queries * values) * std::mem::size_of::<f64>(),
+        copied * std::mem::size_of::<f64>(),
         "attention for the host",
     )?;
     let mut batched = Vec::with_capacity(kt.len());

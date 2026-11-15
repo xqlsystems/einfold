@@ -658,7 +658,13 @@ fn host_product(
     if [shape.batches, shape.rows, shape.inner, shape.columns].contains(&0) {
         return Ok(None);
     }
-    options.reserve(cells * std::mem::size_of::<f64>(), "a product for the host")?;
+    // A backend may copy its operands and its result, as the Python bridge
+    // does, beside the result einfold keeps.
+    let copied = a.len() + b.len() + 2 * cells;
+    options.reserve(
+        copied * std::mem::size_of::<f64>(),
+        "a product for the host",
+    )?;
     match backend.matmul(a, b, shape)? {
         Some(out) if out.len() != cells => crate::bad(format!(
             "the dense backend gave a product {} values, not {cells}",

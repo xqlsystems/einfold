@@ -936,6 +936,65 @@ async fn a_normalized_sum_whose_quotients_would_underflow_answers_as_sql() {
     assert_eq!(got, want);
 }
 
+/// Weights `[5e-324, 1, 1]` over values `[inf, 1, 1]`, per batch: SQL
+/// divides each weight by their sum first, rounds `5e-324 / 2` to 0, and
+/// `0 · inf` is NaN, where the fused sum of `w · v` would give infinity. The
+/// fused algorithm declines it, with the softmax shifted or not.
+#[tokio::test]
+async fn an_infinite_value_whose_weight_would_round_to_zero_answers_as_sql() {
+    let host = SessionContext::new();
+    let builder = SessionStateBuilder::new().with_default_features();
+    let ours = SessionContext::new_with_state(einfold_datafusion::install(builder).build());
+    let both = [&host, &ours];
+    filled(&both, "q", &["b", "h", "t", "d"], &[2, 1, 1, 1], |_| 1.0);
+    let lightest = 5e-324f64.ln();
+    filled(
+        &both,
+        "k",
+        &["b", "h", "t", "d"],
+        &[2, 1, 3, 1],
+        |k| match k[2] {
+            0 => lightest,
+            _ => 0.0,
+        },
+    );
+    filled(
+        &both,
+        "v",
+        &["b", "h", "t", "c"],
+        &[2, 1, 3, 1],
+        |k| match k[2] {
+            0 => f64::INFINITY,
+            _ => 1.0,
+        },
+    );
+    for weight in ["exp(s - MAX(s) OVER (PARTITION BY b, h, i))", "exp(s)"] {
+        let sql = format!(
+            "WITH scores AS (SELECT q.b, q.h, q.t AS i, k.t AS j, SUM(q.x * k.x) AS s \
+               FROM q JOIN k ON q.b = k.b AND q.h = k.h AND q.d = k.d \
+               GROUP BY q.b, q.h, q.t, k.t), \
+             weights AS (SELECT b, h, i, j, {weight} AS w FROM scores), \
+             norm AS (SELECT b, h, i, SUM(w) AS z FROM weights GROUP BY b, h, i) \
+             SELECT weights.b, weights.h, weights.i AS t, v.c, \
+               SUM(weights.w / norm.z * v.x) AS x \
+             FROM weights JOIN v ON weights.j = v.t AND weights.b = v.b AND weights.h = v.h \
+             JOIN norm ON weights.i = norm.i AND weights.b = norm.b AND weights.h = norm.h \
+             GROUP BY weights.b, weights.h, weights.i, v.c"
+        );
+        let (shown, got) = shown_and_rows(&ours, &sql).await;
+        let want = keyed_rows(&host.sql(&sql).await.unwrap().collect().await.unwrap());
+        assert!(
+            shown.contains("softmax("),
+            "{weight}: found no pipeline:\n{shown}"
+        );
+        let nan = |rows: &[(Vec<i64>, Option<f64>)]| {
+            rows.len() == 2 && rows.iter().all(|r| r.1.is_some_and(f64::is_nan))
+        };
+        assert!(nan(&want), "{weight}: {want:?}");
+        assert!(nan(&got), "{weight}: {got:?}, DataFusion has {want:?}");
+    }
+}
+
 /// The plan einfold makes of `sql`, as `EXPLAIN ANALYZE` shows it, and its
 /// rows.
 async fn shown_and_rows(ctx: &SessionContext, sql: &str) -> (String, Vec<(Vec<i64>, Option<f64>)>) {

@@ -560,6 +560,10 @@ fn tile(
     // score, or the largest magnitude of an expression's weights; -inf
     // until the row has one.
     let mut high = vec![f64::NEG_INFINITY; rows];
+    // Each row's lowest finite scaled score of a key with an infinite value:
+    // its weight times infinity is NaN if the weight rounds to 0, in this
+    // order or SQL's. +inf until the row has one.
+    let mut low = vec![f64::INFINITY; rows];
     // The J positions any row of the tile may see, so that the loop starts
     // and ends at the tiles they lie in: with batch keys, every other batch's
     // tiles lie outside, and the work stays linear in the number of batches.
@@ -651,6 +655,14 @@ fn tile(
                 *s = scale.apply(*s);
                 if s.is_finite() {
                     high[r] = high[r].max(*s);
+                }
+            }
+            for j in (lo..hi).filter(|&j| !finite[j0 + j]) {
+                let infinite = v[(j0 + j) * ny..(j0 + j + 1) * ny]
+                    .iter()
+                    .any(|x| x.is_infinite());
+                if infinite && scores[j - lo].is_finite() {
+                    low[r] = low[r].min(scores[j - lo]);
                 }
             }
             // The largest score so far, or NaN once any score is NaN: its
@@ -792,6 +804,19 @@ fn tile(
         let outputs = r * ny..(r + 1) * ny;
         let z = (!unnormalized).then_some(z[r]);
         overflowed |= !bounds.hold(z, &a[outputs.clone()], &special_value[outputs]);
+        // An infinite value times a weight that rounds to 0 is NaN, so its
+        // weight, and SQL's quotient of it, must stay normal in either
+        // order: weights `[5e-324, 1, 1]` over values `[inf, 1, 1]` average
+        // to NaN in SQL, which rounds `5e-324 / 2` to 0, and to infinity
+        // here.
+        if low[r] != f64::INFINITY {
+            let lightest = match shifted {
+                true => (low[r] - m[r]).exp(),
+                false => low[r].exp(),
+            };
+            let normal = 2.0 * f64::MIN_POSITIVE;
+            overflowed |= !(lightest >= normal && z.is_none_or(|z| lightest / z.abs() >= normal));
+        }
     }
     Tile {
         out: a,

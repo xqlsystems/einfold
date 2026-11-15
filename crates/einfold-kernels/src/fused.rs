@@ -529,7 +529,7 @@ fn tile(
     let mut visited = 0;
     let mut overflowed = false;
     let unnormalized = pipeline.normalizer() == Normalizer::None;
-    // Whether each row has summed a value that isn't finite.
+    // Whether each row has summed a weight or value that isn't finite.
     let mut special = vec![false; rows];
     // The J positions any row of the tile may see, so that the loop starts
     // and ends at the tiles they lie in: with batch keys, every other batch's
@@ -639,6 +639,8 @@ fn tile(
                 *s = (*s - shift).exp();
                 sum += *s;
             }
+            // A weight that isn't finite is SQL's to make what it will of.
+            let special_weight = scores.iter().any(|w| !w.is_finite());
             if shifted && rescale != 1.0 {
                 let row = &a[r * ny..(r + 1) * ny];
                 let infinite = z[r].is_infinite() || row.iter().any(|a: &f64| a.is_infinite());
@@ -648,7 +650,7 @@ fn tile(
                     .iter_mut()
                     .for_each(|a| *a *= rescale);
             }
-            special[r] |= (lo..hi).any(|j| !finite[j0 + j]);
+            special[r] |= special_weight || (lo..hi).any(|j| !finite[j0 + j]);
             // Unnormalized, there's no division by a normalizer to give a
             // special value SQL's result, so weights or values that aren't
             // finite decline, as expression weights' do.
@@ -699,7 +701,14 @@ fn tile(
         }
         _ => {
             for (r, z) in z.iter().enumerate() {
-                a[r * ny..(r + 1) * ny].iter_mut().for_each(|a| *a /= z);
+                // A sum of finite terms that reached infinity overflowed
+                // where SQL's needn't: SQL may divide each term by the
+                // normalizer before adding it, as ddx writes `SUM(w / z *
+                // v)`, and so stay finite.
+                let row = &mut a[r * ny..(r + 1) * ny];
+                let infinite = z.is_infinite() || row.iter().any(|a| a.is_infinite());
+                overflowed |= infinite && !special[r];
+                row.iter_mut().for_each(|a| *a /= z);
             }
         }
     }

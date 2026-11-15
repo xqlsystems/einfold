@@ -566,11 +566,20 @@ fn batched_query(rng: &mut Rng) -> (String, Option<Expect>) {
     let all_v = " AND weights.b = v.b AND weights.h = v.h";
     let all_norm = " AND weights.b = norm.b AND weights.h = norm.h";
     let kept = "weights.b, weights.h, weights.i";
-    match rng.below(8) {
+    match rng.below(9) {
         0..=2 => (
             average(&weights, norm, all_v, all_norm, kept),
             Some(Expect::Pipeline),
         ),
+        // A normalizer grouped by a key it doesn't show, `j`, with `h`
+        // spelled from another: a sum over other groups.
+        8 => {
+            let other = "norm AS (SELECT b, i, i AS h, SUM(w) AS z FROM weights GROUP BY b, i, j)";
+            (
+                average(&weights, other, all_v, all_norm, kept),
+                Some(Expect::Decline),
+            )
+        }
         // The normalizer joined on two of its three keys, so each weight
         // meets every head's normalizer.
         3 => (
@@ -793,5 +802,75 @@ async fn einfold_finds_batched_pipelines_and_changes_no_answer() {
     }
     if cases >= 50 {
         assert!(found > 0 && fused > 0, "found {found}, fused {fused}");
+    }
+}
+
+/// Registers `name(<columns>, x)`, complete over `extents`, with every `x`
+/// the same, in each of `ctxs`.
+fn constant(ctxs: &[&SessionContext], name: &str, columns: &[&str], extents: &[usize], x: f64) {
+    let mut fields: Vec<Field> = (columns.iter())
+        .map(|c| Field::new(*c, DataType::Int64, false))
+        .collect();
+    fields.push(Field::new("x", DataType::Float64, false));
+    let schema = Arc::new(Schema::new(fields));
+    let rows = extents.iter().product::<usize>();
+    let key = |r: usize, c: usize| -> i64 {
+        let stride: usize = extents[c + 1..].iter().product();
+        ((r / stride) % extents[c]) as i64
+    };
+    let mut arrays: Vec<Arc<dyn Array>> = (0..columns.len())
+        .map(|c| Arc::new(Int64Array::from_iter_values((0..rows).map(|r| key(r, c)))) as _)
+        .collect();
+    arrays.push(Arc::new(Float64Array::from(vec![x; rows])));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).unwrap();
+    for ctx in ctxs {
+        let mem = MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]]).unwrap();
+        ctx.register_table(name, Arc::new(mem)).unwrap();
+    }
+}
+
+/// A normalized average of values near the largest double, with the
+/// normalizer inside the sum as ddx writes it, `SUM(w / norm.z * v.x)`: each
+/// term is at most `v.x`, so SQL's sum stays finite, where a sum of `w ·
+/// v.x` divided at the end overflows. The fused algorithm declines it, and
+/// the host's plan gives SQL's averages, with one kept key or with batches.
+#[tokio::test]
+async fn a_normalized_sum_that_would_overflow_answers_as_sql() {
+    let one = "WITH scores AS (SELECT q.t AS i, k.t AS j, SUM(q.x * k.x) AS s \
+                 FROM q JOIN k ON q.d = k.d GROUP BY q.t, k.t), \
+               weights AS (SELECT i, j, exp(s - MAX(s) OVER (PARTITION BY i)) AS w FROM scores), \
+               norm AS (SELECT i, SUM(w) AS z FROM weights GROUP BY i) \
+               SELECT weights.i AS t, v.c, SUM(weights.w / norm.z * v.x) AS x \
+               FROM weights JOIN v ON weights.j = v.t JOIN norm ON weights.i = norm.i \
+               GROUP BY weights.i, v.c";
+    let batched = "WITH scores AS (SELECT q.b, q.t AS i, k.t AS j, SUM(q.x * k.x) AS s \
+                 FROM q2 q JOIN k2 k ON q.b = k.b AND q.d = k.d GROUP BY q.b, q.t, k.t), \
+               weights AS (SELECT b, i, j, exp(s - MAX(s) OVER (PARTITION BY b, i)) AS w \
+                 FROM scores), \
+               norm AS (SELECT b, i, SUM(w) AS z FROM weights GROUP BY b, i) \
+               SELECT weights.b, weights.i, v.c, SUM(weights.w / norm.z * v.x) AS x \
+               FROM weights JOIN v2 v ON weights.j = v.t AND weights.b = v.b \
+               JOIN norm ON weights.i = norm.i AND weights.b = norm.b \
+               GROUP BY weights.b, weights.i, v.c";
+    let host = SessionContext::new();
+    let builder = SessionStateBuilder::new().with_default_features();
+    let ours = SessionContext::new_with_state(einfold_datafusion::install(builder).build());
+    // Zero scores, so every weight is 1, and every value 1e308: each average
+    // is 1e308.
+    let both = [&host, &ours];
+    constant(&both, "q", &["t", "d"], &[3, 2], 0.0);
+    constant(&both, "k", &["t", "d"], &[3, 2], 0.0);
+    constant(&both, "v", &["t", "c"], &[3, 2], 1e308);
+    constant(&both, "q2", &["b", "t", "d"], &[2, 3, 2], 0.0);
+    constant(&both, "k2", &["b", "t", "d"], &[2, 3, 2], 0.0);
+    constant(&both, "v2", &["b", "t", "c"], &[2, 3, 2], 1e308);
+    for sql in [one, batched] {
+        let got = keyed_rows(&ours.sql(sql).await.unwrap().collect().await.unwrap());
+        let want = keyed_rows(&host.sql(sql).await.unwrap().collect().await.unwrap());
+        assert!(
+            want.iter().all(|r| r.1.is_some_and(f64::is_finite)),
+            "{want:?}"
+        );
+        assert_eq!(got, want, "{sql}");
     }
 }

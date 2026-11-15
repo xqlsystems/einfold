@@ -1183,12 +1183,18 @@ fn normalizes_many(
             .position(|e| e.clone().unalias() == Expr::Column(c.clone()))?;
         Some(column_at(plan, i))
     };
+    // Grouped by exactly the kept outputs, each shown as the column it is
+    // joined on: a group the normalizer doesn't show, or doesn't join on,
+    // would make it a sum over other groups.
     let mut seen = BTreeSet::new();
     for (i, g) in agg.group_expr.iter().enumerate() {
         let Some(Some(o)) = role(g) else {
             return Ok(false);
         };
-        if !seen.insert(o) || shown(column_at(&p.input, i)).as_ref() != keys.get(&o) {
+        let Some(key) = keys.get(&o) else {
+            return Ok(false);
+        };
+        if !seen.insert(o) || shown(column_at(&p.input, i)).as_ref() != Some(key) {
             return Ok(false);
         }
     }

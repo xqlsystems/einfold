@@ -893,6 +893,43 @@ async fn a_normalized_sum_that_would_overflow_answers_as_sql() {
     }
 }
 
+/// Unshifted softmax weights `exp(s)` of `[5e-324, 2]` over values `[1e308,
+/// 1e-300]`: SQL divides each weight by their sum first, rounds `5e-324 / 2`
+/// to 0, and averages to `1e-300`, where the fused sum of `w · v` would give
+/// `2.5e-16`. The fused algorithm declines it.
+#[tokio::test]
+async fn a_normalized_sum_whose_quotients_would_underflow_answers_as_sql() {
+    let sql = "WITH scores AS (SELECT q.t AS i, k.t AS j, SUM(q.x * k.x) AS s \
+                 FROM q JOIN k ON q.d = k.d GROUP BY q.t, k.t), \
+               weights AS (SELECT i, j, exp(s) AS w FROM scores), \
+               norm AS (SELECT i, SUM(w) AS z FROM weights GROUP BY i) \
+               SELECT weights.i AS t, v.c, SUM(weights.w / norm.z * v.x) AS x \
+               FROM weights JOIN v ON weights.j = v.t JOIN norm ON weights.i = norm.i \
+               GROUP BY weights.i, v.c";
+    let host = SessionContext::new();
+    let builder = SessionStateBuilder::new().with_default_features();
+    let ours = SessionContext::new_with_state(einfold_datafusion::install(builder).build());
+    let both = [&host, &ours];
+    filled(&both, "q", &["t", "d"], &[1, 1], |_| 1.0);
+    let lightest = 5e-324f64.ln();
+    filled(&both, "k", &["t", "d"], &[2, 1], |k| match k[0] {
+        0 => lightest,
+        _ => 2f64.ln(),
+    });
+    filled(&both, "v", &["t", "c"], &[2, 1], |k| match k[0] {
+        0 => 1e308,
+        _ => 1e-300,
+    });
+    let (shown, got) = shown_and_rows(&ours, sql).await;
+    let want = keyed_rows(&host.sql(sql).await.unwrap().collect().await.unwrap());
+    assert!(shown.contains("softmax("), "found no pipeline:\n{shown}");
+    assert!(
+        want.iter().all(|r| r.1.is_some_and(|x| x < 1e-290)),
+        "{want:?}"
+    );
+    assert_eq!(got, want);
+}
+
 /// The plan einfold makes of `sql`, as `EXPLAIN ANALYZE` shows it, and its
 /// rows.
 async fn shown_and_rows(ctx: &SessionContext, sql: &str) -> (String, Vec<(Vec<i64>, Option<f64>)>) {

@@ -368,12 +368,15 @@ pub(crate) fn pipeline(
     let finite: Vec<bool> = (0..nj)
         .map(|j| v[j * ny..(j + 1) * ny].iter().all(|x| x.is_finite()))
         .collect();
-    // The smallest nonzero magnitude of a finite value, which bounds below
-    // every product of a weight and a value that isn't zero.
-    let smallest = (v.iter())
-        .map(|x| x.abs())
-        .filter(|&x| x > 0.0 && x.is_finite())
-        .fold(f64::INFINITY, f64::min);
+    // The smallest nonzero and the largest magnitude of a finite value,
+    // which with a row's weights bound its products.
+    let (smallest, largest) = (v.iter()).map(|x| x.abs()).filter(|x| x.is_finite()).fold(
+        (f64::INFINITY, 0.0f64),
+        |(smallest, largest), x| {
+            let smallest = if x > 0.0 { smallest.min(x) } else { smallest };
+            (smallest, largest.max(x))
+        },
+    );
     let x_tiles = nx.div_ceil(XT);
     // The pairs of tiles that share a batch: for each X tile, the J tiles of
     // the batches its rows are in. Without batch keys, every pair.
@@ -396,6 +399,7 @@ pub(crate) fn pipeline(
                 v,
                 finite: &finite,
                 smallest,
+                largest,
             },
             &scores,
             &allowed,
@@ -501,11 +505,12 @@ fn place(
 }
 
 /// The values a pipeline weighs, `v [j][y]`, with whether each J position's
-/// are all finite, and their smallest nonzero finite magnitude.
+/// are all finite, and their smallest nonzero and largest finite magnitudes.
 struct Values<'a> {
     v: &'a [f64],
     finite: &'a [bool],
     smallest: f64,
+    largest: f64,
 }
 
 /// One X tile's averages, `[x][y]` over its positions, and how many J tiles
@@ -538,6 +543,7 @@ fn tile(
         v,
         finite,
         smallest,
+        largest,
     } = values;
     let (x0, x1) = (t * XT, ((t + 1) * XT).min(nx));
     let rows = x1 - x0;
@@ -560,9 +566,10 @@ fn tile(
     // value of one output says nothing of another's overflow.
     let mut special_weight = vec![false; rows];
     let mut special_value = vec![false; rows * ny];
-    // Each row's smallest nonzero weight, which with `smallest` bounds its
-    // products below.
-    let mut lightest = vec![f64::INFINITY; rows];
+    // What bounds each row's weights: a softmax's lowest and highest scaled
+    // score, or an expression's smallest nonzero and largest weight.
+    let mut low = vec![f64::INFINITY; rows];
+    let mut high = vec![f64::NEG_INFINITY; rows];
     // The J positions any row of the tile may see, so that the loop starts
     // and ends at the tiles they lie in: with batch keys, every other batch's
     // tiles lie outside, and the work stays linear in the number of batches.
@@ -646,12 +653,16 @@ fn tile(
                 // term by term: the host's plan gives SQL's.
                 overflowed |=
                     scores.iter().any(|w| !w.is_finite()) || (lo..hi).any(|j| !finite[j0 + j]);
-                lightest[r] = lightest_nonzero(scores, lightest[r]);
+                for w in scores.iter().map(|w| w.abs()) {
+                    low[r] = if w > 0.0 { low[r].min(w) } else { low[r] };
+                    high[r] = high[r].max(w);
+                }
                 z[r] += scores.iter().sum::<f64>();
                 continue;
             }
             for s in scores.iter_mut() {
                 *s = scale.apply(*s);
+                (low[r], high[r]) = (low[r].min(*s), high[r].max(*s));
             }
             // The largest score so far, or NaN once any score is NaN: its
             // weight is NaN, and so is every average of its row, in SQL too.
@@ -703,10 +714,6 @@ fn tile(
             if unnormalized {
                 overflowed |= special_weights || special_values;
             }
-            // Unshifted, each weight is its own, not rescaled later.
-            if !shifted {
-                lightest[r] = lightest_nonzero(scores, lightest[r]);
-            }
             z[r] += sum;
             m[r] = shift;
         }
@@ -737,6 +744,40 @@ fn tile(
             }
         }
     }
+    // Each row's weights, and SQL's terms, without underflow or overflow.
+    // A product `w · v` below the smallest normal double loses its
+    // precision, or rounds to 0, and so does SQL's `w / z` or `w / z · v`
+    // when it divides first, as ddx writes `SUM(w / z * v)`: in either case
+    // the two orders can differ by far more than rounding. Weights of about
+    // `exp(-744)` and values of `0.125` average to `0.125` in SQL, and to 0
+    // here; weights `[5e-324, 2]` and values `[1e308, 1e-300]` average to
+    // `1e-300` in SQL, which rounds `5e-324 / 2` to 0, and to `2.5e-16`
+    // here. The algorithm declines unless the lightest and heaviest weight,
+    // with the smallest and largest value, prove that every product and
+    // quotient is normal and every sum finite, in both orders. A row whose
+    // weight is NaN or infinite is SQL's to make what it will of, and one
+    // with no keys, or whose every score was -inf, has no products.
+    let normalized = !unnormalized;
+    for r in 0..rows {
+        if special_weight[r] || low[r] > high[r] || (shifted && m[r] == f64::NEG_INFINITY) {
+            continue;
+        }
+        let (lightest, heaviest) = match map {
+            Some(_) => (low[r], high[r]),
+            None => {
+                let shift = if shifted { m[r] } else { 0.0 };
+                ((low[r] - shift).exp(), (high[r] - shift).exp())
+            }
+        };
+        let bounds = Bounds {
+            lightest,
+            heaviest,
+            smallest,
+            largest,
+            terms: nj,
+        };
+        overflowed |= !bounds.hold(normalized.then_some(z[r]));
+    }
     // A row whose every score was -inf has z = 0, and 0 / 0 is NaN, as
     // SQL's exp(-inf - -inf) is.
     // Unnormalized, there is no division to give it, so a shifted row
@@ -758,16 +799,6 @@ fn tile(
                 let row = &mut a[r * ny..(r + 1) * ny];
                 let (weight, values) = (special_weight[r], &special_value[r * ny..(r + 1) * ny]);
                 overflowed |= overflows(z, row, weight, values);
-                // A product `w · v` below the smallest normal double loses
-                // its precision, or rounds to 0, which SQL's `w / z · v`
-                // needn't when `z < 1`: weights of about `exp(-744)` and
-                // values of `0.125` average to `0.125` in SQL, and to 0
-                // here. With `z ≥ 1`, as a shifted softmax's always is, each
-                // of SQL's terms is no larger than this one, and rounds no
-                // better. Below, the lightest weight and smallest value
-                // prove that no product was that small, or the algorithm
-                // declines.
-                overflowed |= z < 1.0 && lightest[r] * smallest < f64::MIN_POSITIVE;
                 row.iter_mut().for_each(|a| *a /= z);
                 // Dividing a finite sum by a small normalizer, as weights of
                 // either sign allow, can overflow too.
@@ -791,10 +822,87 @@ fn overflows(z: f64, a: &[f64], special_weight: bool, special_value: &[bool]) ->
             || (a.iter().zip(special_value)).any(|(a, &special)| !special && !a.is_finite()))
 }
 
-/// The smallest of `so_far` and `weights`' nonzero magnitudes.
-fn lightest_nonzero(weights: &[f64], so_far: f64) -> f64 {
-    (weights.iter())
-        .map(|w| w.abs())
-        .filter(|&w| w > 0.0)
-        .fold(so_far, f64::min)
+/// What bounds a row's products: the magnitudes of its lightest and
+/// heaviest weight, of the smallest nonzero and largest value, and the
+/// number of terms a sum may add.
+struct Bounds {
+    lightest: f64,
+    heaviest: f64,
+    smallest: f64,
+    largest: f64,
+    terms: usize,
+}
+
+impl Bounds {
+    /// Whether every product `w · v` that isn't 0 is a normal double and
+    /// every sum of them finite, and, with a normalizer `z`, every quotient
+    /// `w / z` and product `w / z · v` too, with a factor of 2 to spare for
+    /// rounding. A weight or value of 0 makes a product of exactly 0.
+    #[must_use]
+    fn hold(&self, z: Option<f64>) -> bool {
+        let tiny = 2.0 * f64::MIN_POSITIVE;
+        let terms = 2.0 * self.terms as f64;
+        let normal = |w: f64| w == f64::INFINITY || w >= tiny;
+        let products = |lightest: f64, heaviest: f64| {
+            normal(lightest * self.smallest) && (heaviest * self.largest * terms).is_finite()
+        };
+        products(self.lightest, self.heaviest)
+            && z.is_none_or(|z| {
+                let (lightest, heaviest) = (self.lightest / z.abs(), self.heaviest / z.abs());
+                normal(lightest) && heaviest.is_finite() && products(lightest, heaviest)
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Bounds;
+
+    fn bounds(lightest: f64, heaviest: f64, smallest: f64, largest: f64) -> Bounds {
+        Bounds {
+            lightest,
+            heaviest,
+            smallest,
+            largest,
+            terms: 3,
+        }
+    }
+
+    #[test]
+    fn ordinary_weights_and_values_hold() {
+        assert!(bounds(1e-20, 1.0, 1e-5, 1e5).hold(Some(1.5)));
+        assert!(bounds(1e-20, 1.0, 1e-5, 1e5).hold(None));
+    }
+
+    #[test]
+    fn a_product_below_the_smallest_normal_double_declines() {
+        // Weights of exp(-744), each about 1e-323, times values of 0.125.
+        assert!(!bounds(1e-323, 1e-323, 0.125, 0.125).hold(Some(2e-323)));
+    }
+
+    #[test]
+    fn a_quotient_below_the_smallest_normal_double_declines() {
+        // Weights [5e-324, 2] and values [1e308, 1e-300]: SQL rounds
+        // 5e-324 / 2 to 0, though the product of the weight and value isn't
+        // small.
+        assert!(!bounds(5e-324, 2.0, 1e-300, 1e308).hold(Some(2.0)));
+    }
+
+    #[test]
+    fn a_quotient_that_overflows_declines() {
+        // Weights [1, -1, 1e-309] sum to about 1e-309, so SQL's 1 / z
+        // overflows, though the fused sum doesn't.
+        assert!(!bounds(1e-309, 1.0, 1e100, 1e100).hold(Some(1e-309)));
+        assert!(bounds(1e-200, 1.0, 1e100, 1e100).hold(None));
+    }
+
+    #[test]
+    fn a_sum_that_could_overflow_declines() {
+        assert!(!bounds(1.0, 1.0, 1e308, 1e308).hold(None));
+    }
+
+    #[test]
+    fn zero_values_make_exact_products() {
+        assert!(bounds(1e-20, 1.0, f64::INFINITY, 0.0).hold(Some(1.0)));
+    }
 }

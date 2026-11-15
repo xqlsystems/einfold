@@ -3,14 +3,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! [`PythonBackend`]: a session's Python function as einfold's
-//! [`DenseBackend`], the host's arithmetic for dense matrix products and
-//! attention. Experimental and temporary (see [`DenseBackend`]).
+//! [`DenseBackend`], the host's arithmetic for the dense work einfold has
+//! checked, called with each kind of work by name. Experimental and
+//! temporary (see [`DenseBackend`]).
 
 use datafusion::arrow::array::{make_array, Array, ArrayData, Float64Array};
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use einfold_ir::Scale;
-use einfold_kernels::{AttentionShape, DenseBackend, ProductShape};
+use einfold_kernels::{AttentionShape, DenseBackend, DenseWork, ProductShape};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -25,7 +26,8 @@ use pyo3::prelude::*;
 ///   `(1, c)` for `· c` or `(2, c)` for `/ c`, and `ranges` holds each
 ///   query's half-open range of keys, the same in every batch.
 ///
-/// Work smaller than `min_ops` multiplications, or whose operands and result
+/// Later versions may offer other kinds, such as convolutions, so the
+/// function returns `None` for a kind it doesn't know. Work smaller than `min_ops` multiplications, or whose operands and result
 /// take more than `max_bytes`, isn't offered.
 #[derive(Debug)]
 pub(crate) struct PythonBackend {
@@ -76,58 +78,51 @@ impl PythonBackend {
 }
 
 impl DenseBackend for PythonBackend {
-    fn matmul(
-        &self,
-        a: &[f64],
-        b: &[f64],
-        shape: ProductShape,
-    ) -> Result<Option<Vec<f64>>, ArrowError> {
-        let ProductShape {
-            batches,
-            rows,
-            inner,
-            columns,
-        } = shape;
-        let output = batches.saturating_mul(rows).saturating_mul(columns);
-        let ops = output.saturating_mul(inner);
-        let shape = vec![batches, rows, inner, columns];
-        self.call("matmul", &[a, b], shape, (ops, output), (0, 1.0), &[])
-    }
-
-    fn attention(
-        &self,
-        q: &[f64],
-        kt: &[f64],
-        v: &[f64],
-        shape: AttentionShape,
-        scale: Scale,
-        allowed: &[(usize, usize)],
-    ) -> Result<Option<Vec<f64>>, ArrowError> {
-        let AttentionShape {
-            batches,
-            queries,
-            features,
-            keys,
-            values,
-        } = shape;
-        let scale = match scale {
-            Scale::One => (0, 1.0),
-            Scale::Times(c) => (1, c),
-            Scale::Over(c) => (2, c),
-            _ => return Ok(None),
-        };
-        // Each pair's score, then its weight's share of each value.
-        let pairs = batches.saturating_mul(queries).saturating_mul(keys);
-        let ops = pairs.saturating_mul(features.saturating_add(values));
-        let output = batches.saturating_mul(queries).saturating_mul(values);
-        let shape = vec![batches, queries, features, keys, values];
-        self.call(
-            "attention",
-            &[q, kt, v],
-            shape,
-            (ops, output),
-            scale,
-            allowed,
-        )
+    fn run(&self, work: DenseWork<'_>) -> Result<Option<Vec<f64>>, ArrowError> {
+        match work {
+            DenseWork::Product { a, b, shape } => {
+                let ProductShape {
+                    batches,
+                    rows,
+                    inner,
+                    columns,
+                } = shape;
+                let output = batches.saturating_mul(rows).saturating_mul(columns);
+                let ops = output.saturating_mul(inner);
+                let shape = vec![batches, rows, inner, columns];
+                self.call("matmul", &[a, b], shape, (ops, output), (0, 1.0), &[])
+            }
+            DenseWork::Attention {
+                q,
+                kt,
+                v,
+                shape,
+                scale,
+                allowed,
+            } => {
+                let AttentionShape {
+                    batches,
+                    queries,
+                    features,
+                    keys,
+                    values,
+                } = shape;
+                let scale = match scale {
+                    Scale::One => (0, 1.0),
+                    Scale::Times(c) => (1, c),
+                    Scale::Over(c) => (2, c),
+                    _ => return Ok(None),
+                };
+                // Each pair's score, then its weight's share of each value.
+                let pairs = batches.saturating_mul(queries).saturating_mul(keys);
+                let ops = pairs.saturating_mul(features.saturating_add(values));
+                let output = batches.saturating_mul(queries).saturating_mul(values);
+                let shape = vec![batches, queries, features, keys, values];
+                let arrays = [q, kt, v];
+                self.call("attention", &arrays, shape, (ops, output), scale, allowed)
+            }
+            // A kind of work this function isn't told of: declined.
+            _ => Ok(None),
+        }
     }
 }

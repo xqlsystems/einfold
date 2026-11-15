@@ -30,25 +30,29 @@ use crate::stack;
 /// It counts the plans it was given and those it ran folds or pipelines in.
 ///
 /// Experimental and temporary: `dense_backend`, a function, computes the
-/// matrix products and attention einfold has checked, in place of einfold's
-/// own arithmetic, for this extension's sessions only. It is called as
+/// dense work einfold has detected and checked, in place of einfold's own
+/// arithmetic, for this extension's sessions only. Each kind of work is one
+/// of einfold's nodes, offered by name as
 /// `dense_backend(kind, arrays, shape, scale, ranges)` with `pyarrow`
-/// `float64` arrays, and returns one, or `None` to decline:
+/// `float64` arrays; the function returns one, or `None` to decline:
 ///
-/// - `kind == "matmul"`: `arrays` is `[a, b]`, `shape` is `(batches, rows,
-///   inner, columns)`, and the result is `a @ b` for each batch;
-/// - `kind == "attention"`: `arrays` is `[q, kt, v]`, `shape` is `(batches,
-///   queries, features, keys, values)`, `scale` is `(0, 1.0)` for none, `(1,
-///   c)` for `* c` or `(2, c)` for `/ c`, and `ranges[x]` is query `x`'s
-///   half-open range of keys, in every batch. The result is the softmax of
-///   each query's scaled scores over its keys, shifted by its largest, times
-///   the values.
+/// - `kind == "matmul"`, a matrix product: `arrays` is `[a, b]`, `shape` is
+///   `(batches, rows, inner, columns)`, and the result is `a @ b` for each
+///   batch;
+/// - `kind == "attention"`, a softmax-weighted average: `arrays` is `[q, kt,
+///   v]`, `shape` is `(batches, queries, features, keys, values)`, `scale` is
+///   `(0, 1.0)` for none, `(1, c)` for `* c` or `(2, c)` for `/ c`, and
+///   `ranges[x]` is query `x`'s half-open range of keys, in every batch. The
+///   result is the softmax of each query's scaled scores over its keys,
+///   shifted by its largest, times the values.
 ///
-/// All arrays are row-major, batch first. Work of fewer than
-/// `dense_min_ops` multiplications, or whose arrays take more than
-/// `dense_max_bytes`, isn't offered. The function's results are the
-/// session's answers: einfold doesn't check their precision, so one that
-/// computes in `float32` changes them by as much.
+/// Later versions may offer other kinds, such as convolutions, so the
+/// function returns `None` for a kind it doesn't know. All arrays are
+/// row-major, batch first. Work of fewer than `dense_min_ops`
+/// multiplications, or whose arrays take more than `dense_max_bytes`, isn't
+/// offered. The function's results are the session's answers: einfold
+/// doesn't check their precision, so one that computes in `float32` changes
+/// them by as much.
 #[pyclass(name = "EinFold", module = "einfold._native", frozen)]
 #[derive(Default)]
 pub(crate) struct EinFold {

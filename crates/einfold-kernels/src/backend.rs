@@ -2,11 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`DenseBackend`]: a host's own arithmetic for the dense matrix products
-//! and attention that einfold's kernels compute. Experimental and
-//! temporary: an interface that hands the runtime each detected node, its
-//! checks and the plan it replaced, rather than its packed operands, is
-//! planned to replace it.
+//! [`DenseBackend`]: a host's own arithmetic for the dense work einfold's
+//! kernels compute, offered one checked node at a time as [`DenseWork`].
+//! Experimental and temporary: an interface that hands the runtime each
+//! detected node, its checks and the plan it replaced, rather than its packed
+//! operands, is planned to replace it.
 
 use std::fmt;
 
@@ -42,41 +42,62 @@ pub struct AttentionShape {
     pub values: usize,
 }
 
+/// One node of dense work einfold has detected and checked, with its
+/// operands packed row-major, batch first. Each kind is one of einfold's
+/// nodes in a shape a host may have a kernel for. More kinds may come, such
+/// as convolutions, so a backend declines a kind it doesn't know.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum DenseWork<'a> {
+    /// `a · b` for each batch: a fold over a join whose row value is the
+    /// product of its operands' values, summed. `a` is `[w][x][z]`, `b` is
+    /// `[w][z][y]`, and the result is `[w][x][y]`.
+    Product {
+        /// The left operands.
+        a: &'a [f64],
+        /// The right operands.
+        b: &'a [f64],
+        /// Their shape.
+        shape: ProductShape,
+    },
+    /// Softmax attention for each batch, a fold pipeline: row `x` of the
+    /// result is `Σ_j softmax_j(scale(q[x] · k[j])) · v[j]` over the keys `j`
+    /// in `allowed[x]`, a half-open range, the same in every batch. The
+    /// softmax is shifted by each row's largest score, as SQL's `exp(s -
+    /// MAX(s) OVER (PARTITION BY …))` is. `q` is `[w][x][e]`, `kt` is
+    /// `[w][e][j]`, `v` is `[w][j][y]`, and the result is `[w][x][y]`, with
+    /// every row computed, even one whose range is empty, which einfold
+    /// drops.
+    Attention {
+        /// The queries.
+        q: &'a [f64],
+        /// The keys, transposed.
+        kt: &'a [f64],
+        /// The values.
+        v: &'a [f64],
+        /// Their shape.
+        shape: AttentionShape,
+        /// The constant each score is scaled by.
+        scale: Scale,
+        /// Each query's keys.
+        allowed: &'a [(usize, usize)],
+    },
+}
+
 /// A host's arithmetic for dense work einfold has already checked: every key
-/// in range, no duplicate rows, no NULLs, and every factor finite. Each
-/// method returns the result, row-major, or `None` to decline, in which case
-/// einfold computes it itself. An error fails the query.
+/// in range, no duplicate rows, no NULLs, and every factor finite. Which rows
+/// exist, and which are NULL, stays einfold's.
 ///
 /// Its results are the host's: einfold doesn't check their precision or
 /// determinism, so a host that computes in `float32`, or adds in an order
 /// that depends on timing, changes the query's answer by as much.
 pub trait DenseBackend: Send + Sync + fmt::Debug {
-    /// `a · b` for each batch: `a` is `[w][x][z]` and `b` is `[w][z][y]`,
-    /// and the result is `[w][x][y]`.
+    /// The result of `work`, row-major and batch first, or `None` to decline
+    /// it, in which case einfold computes it itself. A backend declines a
+    /// kind of work it doesn't know.
     ///
     /// # Errors
     ///
-    /// Whatever error the host's arithmetic gives.
-    fn matmul(&self, a: &[f64], b: &[f64], shape: ProductShape) -> crate::Result<Option<Vec<f64>>>;
-
-    /// Softmax attention for each batch: row `x` of the result is
-    /// `Σ_j softmax_j(scale(q[x] · k[j])) · v[j]` over the keys `j` in
-    /// `allowed[x]`, a half-open range, the same in every batch. The softmax
-    /// is shifted by each row's largest score, as SQL's `exp(s - MAX(s) OVER
-    /// (PARTITION BY …))` is. `q` is `[w][x][e]`, `kt` is `[w][e][j]`, `v`
-    /// is `[w][j][y]`, and the result is `[w][x][y]`, with every row computed,
-    /// even one whose range is empty, which einfold drops.
-    ///
-    /// # Errors
-    ///
-    /// Whatever error the host's arithmetic gives.
-    fn attention(
-        &self,
-        q: &[f64],
-        kt: &[f64],
-        v: &[f64],
-        shape: AttentionShape,
-        scale: Scale,
-        allowed: &[(usize, usize)],
-    ) -> crate::Result<Option<Vec<f64>>>;
+    /// Whatever error the host's arithmetic gives, which fails the query.
+    fn run(&self, work: DenseWork<'_>) -> crate::Result<Option<Vec<f64>>>;
 }

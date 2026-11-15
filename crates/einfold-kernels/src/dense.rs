@@ -63,7 +63,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use einfold_ir::{ColumnIndex, DimensionId, Domain, Fold, Operand};
 
 use crate::options::{DomainRows, Options};
-use crate::{DenseBackend, ProductShape, Result};
+use crate::{DenseBackend, DenseWork, ProductShape, Result};
 
 /// Output rows per block, when the output has at least [`FEW_CELLS`] cells.
 const XB: usize = 256;
@@ -665,7 +665,7 @@ fn host_product(
         copied * std::mem::size_of::<f64>(),
         "a product for the host",
     )?;
-    match backend.matmul(a, b, shape)? {
+    match backend.run(DenseWork::Product { a, b, shape })? {
         Some(out) if out.len() != cells => crate::bad(format!(
             "the dense backend gave a product {} values, not {cells}",
             out.len()

@@ -103,7 +103,7 @@ use crate::dense;
 use crate::expression::{self, Lanes};
 use crate::gemm::{self, Matrix};
 use crate::Result;
-use crate::{AttentionShape, DenseBackend};
+use crate::{AttentionShape, DenseBackend, DenseWork};
 
 /// X positions per tile, and J positions per tile.
 const XT: usize = 64;
@@ -493,7 +493,7 @@ pub(crate) fn pipeline(
 /// attention whose scores are a product of the two operands, whose weights
 /// are a softmax shifted by each kept group's maximum, normalized, over
 /// non-empty, finite matrices. Their SQL meaning is then the backend's
-/// [`attention`](DenseBackend::attention), since each operand has one row
+/// [`DenseWork::Attention`], since each operand has one row
 /// per key and every value is finite, so that no overflow or NaN is the
 /// SQL's to decide.
 fn host_attention(
@@ -542,7 +542,14 @@ fn host_attention(
     }
     // Each query's keys, the same in every batch: the first batch's.
     let ranges: Vec<(usize, usize)> = (0..queries).map(allowed).collect();
-    let result = backend.attention(q, &batched, v, shape, *scale, &ranges)?;
+    let result = backend.run(DenseWork::Attention {
+        q,
+        kt: &batched,
+        v,
+        shape,
+        scale: *scale,
+        allowed: &ranges,
+    })?;
     match result {
         Some(r) if r.len() != batches * queries * values => crate::bad(format!(
             "the dense backend gave attention {} values, not {}",

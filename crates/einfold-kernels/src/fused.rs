@@ -839,7 +839,11 @@ impl Bounds {
                 quotient.is_finite() && (quotient * self.largest * terms).is_finite()
             });
         let inverse = z.map_or(1.0, |z| 1.0 / z.abs());
-        let lost = terms * 2f64.powi(-1074) * (inverse + self.largest + 1.0);
+        // The smallest subnormal, 2^-1074: the most a product or quotient
+        // loses when it underflows. (`2f64.powi(-1074)` computed at run
+        // time overflows 2^1074 and gives 0.)
+        let smallest = f64::from_bits(1);
+        let lost = terms * smallest * (inverse + self.largest + 1.0);
         let rounding = f64::EPSILON / 4.0;
         finite
             && (results.iter().zip(special))

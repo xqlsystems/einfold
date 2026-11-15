@@ -39,7 +39,8 @@ use datafusion::physical_plan::{
     self, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
 use datafusion::physical_planner::DefaultPhysicalPlanner;
-use einfold_datafusion::{DetectFolds, EinFoldPlanner, FoldNode, PipelineNode};
+use einfold_datafusion::{DetectFolds, EinFoldExec, EinFoldPlanner, FoldNode, PipelineNode};
+use einfold_kernels::DenseBackend;
 use futures::Stream;
 use tokio::runtime::{Handle, Runtime};
 
@@ -281,9 +282,26 @@ fn einfold_nodes(plan: &LogicalPlan) -> Result<Nodes> {
 /// The session's planner, with einfold's detection in front of it. Every
 /// plan is planned here, so that none crosses back to the session as
 /// protobuf, which copies in-memory tables.
+/// `plan` with each of its `EinFoldExec` operators given `backend`.
+fn with_backend(
+    plan: Arc<dyn ExecutionPlan>,
+    backend: &Arc<dyn DenseBackend>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let given = plan.transform_up(|node| {
+        let Some(exec) = node.downcast_ref::<EinFoldExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(exec.with_backend(Arc::clone(backend)));
+        Ok(Transformed::yes(exec))
+    })?;
+    Ok(given.data)
+}
+
 #[derive(Debug)]
 pub(crate) struct Bridge {
     pub(crate) counts: Arc<Counts>,
+    /// The session's arithmetic for dense work, if it gave einfold some.
+    pub(crate) backend: Option<Arc<dyn DenseBackend>>,
     /// The runtime environment this session's plans are planned and run
     /// with, kept from query to query. A session that crossed the FFI has a
     /// new, default one in every call, so its caches, such as the metadata
@@ -327,6 +345,10 @@ impl QueryPlanner for Bridge {
         let planner =
             DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(EinFoldPlanner)]);
         let physical = planner.create_physical_plan(&detected, &local).await?;
+        let physical = match &self.backend {
+            Some(backend) => with_backend(physical, backend)?,
+            None => physical,
+        };
         Ok(Arc::new(Opaque {
             plan: physical,
             runtime_env: Arc::clone(&self.runtime_env),

@@ -71,6 +71,10 @@ pub struct Options<'a> {
     /// The memory the kernel may take beyond its inputs, or `None` for no
     /// limit.
     pub budget: Option<&'a dyn Budget>,
+    /// The host's arithmetic for dense matrix products and attention, which
+    /// may decline, or `None` for einfold's own. Experimental (see
+    /// [`DenseBackend`](crate::DenseBackend)).
+    pub backend: Option<&'a dyn crate::DenseBackend>,
 }
 
 impl Options<'_> {
@@ -92,6 +96,7 @@ impl Default for Options<'_> {
             threads: 1,
             domain_rows: DomainRows::Any,
             budget: None,
+            backend: None,
         }
     }
 }

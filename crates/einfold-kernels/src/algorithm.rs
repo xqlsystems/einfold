@@ -150,5 +150,11 @@ pub fn pipeline(
     options: Options,
 ) -> Result<Option<Piped>> {
     let threads = options.threads.max(1);
-    fused::pipeline(pipeline, [q.batches, k.batches, v.batches], schema, threads)
+    fused::pipeline(
+        pipeline,
+        [q.batches, k.batches, v.batches],
+        schema,
+        threads,
+        &options,
+    )
 }

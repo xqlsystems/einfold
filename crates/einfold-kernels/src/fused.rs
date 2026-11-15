@@ -103,6 +103,7 @@ use crate::dense;
 use crate::expression::{self, Lanes};
 use crate::gemm::{self, Matrix};
 use crate::Result;
+use crate::{AttentionShape, DenseBackend};
 
 /// X positions per tile, and J positions per tile.
 const XT: usize = 64;
@@ -151,6 +152,7 @@ pub(crate) fn pipeline(
     [q, k, v]: [&[RecordBatch]; 3],
     schema: SchemaRef,
     threads: usize,
+    options: &crate::Options,
 ) -> Result<Option<Piped>> {
     if !matches!(pipeline.weight(), Weight::Exp { .. } | Weight::Of(_)) {
         return Ok(None);
@@ -392,21 +394,38 @@ pub(crate) fn pipeline(
             end.div_ceil(JT) - start / JT
         })
         .sum();
-    let tiles = dense::par_tasks(x_tiles, threads, |t| {
-        tile(
-            pipeline,
-            t,
-            (nx, ne, nj, ny),
-            Values {
-                v,
-                finite: &finite,
-                largest: &largest,
-                smallest: &smallest,
-            },
-            &scores,
-            &allowed,
-        )
-    });
+    // The host's arithmetic, if it has some and takes this pipeline; else
+    // einfold's own, tile by tile.
+    let batches = nx.checked_div(local_nx).unwrap_or(0);
+    let shape = AttentionShape {
+        batches,
+        queries: local_nx,
+        features: ne,
+        keys: local_nj,
+        values: ny,
+    };
+    let hosted = match options.backend {
+        Some(backend) => host_attention(backend, pipeline, &scores, v, shape, &allowed, options)?,
+        None => None,
+    };
+    let tiles = match hosted {
+        Some(_) => Vec::new(),
+        None => dense::par_tasks(x_tiles, threads, |t| {
+            tile(
+                pipeline,
+                t,
+                (nx, ne, nj, ny),
+                Values {
+                    v,
+                    finite: &finite,
+                    largest: &largest,
+                    smallest: &smallest,
+                },
+                &scores,
+                &allowed,
+            )
+        }),
+    };
     if tiles.iter().any(|t| t.overflowed) {
         return Ok(None);
     }
@@ -451,8 +470,13 @@ pub(crate) fn pipeline(
     }
     let mut out = Vec::with_capacity(total);
     for &x in &rows {
-        let state = &tiles[x / XT];
-        out.extend_from_slice(&state.out[(x % XT) * ny..(x % XT + 1) * ny]);
+        match &hosted {
+            Some(result) => out.extend_from_slice(&result[x * ny..(x + 1) * ny]),
+            None => {
+                let state = &tiles[x / XT];
+                out.extend_from_slice(&state.out[(x % XT) * ny..(x % XT + 1) * ny]);
+            }
+        }
     }
     columns.push(Arc::new(Float64Array::from(out)));
     Ok(Some(Piped {
@@ -460,6 +484,67 @@ pub(crate) fn pipeline(
         tiles_visited,
         tiles: tile_pairs,
     }))
+}
+
+/// The pipeline's result, `[w][x][y]`, from the host's `backend`, or `None`
+/// when the backend declines or doesn't take this pipeline: it takes
+/// attention whose scores are a product of the two operands, whose weights
+/// are a softmax shifted by each kept group's maximum, normalized, over
+/// non-empty, finite matrices. Their SQL meaning is then the backend's
+/// [`attention`](DenseBackend::attention), since each operand has one row
+/// per key and every value is finite, so that no overflow or NaN is the
+/// SQL's to decide.
+fn host_attention(
+    backend: &dyn DenseBackend,
+    pipeline: &Pipeline,
+    scores: &Scores,
+    v: &[f64],
+    shape: AttentionShape,
+    allowed: &impl Fn(usize) -> (usize, usize),
+    options: &crate::Options,
+) -> Result<Option<Vec<f64>>> {
+    let AttentionShape {
+        batches,
+        queries,
+        features,
+        keys,
+        values,
+    } = shape;
+    let (Scores::Product { q, kt }, Weight::Exp { scale, shift }) = (scores, pipeline.weight())
+    else {
+        return Ok(None);
+    };
+    let sizes = [batches, queries, features, keys, values];
+    if *shift != Shift::KeptMaximum
+        || pipeline.normalizer() == Normalizer::None
+        || sizes.contains(&0)
+        || !q.iter().chain(kt.iter()).chain(v).all(|x| x.is_finite())
+    {
+        return Ok(None);
+    }
+    // The keys, transposed and batch first: einfold places them `[e][w][j]`.
+    let nj = batches * keys;
+    options.reserve(
+        (kt.len() + batches * queries * values) * std::mem::size_of::<f64>(),
+        "attention for the host",
+    )?;
+    let mut batched = Vec::with_capacity(kt.len());
+    for w in 0..batches {
+        for e in 0..features {
+            batched.extend_from_slice(&kt[e * nj + w * keys..e * nj + (w + 1) * keys]);
+        }
+    }
+    // Each query's keys, the same in every batch: the first batch's.
+    let ranges: Vec<(usize, usize)> = (0..queries).map(allowed).collect();
+    let result = backend.attention(q, &batched, v, shape, *scale, &ranges)?;
+    match result {
+        Some(r) if r.len() != batches * queries * values => crate::bad(format!(
+            "the dense backend gave attention {} values, not {}",
+            r.len(),
+            batches * queries * values
+        )),
+        other => Ok(other),
+    }
 }
 
 /// `p`'s rows as a dense `rows × columns` matrix of its column, or `None`

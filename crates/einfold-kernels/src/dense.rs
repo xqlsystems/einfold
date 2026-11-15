@@ -63,7 +63,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use einfold_ir::{ColumnIndex, DimensionId, Domain, Fold, Operand};
 
 use crate::options::{DomainRows, Options};
-use crate::Result;
+use crate::{DenseBackend, ProductShape, Result};
 
 /// Output rows per block, when the output has at least [`FEW_CELLS`] cells.
 const XB: usize = 256;
@@ -433,14 +433,34 @@ pub(crate) fn fold(
         _ => Vec::new(),
     };
 
-    let out = accumulate(
-        &a_matrix,
-        &held,
-        &b_matrix,
-        (nx, nz, ny),
-        per_batch,
-        threads,
-    );
+    // The product, by the host's arithmetic if it has some and takes it.
+    // Its terms are the matrices' every cell, an absent or NULL one 0, where
+    // einfold's own adds only the cells with values: the same sums, as every
+    // factor is finite. Which groups exist, and which are NULL, is decided
+    // below either way.
+    let hosted = match options.backend {
+        Some(backend) if a_matrix.iter().chain(&b_matrix).all(|x| x.is_finite()) => {
+            let shape = ProductShape {
+                batches: nw,
+                rows: per_batch,
+                inner: nz,
+                columns: ny,
+            };
+            host_product(backend, &a_matrix, &b_matrix, shape, options)?
+        }
+        _ => None,
+    };
+    let out = match hosted {
+        Some(out) => out,
+        None => accumulate(
+            &a_matrix,
+            &held,
+            &b_matrix,
+            (nx, nz, ny),
+            per_batch,
+            threads,
+        ),
+    };
     // A dimension's key at an output cell (x, y): its place in x's or y's
     // position, first dimension slowest. Keys are positions.
     let key_at = |d: usize, x: usize, y: usize| -> usize {
@@ -623,6 +643,29 @@ fn domain_batch(
         .collect();
     columns.push(Arc::new(values));
     RecordBatch::try_new(Arc::clone(schema), columns)
+}
+
+/// `a · b` from the host's `backend`, `[w][x][y]`, or `None` when it
+/// declines or a dimension is empty.
+fn host_product(
+    backend: &dyn DenseBackend,
+    a: &[f64],
+    b: &[f64],
+    shape: ProductShape,
+    options: &Options,
+) -> Result<Option<Vec<f64>>> {
+    let cells = shape.batches * shape.rows * shape.columns;
+    if [shape.batches, shape.rows, shape.inner, shape.columns].contains(&0) {
+        return Ok(None);
+    }
+    options.reserve(cells * std::mem::size_of::<f64>(), "a product for the host")?;
+    match backend.matmul(a, b, shape)? {
+        Some(out) if out.len() != cells => crate::bad(format!(
+            "the dense backend gave a product {} values, not {cells}",
+            out.len()
+        )),
+        other => Ok(other),
+    }
 }
 
 /// `out[x][y] = Σ_z a[x, z]·b[w][z][y]` over the positions of `a` that hold

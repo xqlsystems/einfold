@@ -26,6 +26,9 @@ datafusion = "=55.2.0"
 datafusion-ffi = "=55.2.0"
 datafusion-proto = "=55.2.0"
 einfold-datafusion = { path = "../crates/einfold-datafusion" }
+einfold-kernels = { path = "../crates/einfold-kernels" }
+einfold-ir = { path = "../crates/einfold-ir" }
+arrow = { version = "59.2", features = ["pyarrow"] }
 futures = "0.3"
 # mimalloc, Microsoft's general-purpose memory allocator, which
 # datafusion-python (DataFusion's Python bindings) uses too. With the system

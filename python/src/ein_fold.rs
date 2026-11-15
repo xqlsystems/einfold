@@ -14,29 +14,65 @@ use datafusion_ffi::execution::FFI_TaskContextProvider;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::proto::physical_extension_codec::FFI_PhysicalExtensionCodec;
 use datafusion_ffi::query_planner::FFI_QueryPlanner;
+use einfold_kernels::DenseBackend;
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyDict};
 
 use crate::bridge::{self, Bridge, Counts};
 use crate::by_reference::{self, ByReference};
 use crate::capsule;
+use crate::dense_backend::PythonBackend;
 use crate::logical_codec::LogicalCodec;
 use crate::physical_codec::PhysicalCodec;
 use crate::stack;
 
 /// einfold, as an extension for DataFusion's `SessionContext.with_extensions`.
 /// It counts the plans it was given and those it ran folds or pipelines in.
+///
+/// Experimental and temporary: `dense_backend`, a function, computes the
+/// matrix products and attention einfold has checked, in place of einfold's
+/// own arithmetic, for this extension's sessions only. It is called as
+/// `dense_backend(kind, arrays, shape, scale, ranges)` with `pyarrow`
+/// `float64` arrays, and returns one, or `None` to decline:
+///
+/// - `kind == "matmul"`: `arrays` is `[a, b]`, `shape` is `(batches, rows,
+///   inner, columns)`, and the result is `a @ b` for each batch;
+/// - `kind == "attention"`: `arrays` is `[q, kt, v]`, `shape` is `(batches,
+///   queries, features, keys, values)`, `scale` is `(0, 1.0)` for none, `(1,
+///   c)` for `* c` or `(2, c)` for `/ c`, and `ranges[x]` is query `x`'s
+///   half-open range of keys, in every batch. The result is the softmax of
+///   each query's scaled scores over its keys, shifted by its largest, times
+///   the values.
+///
+/// All arrays are row-major, batch first. Work of fewer than
+/// `dense_min_ops` multiplications, or whose arrays take more than
+/// `dense_max_bytes`, isn't offered. The function's results are the
+/// session's answers: einfold doesn't check their precision, so one that
+/// computes in `float32` changes them by as much.
 #[pyclass(name = "EinFold", module = "einfold._native", frozen)]
 #[derive(Default)]
 pub(crate) struct EinFold {
     counts: Arc<Counts>,
+    backend: Option<Arc<dyn DenseBackend>>,
 }
 
 #[pymethods]
 impl EinFold {
     #[new]
-    fn new() -> Self {
-        EinFold::default()
+    #[pyo3(signature = (*, dense_backend=None, dense_min_ops=1 << 20, dense_max_bytes=512 << 20))]
+    fn new(dense_backend: Option<Py<PyAny>>, dense_min_ops: usize, dense_max_bytes: usize) -> Self {
+        let backend = dense_backend.map(|callback| {
+            let backend = PythonBackend {
+                callback,
+                min_ops: dense_min_ops,
+                max_bytes: dense_max_bytes,
+            };
+            Arc::new(backend) as Arc<dyn DenseBackend>
+        });
+        EinFold {
+            counts: Arc::default(),
+            backend,
+        }
     }
 
     /// How many plans einfold planned.
@@ -140,6 +176,7 @@ impl EinFold {
         let (logical, physical) = (logical.clone(), physical.clone());
         let bridge = Bridge {
             counts: Arc::clone(&self.counts),
+            backend: self.backend.clone(),
             runtime_env: session_runtime_env()?,
         };
         let ffi_planner =

@@ -284,6 +284,7 @@ fn einfold_nodes(plan: &LogicalPlan) -> Result<Nodes> {
 #[derive(Debug)]
 pub(crate) struct Bridge {
     pub(crate) counts: Arc<Counts>,
+    pub(crate) backend: Option<Arc<dyn einfold_kernels::DenseBackend>>,
     /// The runtime environment this session's plans are planned and run
     /// with, kept from query to query. A session that crossed the FFI has a
     /// new, default one in every call, so its caches, such as the metadata
@@ -327,6 +328,19 @@ impl QueryPlanner for Bridge {
         let planner =
             DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(EinFoldPlanner)]);
         let physical = planner.create_physical_plan(&detected, &local).await?;
+        let physical = physical
+            .transform_up(|node| {
+                if let (Some(backend), Some(exec)) = (
+                    &self.backend,
+                    node.downcast_ref::<einfold_datafusion::EinFoldExec>(),
+                ) {
+                    return Ok(Transformed::yes(
+                        Arc::new(exec.with_backend(backend.clone())) as Arc<dyn ExecutionPlan>,
+                    ));
+                }
+                Ok(Transformed::no(node))
+            })?
+            .data;
         Ok(Arc::new(Opaque {
             plan: physical,
             runtime_env: Arc::clone(&self.runtime_env),
@@ -377,7 +391,9 @@ impl ExecutionPlan for Opaque {
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(self)
+        // DataFusion 55's FFI has no reset_state callback. Its foreign
+        // wrapper resets a leaf through with_new_children instead.
+        self.reset_state()
     }
 
     /// The plan within, with its state reset: a session that runs a plan

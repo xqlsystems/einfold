@@ -30,13 +30,24 @@ use crate::stack;
 #[derive(Default)]
 pub(crate) struct EinFold {
     counts: Arc<Counts>,
+    backend: Option<Arc<dyn einfold_kernels::DenseBackend>>,
 }
 
 #[pymethods]
 impl EinFold {
     #[new]
-    fn new() -> Self {
-        EinFold::default()
+    #[pyo3(signature = (*, dense_backend=None, dense_min_ops=1048576, dense_max_bytes=536870912))]
+    fn new(dense_backend: Option<Py<PyAny>>, dense_min_ops: usize, dense_max_bytes: usize) -> Self {
+        EinFold {
+            counts: Arc::default(),
+            backend: dense_backend.map(|f| {
+                Arc::new(crate::dense_backend::PythonBackend {
+                    callback: f,
+                    min_ops: dense_min_ops,
+                    max_bytes: dense_max_bytes,
+                }) as Arc<dyn einfold_kernels::DenseBackend>
+            }),
+        }
     }
 
     /// How many plans einfold planned.
@@ -140,6 +151,7 @@ impl EinFold {
         let (logical, physical) = (logical.clone(), physical.clone());
         let bridge = Bridge {
             counts: Arc::clone(&self.counts),
+            backend: self.backend.clone(),
             runtime_env: session_runtime_env()?,
         };
         let ffi_planner =

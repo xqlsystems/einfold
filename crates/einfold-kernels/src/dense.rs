@@ -433,14 +433,37 @@ pub(crate) fn fold(
         _ => Vec::new(),
     };
 
-    let out = accumulate(
-        &a_matrix,
-        &held,
-        &b_matrix,
-        (nx, nz, ny),
-        per_batch,
-        threads,
-    );
+    // Leave all row existence, NULL and domain reconstruction below intact.
+    // Exceptional factors stay on the original CPU arithmetic path.
+    let accelerated = match options.backend {
+        Some(backend)
+            if nw > 0
+                && per_batch > 0
+                && nz > 0
+                && ny > 0
+                && a_matrix.iter().chain(&b_matrix).all(|x| x.is_finite()) =>
+        {
+            options.reserve(
+                (a_matrix.len() + b_matrix.len() + nx * ny).saturating_mul(32),
+                "dense backend buffers",
+            )?;
+            backend.matmul(&a_matrix, &b_matrix, (nw, per_batch, nz, ny))?
+        }
+        _ => None,
+    };
+    if accelerated.as_ref().is_some_and(|out| out.len() != nx * ny) {
+        return crate::bad("dense backend returned the wrong shape".into());
+    }
+    let out = accelerated.unwrap_or_else(|| {
+        accumulate(
+            &a_matrix,
+            &held,
+            &b_matrix,
+            (nx, nz, ny),
+            per_batch,
+            threads,
+        )
+    });
     // A dimension's key at an output cell (x, y): its place in x's or y's
     // position, first dimension slowest. Keys are positions.
     let key_at = |d: usize, x: usize, y: usize| -> usize {

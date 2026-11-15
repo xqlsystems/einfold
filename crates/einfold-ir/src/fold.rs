@@ -45,6 +45,10 @@
 //! which a query position may use a key only if the key isn't at a later
 //! position, or a sliding window's `q.t - k.t < 32` (see [`Condition`]).
 //!
+//! An output may also be **shown shifted** by a summed dimension of the other
+//! operand, as a convolution's output position is its input position shifted
+//! by the kernel's tap (see [`ShiftedOutput`]).
+//!
 //! Indices into a fold's dimensions and into its inputs' columns have types
 //! of their own, [`DimensionId`] and [`ColumnIndex`], so that one can't be
 //! passed for the other.
@@ -221,6 +225,74 @@ impl Condition {
     }
 }
 
+/// An output whose key is shown shifted by a dimension of the other operand,
+/// as a convolution's output position is its input position shifted by the
+/// kernel's tap. In SQL, a group key that reads both sides of the join:
+///
+/// ```sql
+/// SELECT w.co, x.lat - (w.ky - 1) * 2, SUM(x.v * w.v)
+/// FROM x JOIN w ON x.c = w.ci
+/// WHERE x.lat - (w.ky - 1) * 2 BETWEEN 0 AND 31
+/// GROUP BY 1, 2
+/// ```
+///
+/// is a fold whose second output is dimension `lat`, shown as `scale · lat +
+/// by_scale · ky + offset`, with `scale` 1, `by_scale` -2 and `offset` 2, and
+/// bounds 0 and 31. Several pairs `(lat, ky)` show the same key, so their
+/// rows fall in one group: `lat` and `ky` are both summed away, and only the
+/// shifted key is grouped by.
+///
+/// With a `period`, the shifted key is then taken modulo it, as SQL's `%`
+/// takes it, with the sign of the dividend: a grid that wraps around, such as
+/// longitude, written `(x.lon - (w.kx - 1) * 2 + 64) % 64`. Bounds are allowed
+/// only without a period. They are a condition of the join that every joined
+/// row's shifted key must meet: as each joined row's key is its group's, a
+/// group they disallow doesn't exist.
+///
+/// The arithmetic is exact. A host computes it in its integer type, which
+/// for the small keys and coefficients a kernel takes can't overflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ShiftedOutput {
+    /// The output shown shifted.
+    pub output: DimensionId,
+    /// The dimension it is shifted by: summed away, and held by the operand
+    /// that doesn't hold `output`.
+    pub by: DimensionId,
+    /// The coefficient of the output's key.
+    pub scale: i64,
+    /// The coefficient of `by`'s key.
+    pub by_scale: i64,
+    /// What is added to the sum of the two.
+    pub offset: i64,
+    /// The modulus the shifted key is taken in, if any.
+    pub period: Option<i64>,
+    /// The smallest shifted key allowed, if any.
+    pub low: Option<i64>,
+    /// The largest shifted key allowed, if any.
+    pub high: Option<i64>,
+}
+
+impl ShiftedOutput {
+    /// The key shown for keys `key` of the output and `by` of the dimension
+    /// it is shifted by, or `None` where the bounds disallow it or the
+    /// arithmetic overflows.
+    #[must_use]
+    pub fn key(&self, key: i64, by: i64) -> Option<i64> {
+        let shifted = i128::from(self.scale) * i128::from(key)
+            + i128::from(self.by_scale) * i128::from(by)
+            + i128::from(self.offset);
+        // `%` in Rust, as in SQL, takes the sign of the dividend.
+        let shifted = match self.period {
+            Some(period) => shifted.checked_rem(i128::from(period))?,
+            None => shifted,
+        };
+        let shifted = i64::try_from(shifted).ok()?;
+        let low = self.low.is_none_or(|low| shifted >= low);
+        let high = self.high.is_none_or(|high| shifted <= high);
+        (low && high).then_some(shifted)
+    }
+}
+
 /// One key column of a fold's result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Output {
@@ -385,6 +457,7 @@ pub struct Fold {
     aggregate: Aggregate,
     domain: Option<Domain>,
     conditions: Vec<Condition>,
+    shifts: Vec<ShiftedOutput>,
 }
 
 /// Why a fold's description is inconsistent.
@@ -491,7 +564,62 @@ impl Fold {
             aggregate,
             domain,
             conditions: Vec::new(),
+            shifts: Vec::new(),
         })
+    }
+
+    /// This fold, with some of its outputs shown shifted (see
+    /// [`ShiftedOutput`]), if each shifts an output of a fold of two operands
+    /// without a domain, at most once, by a summed dimension that only the
+    /// other operand holds and no other shift uses, with a nonzero
+    /// coefficient for each, a positive period, and bounds only without one.
+    pub fn with_shifts(mut self, shifts: Vec<ShiftedOutput>) -> Result<Self, InvalidFold> {
+        let bad = |why: String| Err(InvalidFold(why));
+        if shifts.is_empty() {
+            self.shifts = shifts;
+            return Ok(self);
+        }
+        if self.operands.len() != 2 || self.domain.is_some() {
+            return bad("only a fold of two operands without a domain shifts its outputs".into());
+        }
+        let holder = |d: DimensionId| -> Vec<usize> {
+            (0..2)
+                .filter(|&o| self.operands[o].column_of(d).is_some())
+                .collect()
+        };
+        for (i, s) in shifts.iter().enumerate() {
+            let (DimensionId(o), DimensionId(b)) = (s.output, s.by);
+            if o >= self.dimensions.len() || b >= self.dimensions.len() {
+                return bad(format!("a shift names dimensions {o} and {b}"));
+            }
+            if self.output_of(s.output).is_none() || !self.is_aggregated(s.by) {
+                return bad(format!(
+                    "a shift shows output {o} shifted by summed dimension {b}"
+                ));
+            }
+            let (on, by) = (holder(s.output), holder(s.by));
+            if on.len() != 1 || by.len() != 1 || on == by {
+                return bad(format!(
+                    "dimensions {o} and {b} of a shift are each held by one operand, not the same"
+                ));
+            }
+            if (shifts[..i].iter()).any(|t| t.output == s.output || t.by == s.by) {
+                return bad(format!("output {o} or dimension {b} is in two shifts"));
+            }
+            if s.scale == 0 || s.by_scale == 0 {
+                return bad(format!("a shift of output {o} has a zero coefficient"));
+            }
+            if s.period.is_some_and(|p| p <= 0) {
+                return bad(format!(
+                    "a shift of output {o} has a period that isn't positive"
+                ));
+            }
+            if s.period.is_some() && (s.low.is_some() || s.high.is_some()) {
+                return bad(format!("a shift of output {o} has a period and bounds"));
+            }
+        }
+        self.shifts = shifts;
+        Ok(self)
     }
 
     /// This fold, with `conditions` that every joined row must meet, if each
@@ -572,6 +700,18 @@ impl Fold {
     #[must_use]
     pub fn conditions(&self) -> &[Condition] {
         &self.conditions
+    }
+
+    /// The outputs shown shifted (see [`ShiftedOutput`]).
+    #[must_use]
+    pub fn shifts(&self) -> &[ShiftedOutput] {
+        &self.shifts
+    }
+
+    /// The shift of output dimension `dim`, if it is shown shifted.
+    #[must_use]
+    pub fn shift_of(&self, dim: DimensionId) -> Option<&ShiftedOutput> {
+        self.shifts.iter().find(|s| s.output == dim)
     }
 
     /// The position in [`Fold::outputs`] of dimension `dim`, if it is an
@@ -708,6 +848,68 @@ mod tests {
         assert!(Comparison::GreaterOrEqual.holds(2, 2));
         assert!(!Comparison::Greater.holds(2, 2));
         assert!(Comparison::Less.holds(1, 2) && Comparison::LessOrEqual.holds(2, 2));
+    }
+
+    /// `c,y * o,c,k -> o,y` with `y` shown as `y - 2k + 2`, a dilated
+    /// convolution along one axis.
+    fn convolution(shift: ShiftedOutput) -> Result<Fold, InvalidFold> {
+        let ops = vec![
+            op(&[(0, 0), (1, 1)], Some(2)),
+            op(&[(2, 0), (0, 1), (3, 2)], Some(3)),
+        ];
+        fold(4, ops, vec![out(2), out(1)], None)?.with_shifts(vec![shift])
+    }
+
+    const SHIFT: ShiftedOutput = ShiftedOutput {
+        output: DimensionId(1),
+        by: DimensionId(3),
+        scale: 1,
+        by_scale: -2,
+        offset: 2,
+        period: None,
+        low: Some(0),
+        high: Some(31),
+    };
+
+    #[test]
+    fn shifts_show_an_output_shifted_by_another_operands_dimension() {
+        let f = convolution(SHIFT).unwrap();
+        assert_eq!(f.shift_of(DimensionId(1)), Some(&SHIFT));
+        assert_eq!(f.shift_of(DimensionId(2)), None);
+        // y - 2k + 2, within [0, 31].
+        assert_eq!(SHIFT.key(5, 0), Some(7));
+        assert_eq!(SHIFT.key(5, 2), Some(3));
+        assert_eq!(SHIFT.key(0, 2), None);
+        assert_eq!(SHIFT.key(31, 0), None);
+        // A period takes the remainder with the dividend's sign, as SQL does.
+        let wraps = ShiftedOutput {
+            period: Some(8),
+            low: None,
+            high: None,
+            ..SHIFT
+        };
+        assert_eq!(wraps.key(7, 0), Some(1));
+        assert_eq!(wraps.key(0, 2), Some(-2));
+        assert!(convolution(wraps).is_ok());
+    }
+
+    #[test]
+    fn rejects_inconsistent_shifts() {
+        let shifted = |change: fn(&mut ShiftedOutput)| {
+            let mut s = SHIFT;
+            change(&mut s);
+            convolution(s)
+        };
+        // The output must be an output, and the dimension it's shifted by
+        // summed, held only by the other operand.
+        assert!(shifted(|s| s.output = DimensionId(3)).is_err());
+        assert!(shifted(|s| s.by = DimensionId(0)).is_err());
+        assert!(shifted(|s| s.output = DimensionId(2)).is_err());
+        assert!(shifted(|s| s.scale = 0).is_err());
+        assert!(shifted(|s| s.period = Some(0)).is_err());
+        assert!(shifted(|s| s.period = Some(8)).is_err());
+        let f = convolution(SHIFT).unwrap();
+        assert!(f.with_shifts(vec![SHIFT, SHIFT]).is_err());
     }
 
     #[test]

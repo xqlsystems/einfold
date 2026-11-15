@@ -38,6 +38,7 @@ mod keys;
 mod options;
 mod relation;
 mod schema;
+mod stencil;
 
 pub use algorithm::{fold, fold_chain, fold_dense, pipeline, Algorithm, Folded};
 pub use fused::Piped;

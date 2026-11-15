@@ -25,6 +25,7 @@
 mod detect_chains;
 mod detect_folds;
 mod detect_pipelines;
+mod detect_shifts;
 mod ein_fold_exec;
 mod fold_node;
 mod join_back;

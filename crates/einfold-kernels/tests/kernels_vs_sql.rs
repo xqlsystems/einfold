@@ -31,6 +31,8 @@
 //!    asked for with none, they give the same rows by the same algorithm, bit
 //!    for bit; given one byte fewer, they stop with a memory error. So a
 //!    kernel asks before it allocates, and asks the same for the same rows.
+//!    With a dense backend that takes no shape, they ask for the same bytes
+//!    and give the same rows, and never offer the backend work.
 //!
 //! Half the cases are drawn from a *dense family*, shaped so that the dense
 //! algorithm may apply: non-negative integer keys with no NULLs in the
@@ -60,7 +62,10 @@ use einfold_ir::{
     Aggregate, ColumnIndex, Dimension, DimensionId, Domain, DomainKey, Fold, Key, KeyEquality,
     Operand, Output, RowValue,
 };
-use einfold_kernels::{Algorithm, Budget, DomainRows, FloatKeys, Folded, Host, Options, Relation};
+use einfold_kernels::{
+    Algorithm, Budget, DenseBackend, DenseShape, DenseWork, DomainRows, FloatKeys, Folded, Host,
+    Options, Relation,
+};
 use einfold_testkit::Rng;
 
 #[derive(Clone, Copy, Debug)]
@@ -648,7 +653,7 @@ fn run_fold(case: &Case, rng: &mut Rng) -> (Vec<RecordBatch>, Algorithm) {
     let (a, b) = (batches(&case.a, rng), batches(&case.b, rng));
     let domain = case.domain.as_ref().map(|t| batches(t, rng));
     let threads = 1 + rng.below(8);
-    let folded = fold_within(case, [&a, &b], domain.as_deref(), threads, None).unwrap();
+    let folded = fold_within(case, [&a, &b], domain.as_deref(), threads, None, None).unwrap();
     (folded.batches, folded.algorithm)
 }
 
@@ -670,8 +675,26 @@ impl Budget for Limit {
     }
 }
 
+/// A dense backend that takes no shape, and counts the work it is offered.
+#[derive(Debug, Default)]
+struct Refusing {
+    offered: AtomicUsize,
+}
+
+impl DenseBackend for Refusing {
+    fn may_run(&self, _: DenseShape) -> bool {
+        false
+    }
+
+    fn run(&self, _: DenseWork<'_>) -> einfold_kernels::Result<Option<Vec<f64>>> {
+        self.offered.fetch_add(1, Ordering::Relaxed);
+        Ok(None)
+    }
+}
+
 /// Checks invariant 5 for a case, on one batching of its tables: the bytes
-/// the kernels ask for, and the result given exactly those and one fewer.
+/// the kernels ask for, the result given exactly those and one fewer, and
+/// the bytes and result with a backend that takes no shape.
 fn check_budget(case: &Case, rng: &mut Rng, fail: impl Fn(String)) {
     let batches = |t: &Table, rng: &mut Rng| -> Vec<RecordBatch> {
         t.partitions(rng).into_iter().flatten().collect()
@@ -679,16 +702,37 @@ fn check_budget(case: &Case, rng: &mut Rng, fail: impl Fn(String)) {
     let (a, b) = (batches(&case.a, rng), batches(&case.b, rng));
     let domain = case.domain.as_ref().map(|t| batches(t, rng));
     let threads = 1 + rng.below(8);
-    let run = |limit: usize| {
+    let refusing = Refusing::default();
+    let within = |limit: usize, backend: Option<&dyn DenseBackend>| {
         let budget = Limit {
             given: AtomicUsize::new(0),
             limit,
         };
-        let folded = fold_within(case, [&a, &b], domain.as_deref(), threads, Some(&budget));
+        let folded = fold_within(
+            case,
+            [&a, &b],
+            domain.as_deref(),
+            threads,
+            Some(&budget),
+            backend,
+        );
         (folded, budget.given.into_inner())
     };
+    let run = |limit: usize| within(limit, None);
     let (free, asked) = run(usize::MAX);
     let free = free.unwrap();
+    match within(usize::MAX, Some(&refusing)) {
+        (Ok(f), given) if given == asked && same_bits(&f.batches, &free.batches) => {}
+        (other, given) => fail(format!(
+            "with a backend that takes nothing, asked for {given} bytes, not {asked}: {other:?}"
+        )),
+    }
+    let offered = refusing.offered.load(Ordering::Relaxed);
+    if offered > 0 {
+        fail(format!(
+            "offered a backend that takes nothing {offered} times"
+        ));
+    }
     let (exact, _) = run(asked);
     match exact {
         Ok(f) if f.algorithm == free.algorithm && same_bits(&f.batches, &free.batches) => {}
@@ -711,13 +755,14 @@ fn same_bits(x: &[RecordBatch], y: &[RecordBatch]) -> bool {
 }
 
 /// `case`'s fold over operand batches `a` and `b`, and `domain`'s, on
-/// `threads` threads, within `budget`.
+/// `threads` threads, within `budget`, with `backend`'s arithmetic.
 fn fold_within(
     case: &Case,
     [a, b]: [&[RecordBatch]; 2],
     domain: Option<&[RecordBatch]>,
     threads: usize,
     budget: Option<&dyn Budget>,
+    backend: Option<&dyn DenseBackend>,
 ) -> Result<Folded, ArrowError> {
     let domain = (case.domain.as_ref())
         .zip(domain)
@@ -732,6 +777,7 @@ fn fold_within(
         host: HOST,
         threads,
         budget,
+        backend,
         ..Options::default()
     };
     einfold_kernels::fold(

@@ -85,6 +85,29 @@ pub enum DenseWork<'a> {
     },
 }
 
+/// The kind and shape of [`DenseWork`], without its operands: what a
+/// backend is asked before einfold reserves memory for them, copies them or
+/// checks them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DenseShape {
+    /// A batched matrix product, [`DenseWork::Product`].
+    Product(ProductShape),
+    /// Batched attention, [`DenseWork::Attention`].
+    Attention(AttentionShape),
+}
+
+impl DenseWork<'_> {
+    /// The kind and shape of this work.
+    #[must_use]
+    pub fn shape(&self) -> DenseShape {
+        match self {
+            DenseWork::Product { shape, .. } => DenseShape::Product(*shape),
+            DenseWork::Attention { shape, .. } => DenseShape::Attention(*shape),
+        }
+    }
+}
+
 /// A host's arithmetic for dense work einfold has already checked: every key
 /// in range, no duplicate rows, no NULLs, and every factor finite. Which rows
 /// exist, and which are NULL, stays einfold's.
@@ -93,6 +116,16 @@ pub enum DenseWork<'a> {
 /// determinism, so a host that computes in `float32`, or adds in an order
 /// that depends on timing, changes the query's answer by as much.
 pub trait DenseBackend: Send + Sync + fmt::Debug {
+    /// Whether the backend may take work of `shape`. If not, einfold
+    /// computes it itself, without reserving memory for, copying or
+    /// checking what the backend would have been given, so a backend that
+    /// declines small or large work says so here. [`run`](Self::run) may
+    /// still decline. By default, every shape.
+    fn may_run(&self, shape: DenseShape) -> bool {
+        let _ = shape;
+        true
+    }
+
     /// The result of `work`, row-major and batch first, or `None` to decline
     /// it, in which case einfold computes it itself. A backend declines a
     /// kind of work it doesn't know.

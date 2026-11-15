@@ -103,7 +103,7 @@ use crate::dense;
 use crate::expression::{self, Lanes};
 use crate::gemm::{self, Matrix};
 use crate::Result;
-use crate::{AttentionShape, DenseBackend, DenseWork};
+use crate::{AttentionShape, DenseBackend, DenseShape, DenseWork};
 
 /// X positions per tile, and J positions per tile.
 const XT: usize = 64;
@@ -517,9 +517,12 @@ fn host_attention(
         return Ok(None);
     };
     let sizes = [batches, queries, features, keys, values];
+    // Whether the backend may take it is asked first, before the operands
+    // are scanned, copied or reserved for.
     if *shift != Shift::KeptMaximum
         || pipeline.normalizer() == Normalizer::None
         || sizes.contains(&0)
+        || !backend.may_run(DenseShape::Attention(shape))
         || !q.iter().chain(kt.iter()).chain(v).all(|x| x.is_finite())
     {
         return Ok(None);

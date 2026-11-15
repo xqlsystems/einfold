@@ -63,7 +63,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use einfold_ir::{ColumnIndex, DimensionId, Domain, Fold, Operand};
 
 use crate::options::{DomainRows, Options};
-use crate::{DenseBackend, DenseWork, ProductShape, Result};
+use crate::{DenseBackend, DenseShape, DenseWork, ProductShape, Result};
 
 /// Output rows per block, when the output has at least [`FEW_CELLS`] cells.
 const XB: usize = 256;
@@ -438,14 +438,17 @@ pub(crate) fn fold(
     // einfold's own adds only the cells with values: the same sums, as every
     // factor is finite. Which groups exist, and which are NULL, is decided
     // below either way.
+    let shape = ProductShape {
+        batches: nw,
+        rows: per_batch,
+        inner: nz,
+        columns: ny,
+    };
     let hosted = match options.backend {
-        Some(backend) if a_matrix.iter().chain(&b_matrix).all(|x| x.is_finite()) => {
-            let shape = ProductShape {
-                batches: nw,
-                rows: per_batch,
-                inner: nz,
-                columns: ny,
-            };
+        Some(backend)
+            if backend.may_run(DenseShape::Product(shape))
+                && a_matrix.iter().chain(&b_matrix).all(|x| x.is_finite()) =>
+        {
             host_product(backend, &a_matrix, &b_matrix, shape, options)?
         }
         _ => None,

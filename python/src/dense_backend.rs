@@ -11,7 +11,7 @@ use datafusion::arrow::array::{make_array, Array, ArrayData, Float64Array};
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use einfold_ir::Scale;
-use einfold_kernels::{AttentionShape, DenseBackend, DenseWork, ProductShape};
+use einfold_kernels::{AttentionShape, DenseBackend, DenseShape, DenseWork, ProductShape};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -29,7 +29,8 @@ use pyo3::prelude::*;
 /// Later versions may offer other kinds, such as convolutions, so the
 /// function returns `None` for a kind it doesn't know. Work smaller than
 /// `min_ops` multiplications, or whose operands and result take more than
-/// `max_bytes`, isn't offered.
+/// `max_bytes`, isn't offered, and einfold doesn't reserve memory for it or
+/// copy it.
 #[derive(Debug)]
 pub(crate) struct PythonBackend {
     pub(crate) callback: Py<PyAny>,
@@ -37,27 +38,64 @@ pub(crate) struct PythonBackend {
     pub(crate) max_bytes: usize,
 }
 
+/// What a kind of work costs: its multiplications, the cells of its
+/// operands, and the cells of its result.
+struct Cost {
+    ops: usize,
+    operands: usize,
+    output: usize,
+}
+
+impl Cost {
+    /// The cost of work of `shape`, or `None` for a kind this function
+    /// isn't told of.
+    fn of(shape: DenseShape) -> Option<Cost> {
+        let product = |sizes: &[usize]| sizes.iter().fold(1, |n: usize, &s| n.saturating_mul(s));
+        match shape {
+            DenseShape::Product(ProductShape {
+                batches,
+                rows,
+                inner,
+                columns,
+            }) => Some(Cost {
+                ops: product(&[batches, rows, inner, columns]),
+                operands: product(&[batches, rows, inner])
+                    .saturating_add(product(&[batches, inner, columns])),
+                output: product(&[batches, rows, columns]),
+            }),
+            DenseShape::Attention(AttentionShape {
+                batches,
+                queries,
+                features,
+                keys,
+                values,
+            }) => Some(Cost {
+                // Each pair's score, then its weight's share of each value.
+                ops: product(&[batches, queries, keys, features.saturating_add(values)]),
+                operands: product(&[batches, queries, features])
+                    .saturating_add(product(&[batches, features, keys]))
+                    .saturating_add(product(&[batches, keys, values])),
+                output: product(&[batches, queries, values]),
+            }),
+            _ => None,
+        }
+    }
+}
+
 impl PythonBackend {
-    /// Calls the function with `arrays`, if the work is worth offering, and
-    /// returns its result, checked to be `output` `float64` values with no
-    /// NULLs before it is copied: a longer result would take memory einfold
-    /// hasn't reserved. `noun` names the work in errors.
+    /// Calls the function with `arrays` and returns its result, checked to
+    /// be `output` `float64` values with no NULLs before it is copied: a
+    /// longer result would take memory einfold hasn't reserved. `noun` names
+    /// the work in errors.
     fn call(
         &self,
         (kind, noun): (&str, &str),
         arrays: &[&[f64]],
         shape: Vec<usize>,
-        (ops, output): (usize, usize),
+        output: usize,
         scale: (u8, f64),
         ranges: &[(usize, usize)],
     ) -> Result<Option<Vec<f64>>, ArrowError> {
-        let cells = arrays.iter().map(|a| a.len()).sum::<usize>();
-        let bytes = cells
-            .saturating_add(output)
-            .saturating_mul(std::mem::size_of::<f64>());
-        if ops < self.min_ops || bytes > self.max_bytes {
-            return Ok(None);
-        }
         Python::attach(|py| -> PyResult<Option<Vec<f64>>> {
             let arrays: Vec<_> = (arrays.iter())
                 .map(|a| Float64Array::from(a.to_vec()).to_data().to_pyarrow(py))
@@ -87,7 +125,18 @@ impl PythonBackend {
 }
 
 impl DenseBackend for PythonBackend {
+    fn may_run(&self, shape: DenseShape) -> bool {
+        Cost::of(shape).is_some_and(|cost| {
+            let bytes = (cost.operands.saturating_add(cost.output))
+                .saturating_mul(std::mem::size_of::<f64>());
+            cost.ops >= self.min_ops && bytes <= self.max_bytes
+        })
+    }
+
     fn run(&self, work: DenseWork<'_>) -> Result<Option<Vec<f64>>, ArrowError> {
+        let Some(cost) = Cost::of(work.shape()).filter(|_| self.may_run(work.shape())) else {
+            return Ok(None);
+        };
         match work {
             DenseWork::Product { a, b, shape } => {
                 let ProductShape {
@@ -96,14 +145,12 @@ impl DenseBackend for PythonBackend {
                     inner,
                     columns,
                 } = shape;
-                let output = batches.saturating_mul(rows).saturating_mul(columns);
-                let ops = output.saturating_mul(inner);
                 let shape = vec![batches, rows, inner, columns];
                 self.call(
                     ("matmul", "a product"),
                     &[a, b],
                     shape,
-                    (ops, output),
+                    cost.output,
                     (0, 1.0),
                     &[],
                 )
@@ -129,17 +176,13 @@ impl DenseBackend for PythonBackend {
                     Scale::Over(c) => (2, c),
                     _ => return Ok(None),
                 };
-                // Each pair's score, then its weight's share of each value.
-                let pairs = batches.saturating_mul(queries).saturating_mul(keys);
-                let ops = pairs.saturating_mul(features.saturating_add(values));
-                let output = batches.saturating_mul(queries).saturating_mul(values);
                 let shape = vec![batches, queries, features, keys, values];
                 let arrays = [q, kt, v];
                 self.call(
                     ("attention", "attention"),
                     &arrays,
                     shape,
-                    (ops, output),
+                    cost.output,
                     scale,
                     allowed,
                 )

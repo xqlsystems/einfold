@@ -41,7 +41,7 @@ mod relation;
 mod schema;
 
 pub use algorithm::{fold, fold_chain, fold_dense, pipeline, Algorithm, Folded};
-pub use backend::{AttentionShape, DenseBackend, DenseWork, ProductShape};
+pub use backend::{AttentionShape, DenseBackend, DenseShape, DenseWork, ProductShape};
 pub use fused::Piped;
 pub use options::{Budget, DomainRows, FloatKeys, Host, Options};
 pub use relation::Relation;

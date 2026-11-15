@@ -267,7 +267,8 @@ impl Damage {
 
     /// Whether the fused algorithm must run: every key has exactly one row,
     /// and every value is finite. With a NaN or an infinity it may decline,
-    /// as it does where unnormalized or expression weights meet one (#116).
+    /// as it does where unnormalized or expression weights meet one (#116),
+    /// and it may where an answer is exactly 0.
     fn complete(self) -> bool {
         matches!(self, Damage::None)
     }
@@ -421,12 +422,15 @@ async fn einfold_finds_pipelines_and_changes_no_answer() {
         found += usize::from(is_pipeline);
         let ran = shown.contains("fused_pipelines=1");
         fused += usize::from(ran);
-        if is_pipeline && complete && !ran {
+        let want = rows(&host.sql(&sql).await.unwrap().collect().await.unwrap());
+        // A sum that is exactly 0 may decline: its underflow can't be told
+        // from rounding, so SQL answers it.
+        let zero = want.iter().any(|row| row.2 == Some(0.0));
+        if is_pipeline && complete && !zero && !ran {
             fail(format!(
                 "the fused algorithm didn't run on complete tables:\n{shown}"
             ));
         }
-        let want = rows(&host.sql(&sql).await.unwrap().collect().await.unwrap());
         if got.len() != want.len() {
             fail(format!("{} rows, DataFusion has {}", got.len(), want.len()));
         }
@@ -773,12 +777,14 @@ async fn einfold_finds_batched_pipelines_and_changes_no_answer() {
         found += usize::from(is_pipeline);
         let ran = shown.contains("fused_pipelines=1");
         fused += usize::from(ran);
-        if expect == Some(Expect::Pipeline) && damage.complete() && !ran {
+        let want = keyed_rows(&host.sql(&sql).await.unwrap().collect().await.unwrap());
+        // A sum that is exactly 0 may decline, as above.
+        let zero = want.iter().any(|row| row.1 == Some(0.0));
+        if expect == Some(Expect::Pipeline) && damage.complete() && !zero && !ran {
             fail(format!(
                 "the fused algorithm didn't run on complete tables:\n{shown}"
             ));
         }
-        let want = keyed_rows(&host.sql(&sql).await.unwrap().collect().await.unwrap());
         if got.len() != want.len() {
             fail(format!(
                 "{} rows, DataFusion has {}:\n{shown}",

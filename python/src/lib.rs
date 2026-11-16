@@ -29,6 +29,7 @@ mod allocator;
 mod bridge;
 mod by_reference;
 mod capsule;
+mod dense_backend;
 mod ein_fold;
 mod lean;
 mod logical_codec;

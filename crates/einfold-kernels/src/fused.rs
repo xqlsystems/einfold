@@ -103,6 +103,7 @@ use crate::dense;
 use crate::expression::{self, Lanes};
 use crate::gemm::{self, Matrix};
 use crate::Result;
+use crate::{AttentionShape, DenseBackend, DenseShape, DenseWork};
 
 /// X positions per tile, and J positions per tile.
 const XT: usize = 64;
@@ -116,7 +117,8 @@ pub struct Piped {
     /// Pairs of an X tile and a J tile that were computed.
     pub tiles_visited: usize,
     /// Every pair of an X tile and a J tile in the same batch: every pair,
-    /// without batch keys.
+    /// without batch keys. Both counts are 0 where the host's
+    /// [`DenseBackend`] computed the pipeline.
     pub tiles: usize,
 }
 
@@ -151,6 +153,7 @@ pub(crate) fn pipeline(
     [q, k, v]: [&[RecordBatch]; 3],
     schema: SchemaRef,
     threads: usize,
+    options: &crate::Options,
 ) -> Result<Option<Piped>> {
     if !matches!(pipeline.weight(), Weight::Exp { .. } | Weight::Of(_)) {
         return Ok(None);
@@ -392,21 +395,38 @@ pub(crate) fn pipeline(
             end.div_ceil(JT) - start / JT
         })
         .sum();
-    let tiles = dense::par_tasks(x_tiles, threads, |t| {
-        tile(
-            pipeline,
-            t,
-            (nx, ne, nj, ny),
-            Values {
-                v,
-                finite: &finite,
-                largest: &largest,
-                smallest: &smallest,
-            },
-            &scores,
-            &allowed,
-        )
-    });
+    // The host's arithmetic, if it has some and takes this pipeline; else
+    // einfold's own, tile by tile.
+    let batches = nx.checked_div(local_nx).unwrap_or(0);
+    let shape = AttentionShape {
+        batches,
+        queries: local_nx,
+        features: ne,
+        keys: local_nj,
+        values: ny,
+    };
+    let hosted = match options.backend {
+        Some(backend) => host_attention(backend, pipeline, &scores, v, shape, &allowed, options)?,
+        None => None,
+    };
+    let tiles = match hosted {
+        Some(_) => Vec::new(),
+        None => dense::par_tasks(x_tiles, threads, |t| {
+            tile(
+                pipeline,
+                t,
+                (nx, ne, nj, ny),
+                Values {
+                    v,
+                    finite: &finite,
+                    largest: &largest,
+                    smallest: &smallest,
+                },
+                &scores,
+                &allowed,
+            )
+        }),
+    };
     if tiles.iter().any(|t| t.overflowed) {
         return Ok(None);
     }
@@ -451,15 +471,152 @@ pub(crate) fn pipeline(
     }
     let mut out = Vec::with_capacity(total);
     for &x in &rows {
-        let state = &tiles[x / XT];
-        out.extend_from_slice(&state.out[(x % XT) * ny..(x % XT + 1) * ny]);
+        match &hosted {
+            Some(result) => out.extend_from_slice(&result[x * ny..(x + 1) * ny]),
+            None => {
+                let state = &tiles[x / XT];
+                out.extend_from_slice(&state.out[(x % XT) * ny..(x % XT + 1) * ny]);
+            }
+        }
     }
     columns.push(Arc::new(Float64Array::from(out)));
     Ok(Some(Piped {
         batches: vec![RecordBatch::try_new(schema, columns)?],
         tiles_visited,
-        tiles: tile_pairs,
+        // The host's arithmetic computed none of einfold's tiles.
+        tiles: if hosted.is_some() { 0 } else { tile_pairs },
     }))
+}
+
+/// The pipeline's result, `[w][x][y]`, from the host's `backend`, or `None`
+/// when the backend declines or doesn't take this pipeline: it takes
+/// attention whose scores are a product of the two operands, whose weights
+/// are a softmax shifted by each kept group's maximum, normalized, over
+/// non-empty, finite matrices. Their SQL meaning is then the backend's
+/// [`DenseWork::Attention`], since each operand has one row
+/// per key and every value is finite, so that no overflow or NaN is the
+/// SQL's to decide.
+fn host_attention(
+    backend: &dyn DenseBackend,
+    pipeline: &Pipeline,
+    scores: &Scores,
+    v: &[f64],
+    shape: AttentionShape,
+    allowed: &impl Fn(usize) -> (usize, usize),
+    options: &crate::Options,
+) -> Result<Option<Vec<f64>>> {
+    let AttentionShape {
+        batches,
+        queries,
+        features,
+        keys,
+        values,
+    } = shape;
+    let (Scores::Product { q, kt }, Weight::Exp { scale, shift }) = (scores, pipeline.weight())
+    else {
+        return Ok(None);
+    };
+    let sizes = [batches, queries, features, keys, values];
+    // Whether the backend may take it is asked first, before the operands
+    // are scanned, copied or reserved for.
+    if *shift != Shift::KeptMaximum
+        || pipeline.normalizer() == Normalizer::None
+        || sizes.contains(&0)
+        || !backend.may_run(DenseShape::Attention(shape))
+        || !q.iter().chain(kt.iter()).chain(v).all(|x| x.is_finite())
+    {
+        return Ok(None);
+    }
+    // A shifted softmax's weights are at most 1, so `keys` times the largest
+    // value bounds every sum of `w · v`. Below half the largest double,
+    // leaving room for rounding, no sum overflows, in either SQL's order,
+    // `SUM(w * v) / SUM(w)` or `SUM(w / z * v)`, or a backend's.
+    let largest = v.iter().fold(0.0, |m: f64, x| m.max(x.abs()));
+    if !(largest * keys as f64 * 2.0).is_finite() {
+        return Ok(None);
+    }
+    // Underflow is checked too: SQL's `w / z · v` is smaller than a
+    // backend's `w · v`, so it can round to 0 where the backend's doesn't,
+    // and the answers then differ by more than rounding. Weights `[5e-324,
+    // 2]` over values `[1e300, 1e-300]` average to `1e-300` in SQL, and to
+    // `2.5e-24` when multiplied first. The scores aren't computed yet, so
+    // they are bounded from the operands: `|q · k| ≤ |q| |k|`, so every
+    // score is within `bound` of 0, and every weight `exp(s - max s)` at
+    // least `exp(-2 · bound)`, with 1 to spare for rounding. Each norm is
+    // scaled by its largest element, so that squaring a tiny one can't
+    // round it to 0. With at most
+    // `keys` weights of at most 1, the normalizer is at most `keys`. Work
+    // whose lightest quotient, or its product with the smallest nonzero
+    // value, could be below the smallest normal double isn't offered.
+    let nx = batches * queries;
+    let nj = batches * keys;
+    let q_norm = (0..nx)
+        .map(|x| norm(q[x * features..(x + 1) * features].iter().copied()))
+        .fold(0.0, f64::max);
+    // Each key's features are `features` apart: read in place, so that
+    // nothing is allocated before the budget is asked.
+    let k_norm = (0..nj)
+        .map(|j| norm((0..features).map(|e| kt[e * nj + j])))
+        .fold(0.0, f64::max);
+    let bound = scale.apply(q_norm * k_norm).abs();
+    let smallest = (v.iter().map(|x| x.abs()))
+        .filter(|&x| x != 0.0)
+        .fold(f64::INFINITY, f64::min);
+    let quotient = (-2.0 * bound - 1.0).exp() / keys as f64;
+    let normal = 2.0 * f64::MIN_POSITIVE;
+    if !(quotient >= normal && (smallest == f64::INFINITY || quotient * smallest >= normal)) {
+        return Ok(None);
+    }
+    // The keys, transposed and batch first: einfold places them `[e][w][j]`.
+    // The keys transposed, and what a backend may copy, as the Python bridge
+    // does: its operands and its result, beside the result einfold keeps.
+    // Each query's range of keys too, einfold's and the backend's copy. If
+    // the budget can't hold them, einfold computes the tiles itself, and if
+    // the backend declines, they are given back.
+    let output = batches * queries * values;
+    let copied = kt.len() + q.len() + kt.len() + v.len() + 2 * output;
+    let ranges = 2 * queries * std::mem::size_of::<(usize, usize)>();
+    let reserved = copied * std::mem::size_of::<f64>() + ranges;
+    if !options.try_reserve(reserved) {
+        return Ok(None);
+    }
+    let mut batched = Vec::with_capacity(kt.len());
+    for w in 0..batches {
+        for e in 0..features {
+            batched.extend_from_slice(&kt[e * nj + w * keys..e * nj + (w + 1) * keys]);
+        }
+    }
+    // Each query's keys, the same in every batch: the first batch's.
+    let ranges: Vec<(usize, usize)> = (0..queries).map(allowed).collect();
+    let result = backend.run(DenseWork::Attention {
+        q,
+        kt: &batched,
+        v,
+        shape,
+        scale: *scale,
+        allowed: &ranges,
+    });
+    if !matches!(result, Ok(Some(_))) {
+        options.release(reserved);
+    }
+    match result? {
+        Some(r) if r.len() != batches * queries * values => crate::bad(format!(
+            "the dense backend gave attention {} values, not {}",
+            r.len(),
+            batches * queries * values
+        )),
+        other => Ok(other),
+    }
+}
+
+/// The Euclidean norm of `x`, scaled by its largest magnitude, `m · sqrt(Σ
+/// (x / m)²)`, so that no square underflows or overflows.
+fn norm(x: impl Iterator<Item = f64> + Clone) -> f64 {
+    let largest = x.clone().fold(0.0, |m: f64, x| m.max(x.abs()));
+    if largest == 0.0 {
+        return 0.0;
+    }
+    largest * x.map(|x| (x / largest).powi(2)).sum::<f64>().sqrt()
 }
 
 /// `p`'s rows as a dense `rows × columns` matrix of its column, or `None`

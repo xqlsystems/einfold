@@ -56,6 +56,12 @@ pub enum DomainRows {
 pub trait Budget: Sync + fmt::Debug {
     /// Whether `bytes` more may be allocated; if so, they are counted.
     fn grow(&self, bytes: usize) -> bool;
+
+    /// Gives back `bytes` of what [`grow`](Self::grow) counted, once they
+    /// are freed. By default, nothing is given back until the kernel ends.
+    fn shrink(&self, bytes: usize) {
+        let _ = bytes;
+    }
 }
 
 /// How to run a fold. The default is one thread, a host that compares float
@@ -71,10 +77,27 @@ pub struct Options<'a> {
     /// The memory the kernel may take beyond its inputs, or `None` for no
     /// limit.
     pub budget: Option<&'a dyn Budget>,
+    /// The host's arithmetic for dense matrix products and attention, which
+    /// may decline, or `None` for einfold's own. Experimental (see
+    /// [`DenseBackend`](crate::DenseBackend)).
+    pub backend: Option<&'a dyn crate::DenseBackend>,
 }
 
 impl Options<'_> {
     /// Asks the budget for `bytes` to hold `what`, failing if it says no.
+    /// Asks the budget for `bytes`, saying whether it gave them.
+    pub(crate) fn try_reserve(&self, bytes: usize) -> bool {
+        self.budget.is_none_or(|budget| budget.grow(bytes))
+    }
+
+    /// Gives back `bytes` that [`try_reserve`](Self::try_reserve) or
+    /// [`reserve`](Self::reserve) took, once they are freed.
+    pub(crate) fn release(&self, bytes: usize) {
+        if let Some(budget) = self.budget {
+            budget.shrink(bytes);
+        }
+    }
+
     pub(crate) fn reserve(&self, bytes: usize, what: &str) -> crate::Result<()> {
         match self.budget {
             Some(budget) if !budget.grow(bytes) => Err(ArrowError::MemoryError(format!(
@@ -92,6 +115,7 @@ impl Default for Options<'_> {
             threads: 1,
             domain_rows: DomainRows::Any,
             budget: None,
+            backend: None,
         }
     }
 }

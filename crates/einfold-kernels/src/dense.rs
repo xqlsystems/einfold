@@ -63,7 +63,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use einfold_ir::{ColumnIndex, DimensionId, Domain, Fold, Operand};
 
 use crate::options::{DomainRows, Options};
-use crate::Result;
+use crate::{DenseBackend, DenseShape, DenseWork, ProductShape, Result};
 
 /// Output rows per block, when the output has at least [`FEW_CELLS`] cells.
 const XB: usize = 256;
@@ -433,14 +433,38 @@ pub(crate) fn fold(
         _ => Vec::new(),
     };
 
-    let out = accumulate(
-        &a_matrix,
-        &held,
-        &b_matrix,
-        (nx, nz, ny),
-        per_batch,
-        threads,
-    );
+    // The product, by the host's arithmetic if it has some and takes it.
+    // Its terms are the matrices' every cell, an absent or NULL one 0, where
+    // einfold's own adds only the cells with values: the same sums, as every
+    // factor is finite, and within rounding of each other in any order, as
+    // no partial sum can overflow. Which groups exist, and which are NULL,
+    // is decided below either way.
+    let shape = ProductShape {
+        batches: nw,
+        rows: per_batch,
+        inner: nz,
+        columns: ny,
+    };
+    let hosted = match options.backend {
+        Some(backend)
+            if backend.may_run(DenseShape::Product(shape))
+                && sums_stay_finite(&a_matrix, &b_matrix, nz) =>
+        {
+            host_product(backend, &a_matrix, &b_matrix, shape, options)?
+        }
+        _ => None,
+    };
+    let out = match hosted {
+        Some(out) => out,
+        None => accumulate(
+            &a_matrix,
+            &held,
+            &b_matrix,
+            (nx, nz, ny),
+            per_batch,
+            threads,
+        ),
+    };
     // A dimension's key at an output cell (x, y): its place in x's or y's
     // position, first dimension slowest. Keys are positions.
     let key_at = |d: usize, x: usize, y: usize| -> usize {
@@ -623,6 +647,56 @@ fn domain_batch(
         .collect();
     columns.push(Arc::new(values));
     RecordBatch::try_new(Arc::clone(schema), columns)
+}
+
+/// Whether every factor of `a` and `b` is finite, and no partial sum of
+/// `inner` products of them can overflow, in any order: `2 · inner ·
+/// max|a| · max|b|` is finite, with a factor of 2 for rounding. A backend
+/// adds in its own order, so where a sum could overflow, its answer could
+/// be finite where SQL's is infinite, or the reverse: `[1e308, 1e308,
+/// -1e308]` summed left to right is infinite, and 1e308 in another order.
+fn sums_stay_finite(a: &[f64], b: &[f64], inner: usize) -> bool {
+    let largest = |x: &[f64]| {
+        x.iter()
+            .try_fold(0.0, |m: f64, x| x.is_finite().then(|| m.max(x.abs())))
+    };
+    match (largest(a), largest(b)) {
+        (Some(a), Some(b)) => (2.0 * inner as f64 * a * b).is_finite(),
+        _ => false,
+    }
+}
+
+/// `a · b` from the host's `backend`, `[w][x][y]`, or `None` when it
+/// declines, a dimension is empty, or the budget can't hold its copies, so
+/// that einfold computes it itself.
+fn host_product(
+    backend: &dyn DenseBackend,
+    a: &[f64],
+    b: &[f64],
+    shape: ProductShape,
+    options: &Options,
+) -> Result<Option<Vec<f64>>> {
+    let cells = shape.batches * shape.rows * shape.columns;
+    if [shape.batches, shape.rows, shape.inner, shape.columns].contains(&0) {
+        return Ok(None);
+    }
+    // A backend may copy its operands and its result, as the Python bridge
+    // does, beside the result einfold keeps. Given back if it declines.
+    let copied = (a.len() + b.len() + 2 * cells) * std::mem::size_of::<f64>();
+    if !options.try_reserve(copied) {
+        return Ok(None);
+    }
+    let result = backend.run(DenseWork::Product { a, b, shape });
+    if !matches!(result, Ok(Some(_))) {
+        options.release(copied);
+    }
+    match result? {
+        Some(out) if out.len() != cells => crate::bad(format!(
+            "the dense backend gave a product {} values, not {cells}",
+            out.len()
+        )),
+        other => Ok(other),
+    }
 }
 
 /// `out[x][y] = Σ_z a[x, z]·b[w][z][y]` over the positions of `a` that hold

@@ -33,7 +33,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use einfold_ir::{ColumnIndex, Fold, Pipeline};
-use einfold_kernels::{Algorithm, Budget, DomainRows, Folded, Options, Relation};
+use einfold_kernels::{Algorithm, Budget, DenseBackend, DomainRows, Folded, Options, Relation};
 use futures::stream::BoxStream;
 use futures::{future, stream, StreamExt};
 
@@ -87,6 +87,7 @@ enum Work {
 #[derive(Debug)]
 pub struct EinFoldExec {
     work: Work,
+    backend: Option<Arc<dyn DenseBackend>>,
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     /// The host's plan for the same rows, run instead of the discrimination
     /// algorithm, or where memory runs short, and planned only then.
@@ -140,6 +141,7 @@ impl EinFoldExec {
         );
         EinFoldExec {
             work,
+            backend: None,
             inputs,
             fallback: None,
             execution_props: None,
@@ -212,10 +214,21 @@ impl EinFoldExec {
     fn copy(&self, inputs: Vec<Arc<dyn ExecutionPlan>>) -> EinFoldExec {
         let mut exec = EinFoldExec::computing(self.work.clone(), inputs, self.schema());
         exec.fallback = self.fallback.clone();
+        exec.backend = self.backend.clone();
         exec.execution_props = self.execution_props.clone();
         exec.host_on_decline = self.host_on_decline;
         exec.domain_rows = self.domain_rows;
         exec.null_when = self.null_when;
+        exec
+    }
+
+    /// This operator, computing its dense matrix products and attention with
+    /// the session's `backend` (see [`DenseBackend`]), as are the einfold
+    /// operators of the plan it falls back on.
+    #[must_use]
+    pub fn with_backend(&self, backend: Arc<dyn DenseBackend>) -> Self {
+        let mut exec = self.copy(self.inputs.clone());
+        exec.backend = Some(backend);
         exec
     }
 
@@ -284,27 +297,48 @@ async fn on_a_runtime<T: Send + 'static>(
         .map_err(|e| DataFusionError::External(Box::new(e)))?
 }
 
+/// What the host's plan is planned with, beyond its task: the planning
+/// session's properties, and the session's arithmetic for dense work, which
+/// each einfold operator within the plan is given too.
+#[derive(Clone, Default)]
+struct HostPlanning {
+    props: Option<Arc<ExecutionProps>>,
+    backend: Option<Arc<dyn DenseBackend>>,
+}
+
 /// The host's plan `plan`, planned for the task `ctx`: with its
-/// configuration and runtime, the planning session's `props` if given, and
-/// DataFusion's default physical optimizer rules. A fold node within it is
-/// planned as einfold's operator, and only as that: as when einfold planned
-/// the query, other extensions' nodes aren't planned.
+/// configuration and runtime, the planning session's properties if given,
+/// and DataFusion's default physical optimizer rules. A fold node within it
+/// is planned as einfold's operator, and only as that: as when einfold
+/// planned the query, other extensions' nodes aren't planned.
 async fn plan_host(
     plan: &LogicalPlan,
     ctx: &TaskContext,
-    props: Option<&ExecutionProps>,
+    planning: &HostPlanning,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
     let mut builder = SessionStateBuilder::new()
         .with_config(ctx.session_config().clone())
         .with_runtime_env(ctx.runtime_env())
         .with_default_features();
-    if let Some(props) = props {
-        builder = builder.with_execution_props(props.clone());
+    if let Some(props) = &planning.props {
+        builder = builder.with_execution_props(props.as_ref().clone());
     }
     let state = builder.build();
-    DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(EinFoldPlanner)])
+    let physical = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(EinFoldPlanner)])
         .create_physical_plan(plan, &state)
-        .await
+        .await?;
+    let Some(backend) = &planning.backend else {
+        return Ok(physical);
+    };
+    let given = physical.transform_up(|node| {
+        let Some(exec) = node.downcast_ref::<EinFoldExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(exec.with_backend(Arc::clone(backend)));
+        Ok(Transformed::yes(exec))
+    })?;
+    Ok(given.data)
 }
 
 /// Every batch of every partition of the host's plan `plan`, planned for the
@@ -313,10 +347,10 @@ async fn plan_host(
 async fn run_host_plan(
     plan: Arc<LogicalPlan>,
     ctx: Arc<TaskContext>,
-    props: Option<Arc<ExecutionProps>>,
+    planning: HostPlanning,
 ) -> Result<Vec<Vec<RecordBatch>>> {
     on_a_runtime(async move {
-        let physical = plan_host(&plan, &ctx, props.as_deref()).await?;
+        let physical = plan_host(&plan, &ctx, &planning).await?;
         physical_plan::collect_partitioned(physical, ctx).await
     })
     .await
@@ -330,7 +364,7 @@ async fn run_host_plan(
 async fn host_stream(
     plan: Arc<LogicalPlan>,
     ctx: Arc<TaskContext>,
-    props: Option<Arc<ExecutionProps>>,
+    planning: HostPlanning,
     out: SchemaRef,
     output_rows: metrics::Count,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
@@ -341,10 +375,10 @@ async fn host_stream(
         Ok(b)
     };
     if tokio::runtime::Handle::try_current().is_err() {
-        let batches = run_host_plan(plan, ctx, props).await?.concat();
+        let batches = run_host_plan(plan, ctx, planning).await?.concat();
         return Ok(stream::iter(batches.into_iter().map(Ok).map(rename)).boxed());
     }
-    let physical = plan_host(&plan, &ctx, props.as_deref()).await?;
+    let physical = plan_host(&plan, &ctx, &planning).await?;
     let one: Arc<dyn ExecutionPlan> = match physical.properties().partitioning.partition_count() {
         1 => physical,
         _ => Arc::new(CoalescePartitionsExec::new(physical)),
@@ -371,6 +405,10 @@ struct Pool<'a>(&'a MemoryReservation);
 impl Budget for Pool<'_> {
     fn grow(&self, bytes: usize) -> bool {
         self.0.try_grow(bytes).is_ok()
+    }
+
+    fn shrink(&self, bytes: usize) {
+        self.0.shrink(bytes);
     }
 }
 
@@ -558,12 +596,14 @@ impl ExecutionPlan for EinFoldExec {
         if chain && !self.host_on_decline {
             return internal_err!("EinFoldExec computes a chain only with the host's plan");
         }
+        let backend = self.backend.clone();
         let batch_size = context.session_config().batch_size().max(1);
         let options = Options {
             host: HOST,
             threads: context.session_config().target_partitions(),
             domain_rows: self.domain_rows,
             budget: None,
+            backend: None,
         };
         if self.domain_rows == DomainRows::UniqueKeys && self.fallback.is_none() {
             return internal_err!("EinFoldExec requires a unique domain, but has no fallback");
@@ -577,7 +617,10 @@ impl ExecutionPlan for EinFoldExec {
         let host_plans = builder().global_counter("host_plans");
         let memory_fallbacks = builder().global_counter("memory_fallbacks");
         let fallback = self.fallback.clone();
-        let execution_props = self.execution_props.clone();
+        let planning = HostPlanning {
+            props: self.execution_props.clone(),
+            backend: self.backend.clone(),
+        };
         let host_on_decline = self.host_on_decline;
         let null_when = self.null_when;
         let compute = builder().elapsed_compute(0);
@@ -599,8 +642,8 @@ impl ExecutionPlan for EinFoldExec {
                 reservation.free();
                 memory_fallbacks.add(1);
                 host_plans.add(1);
-                let (rows, props) = (output_rows.clone(), execution_props.clone());
-                host_stream(plan, Arc::clone(&context), props, Arc::clone(&out), rows).await
+                let (rows, planning) = (output_rows.clone(), planning.clone());
+                host_stream(plan, Arc::clone(&context), planning, Arc::clone(&out), rows).await
             };
             // Every input is read whole, and stays in the batches it arrived
             // in: the kernels read them batch by batch.
@@ -632,6 +675,7 @@ impl ExecutionPlan for EinFoldExec {
                 let pool = Pool(&held);
                 let options = Options {
                     budget: Some(&pool),
+                    backend: backend.as_deref(),
                     ..options
                 };
                 let (a, b) = (
@@ -735,9 +779,15 @@ impl ExecutionPlan for EinFoldExec {
                 (None, Some(plan)) => {
                     host_plans.add(1);
                     let rows = output_rows.clone();
-                    let props = execution_props.clone();
-                    return host_stream(plan, Arc::clone(&context), props, Arc::clone(&out), rows)
-                        .await;
+                    let planning = planning.clone();
+                    return host_stream(
+                        plan,
+                        Arc::clone(&context),
+                        planning,
+                        Arc::clone(&out),
+                        rows,
+                    )
+                    .await;
                 }
                 (None, None) => return internal_err!("EinFoldExec ran no algorithm"),
             };

@@ -27,7 +27,8 @@
 //!
 //! 1. **Runs when it can, and declines when it can't.** With every table
 //!    complete, a producer that reads both of its operands, and no special
-//!    values, the algorithm runs; with special values it may decline. When a table misses a row, repeats one,
+//!    values, the algorithm runs, unless a sum could overflow (as an unshifted
+//!    `exp(s)` of a large score can); with special values it may decline. When a table misses a row, repeats one,
 //!    or holds a NULL factor, it either returns `None`, so that the caller
 //!    runs the host's plan, or (when the gap only shrinks a dimension's
 //!    range) gives SQL's result, as below.
@@ -127,6 +128,12 @@ struct Case {
     sql: String,
     /// Whether every table has one non-NULL row per key tuple.
     complete: bool,
+    /// The number of keys `j`, which bounds the terms of each sum.
+    keys: usize,
+    /// SQL for the largest `|w|`, which with `v_scale` and `keys` bounds
+    /// every sum: where that bound overflows, the algorithm may decline,
+    /// since a sum in another order could.
+    heaviest: String,
     /// The largest `|v.x|`, the scale of every average.
     v_scale: f64,
     /// For a sum that nothing normalizes, SQL for each group's `Σ |w · v.x|`,
@@ -481,6 +488,7 @@ fn case(rng: &mut Rng) -> Case {
              FROM weights JOIN v ON weights.j = v.t{v_b} GROUP BY {weights_b}weights.i{c_group}"
         )
     });
+    let heaviest = format!("{scores} SELECT MAX(abs(w)) FROM weights");
     Case {
         q,
         k,
@@ -490,6 +498,8 @@ fn case(rng: &mut Rng) -> Case {
         // Special values, or the extreme scores above, may make it decline
         // too: sums that overflow, or expression weights that aren't finite.
         complete: complete && reads_both && !specials && extremes > 1,
+        keys: nk,
+        heaviest,
         v_scale,
         magnitudes,
     }
@@ -572,8 +582,26 @@ async fn pipeline_matches_sql() {
         let case = case(&mut rng);
         let fail = |what: String| panic!("seed {seed}: {what}\nSQL: {}", case.sql);
         let ours = run(&case, &mut rng);
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+        for (name, t) in [("q", &case.q), ("k", &case.k), ("v", &case.v)] {
+            let mem = MemTable::try_new(Arc::clone(&t.schema), t.partitions(&mut rng)).unwrap();
+            ctx.register_table(name, Arc::new(mem)).unwrap();
+        }
         if case.complete && ours.is_none() {
-            fail("declined complete inputs".into());
+            // Ordinary values can still make sums that overflow, or nearly:
+            // an unshifted `exp(s)` of a large score, say.
+            let heaviest = rows(
+                &ctx.sql(&case.heaviest)
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap(),
+            );
+            let heaviest = heaviest[0].1.unwrap_or(0.0);
+            if (2.0 * case.keys as f64 * heaviest * case.v_scale).is_finite() {
+                fail("declined complete inputs".into());
+            }
         }
         let Some(ours) = ours else { continue };
         let again = run(&case, &mut rng).unwrap();
@@ -587,11 +615,6 @@ async fn pipeline_matches_sql() {
             fail("two arrival orders and thread counts gave different bits".into());
         }
 
-        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
-        for (name, t) in [("q", &case.q), ("k", &case.k), ("v", &case.v)] {
-            let mem = MemTable::try_new(Arc::clone(&t.schema), t.partitions(&mut rng)).unwrap();
-            ctx.register_table(name, Arc::new(mem)).unwrap();
-        }
         let theirs = rows(&ctx.sql(&case.sql).await.unwrap().collect().await.unwrap());
         if ours.len() != theirs.len() {
             fail(format!("{} rows, SQL has {}", ours.len(), theirs.len()));

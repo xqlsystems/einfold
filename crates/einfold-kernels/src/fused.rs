@@ -529,27 +529,61 @@ fn host_attention(
     }
     // A shifted softmax's weights are at most 1, so `keys` times the largest
     // value bounds every sum of `w · v`. Below half the largest double,
-    // leaving room for rounding, no sum
-    // overflows, in either SQL's order, `SUM(w * v) / SUM(w)` or `SUM(w / z
-    // * v)`, or a backend's. With the normalizer at least 1, none of SQL's
-    // terms is larger than a backend's, so none underflows where a
-    // backend's doesn't.
+    // leaving room for rounding, no sum overflows, in either SQL's order,
+    // `SUM(w * v) / SUM(w)` or `SUM(w / z * v)`, or a backend's.
     let largest = v.iter().fold(0.0, |m: f64, x| m.max(x.abs()));
     if !(largest * keys as f64 * 2.0).is_finite() {
         return Ok(None);
     }
-    // The keys, transposed and batch first: einfold places them `[e][w][j]`.
+    // Underflow is checked too: SQL's `w / z · v` is smaller than a
+    // backend's `w · v`, so it can round to 0 where the backend's doesn't,
+    // and the answers then differ by more than rounding. Weights `[5e-324,
+    // 2]` over values `[1e300, 1e-300]` average to `1e-300` in SQL, and to
+    // `2.5e-24` when multiplied first. The scores aren't computed yet, so
+    // they are bounded from the operands: `|q · k| ≤ |q| |k|`, so every
+    // score is within `bound` of 0, and every weight `exp(s - max s)` at
+    // least `exp(-2 · bound)`, with 1 to spare for rounding. With at most
+    // `keys` weights of at most 1, the normalizer is at most `keys`. Work
+    // whose lightest quotient, or its product with the smallest nonzero
+    // value, could be below the smallest normal double isn't offered.
+    let norm = |squares: &mut dyn Iterator<Item = f64>| squares.fold(0.0, f64::max).sqrt();
+    let nx = batches * queries;
     let nj = batches * keys;
+    let q_norm = norm(&mut (0..nx).map(|x| {
+        q[x * features..(x + 1) * features]
+            .iter()
+            .map(|q| q * q)
+            .sum()
+    }));
+    let mut k_squares = vec![0.0; nj];
+    for e in 0..features {
+        for (square, k) in k_squares.iter_mut().zip(&kt[e * nj..(e + 1) * nj]) {
+            *square += k * k;
+        }
+    }
+    let k_norm = norm(&mut k_squares.into_iter());
+    let bound = scale.apply(q_norm * k_norm).abs();
+    let smallest = (v.iter().map(|x| x.abs()))
+        .filter(|&x| x != 0.0)
+        .fold(f64::INFINITY, f64::min);
+    let quotient = (-2.0 * bound - 1.0).exp() / keys as f64;
+    let normal = 2.0 * f64::MIN_POSITIVE;
+    if !(quotient >= normal && (smallest == f64::INFINITY || quotient * smallest >= normal)) {
+        return Ok(None);
+    }
+    // The keys, transposed and batch first: einfold places them `[e][w][j]`.
     // The keys transposed, and what a backend may copy, as the Python bridge
     // does: its operands and its result, beside the result einfold keeps.
-    // Each query's range of keys too, einfold's and the backend's copy.
+    // Each query's range of keys too, einfold's and the backend's copy. If
+    // the budget can't hold them, einfold computes the tiles itself, and if
+    // the backend declines, they are given back.
     let output = batches * queries * values;
     let copied = kt.len() + q.len() + kt.len() + v.len() + 2 * output;
     let ranges = 2 * queries * std::mem::size_of::<(usize, usize)>();
-    options.reserve(
-        copied * std::mem::size_of::<f64>() + ranges,
-        "attention for the host",
-    )?;
+    let reserved = copied * std::mem::size_of::<f64>() + ranges;
+    if !options.try_reserve(reserved) {
+        return Ok(None);
+    }
     let mut batched = Vec::with_capacity(kt.len());
     for w in 0..batches {
         for e in 0..features {
@@ -565,8 +599,11 @@ fn host_attention(
         shape,
         scale: *scale,
         allowed: &ranges,
-    })?;
-    match result {
+    });
+    if !matches!(result, Ok(Some(_))) {
+        options.release(reserved);
+    }
+    match result? {
         Some(r) if r.len() != batches * queries * values => crate::bad(format!(
             "the dense backend gave attention {} values, not {}",
             r.len(),

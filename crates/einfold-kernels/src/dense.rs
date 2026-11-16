@@ -649,7 +649,8 @@ fn domain_batch(
 }
 
 /// `a · b` from the host's `backend`, `[w][x][y]`, or `None` when it
-/// declines or a dimension is empty.
+/// declines, a dimension is empty, or the budget can't hold its copies, so
+/// that einfold computes it itself.
 fn host_product(
     backend: &dyn DenseBackend,
     a: &[f64],
@@ -662,13 +663,16 @@ fn host_product(
         return Ok(None);
     }
     // A backend may copy its operands and its result, as the Python bridge
-    // does, beside the result einfold keeps.
-    let copied = a.len() + b.len() + 2 * cells;
-    options.reserve(
-        copied * std::mem::size_of::<f64>(),
-        "a product for the host",
-    )?;
-    match backend.run(DenseWork::Product { a, b, shape })? {
+    // does, beside the result einfold keeps. Given back if it declines.
+    let copied = (a.len() + b.len() + 2 * cells) * std::mem::size_of::<f64>();
+    if !options.try_reserve(copied) {
+        return Ok(None);
+    }
+    let result = backend.run(DenseWork::Product { a, b, shape });
+    if !matches!(result, Ok(Some(_))) {
+        options.release(copied);
+    }
+    match result? {
         Some(out) if out.len() != cells => crate::bad(format!(
             "the dense backend gave a product {} values, not {cells}",
             out.len()

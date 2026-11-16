@@ -406,6 +406,10 @@ impl Budget for Pool<'_> {
     fn grow(&self, bytes: usize) -> bool {
         self.0.try_grow(bytes).is_ok()
     }
+
+    fn shrink(&self, bytes: usize) {
+        self.0.shrink(bytes);
+    }
 }
 
 /// `batches` as this operator's output stream: in batches of `batch_size`

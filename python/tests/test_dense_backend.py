@@ -167,6 +167,25 @@ def test_attention_that_could_overflow_isnt_offered():
     assert not any(kind == "attention" for kind, _ in backend.calls)
 
 
+def test_attention_that_could_underflow_isnt_offered():
+    """Scores of `[-744.4, 0, 0]`, so weights of about `[5e-324, 1, 1]`, over
+    values `[1e300, 1e-300, 1e-300]`: SQL's `w / z` rounds the first to 0,
+    where a backend that multiplies before it divides keeps it, and answers
+    `5e-324 · 1e300 / 2`, far from SQL's `1e-300`. So einfold keeps the
+    work, and the query answers as SQL does."""
+    backend = NumpyBackend()
+    plain, ours = _sessions(backend)
+    _register((plain, ours), "q", ("b", "h", "t", "d"), (1, 1, 1, 1), np.ones(1))
+    _register((plain, ours), "k", ("b", "h", "t", "d"), (1, 1, 3, 1), np.array([-744.4, 0.0, 0.0]))
+    _register((plain, ours), "v", ("b", "h", "t", "c"), (1, 1, 3, 1),
+              np.array([1e300, 1e-300, 1e-300]))
+    sql = _attention("", "")
+    want = plain.sql(sql).to_arrow_table()
+    assert want.column("x").to_pylist() == [1e-300]
+    _assert_same(want, ours.sql(sql).to_arrow_table())
+    assert not any(kind == "attention" for kind, _ in backend.calls)
+
+
 @pytest.mark.parametrize("result, error", [
     (lambda shape: (_ for _ in ()).throw(RuntimeError("the GPU is busy")), "the GPU is busy"),
     (lambda shape: pa.array([1.0, 2.0]), "gave a product 2 values"),

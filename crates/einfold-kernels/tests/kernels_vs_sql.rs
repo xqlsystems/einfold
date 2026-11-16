@@ -32,7 +32,10 @@
 //!    for bit; given one byte fewer, they stop with a memory error. So a
 //!    kernel asks before it allocates, and asks the same for the same rows.
 //!    With a dense backend that takes no shape, they ask for the same bytes
-//!    and give the same rows, and never offer the backend work.
+//!    and give the same rows, and never offer the backend work. With one
+//!    that takes every shape but declines the work, they give back what
+//!    they asked for it, and given only the bytes they asked for with none,
+//!    still give the same rows.
 //!
 //! Half the cases are drawn from a *dense family*, shaped so that the dense
 //! algorithm may apply: non-negative integer keys with no NULLs in the
@@ -673,17 +676,23 @@ impl Budget for Limit {
         }
         ok
     }
+
+    fn shrink(&self, bytes: usize) {
+        self.given.fetch_sub(bytes, Ordering::Relaxed);
+    }
 }
 
-/// A dense backend that takes no shape, and counts the work it is offered.
+/// A dense backend that declines all work, and counts the work it is
+/// offered. With `takes`, it says it takes every shape; without, none.
 #[derive(Debug, Default)]
 struct Refusing {
+    takes: bool,
     offered: AtomicUsize,
 }
 
 impl DenseBackend for Refusing {
     fn may_run(&self, _: DenseShape) -> bool {
-        false
+        self.takes
     }
 
     fn run(&self, _: DenseWork<'_>) -> einfold_kernels::Result<Option<Vec<f64>>> {
@@ -732,6 +741,22 @@ fn check_budget(case: &Case, rng: &mut Rng, fail: impl Fn(String)) {
         fail(format!(
             "offered a backend that takes nothing {offered} times"
         ));
+    }
+    let declining = Refusing {
+        takes: true,
+        ..Refusing::default()
+    };
+    match within(usize::MAX, Some(&declining)) {
+        (Ok(f), given) if given == asked && same_bits(&f.batches, &free.batches) => {}
+        (other, given) => fail(format!(
+            "with a backend that declines, kept {given} bytes, not {asked}: {other:?}"
+        )),
+    }
+    match within(asked, Some(&declining)) {
+        (Ok(f), _) if f.algorithm == free.algorithm && same_bits(&f.batches, &free.batches) => {}
+        (other, _) => fail(format!(
+            "with a backend that declines, given the {asked} bytes it asked for: {other:?}"
+        )),
     }
     let (exact, _) = run(asked);
     match exact {

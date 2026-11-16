@@ -27,8 +27,9 @@
 //!
 //! 1. **Runs when it can, and declines when it can't.** With every table
 //!    complete, a producer that reads both of its operands, and no special
-//!    values, the algorithm runs, unless a sum could overflow (as an unshifted
-//!    `exp(s)` of a large score can); with special values it may decline. When a table misses a row, repeats one,
+//!    values, the algorithm runs, unless a sum could overflow or a term
+//!    underflow (as an unshifted `exp(s)` of a large or very negative score
+//!    can); with special values it may decline. When a table misses a row, repeats one,
 //!    or holds a NULL factor, it either returns `None`, so that the caller
 //!    runs the host's plan, or (when the gap only shrinks a dimension's
 //!    range) gives SQL's result, as below.
@@ -130,12 +131,17 @@ struct Case {
     complete: bool,
     /// The number of keys `j`, which bounds the terms of each sum.
     keys: usize,
-    /// SQL for the largest `|w|`, which with `v_scale` and `keys` bounds
-    /// every sum: where that bound overflows, the algorithm may decline,
-    /// since a sum in another order could.
+    /// SQL for the largest `|w|`, and for the smallest nonzero one. With
+    /// `v_scale`, `v_smallest` and `keys` they bound every term and sum:
+    /// where a sum could overflow, or a term or a weight over its normalizer
+    /// fall below the smallest normal double, the algorithm may decline,
+    /// since SQL's order could round differently.
     heaviest: String,
+    lightest: String,
     /// The largest `|v.x|`, the scale of every average.
     v_scale: f64,
+    /// The smallest nonzero `|v.x|`.
+    v_smallest: f64,
     /// For a sum that nothing normalizes, SQL for each group's `Σ |w · v.x|`,
     /// the scale of its rounding.
     magnitudes: Option<String>,
@@ -279,6 +285,10 @@ fn case(rng: &mut Rng) -> Case {
         .filter_map(|r| r.1)
         .filter(|x| x.is_finite())
         .fold(0.0f64, |m, x| m.max(x.abs()));
+    let v_smallest = (v.rows.iter())
+        .filter_map(|r| r.1)
+        .filter(|&x| x != 0.0)
+        .fold(f64::INFINITY, |m, x| m.min(x.abs()));
 
     // Dimensions: 0 = i (q.t), 1 = e (d), 2 = j (k.t), then the batch's b,
     // then c (v.c); without d, 0 = i, 1 = j, then b and c.
@@ -489,6 +499,7 @@ fn case(rng: &mut Rng) -> Case {
         )
     });
     let heaviest = format!("{scores} SELECT MAX(abs(w)) FROM weights");
+    let lightest = format!("{scores} SELECT MIN(CASE WHEN w <> 0 THEN abs(w) END) FROM weights");
     Case {
         q,
         k,
@@ -500,7 +511,9 @@ fn case(rng: &mut Rng) -> Case {
         complete: complete && reads_both && !specials && extremes > 1,
         keys: nk,
         heaviest,
+        lightest,
         v_scale,
+        v_smallest,
         magnitudes,
     }
 }
@@ -588,18 +601,22 @@ async fn pipeline_matches_sql() {
             ctx.register_table(name, Arc::new(mem)).unwrap();
         }
         if case.complete && ours.is_none() {
-            // Ordinary values can still make sums that overflow, or nearly:
-            // an unshifted `exp(s)` of a large score, say.
-            let heaviest = rows(
-                &ctx.sql(&case.heaviest)
-                    .await
-                    .unwrap()
-                    .collect()
-                    .await
-                    .unwrap(),
-            );
-            let heaviest = heaviest[0].1.unwrap_or(0.0);
-            if (2.0 * case.keys as f64 * heaviest * case.v_scale).is_finite() {
+            // Ordinary values can still make terms near the ends of the
+            // double range: an unshifted `exp(s)` of a large score, or of a
+            // very negative one, say.
+            let weight = async |sql: &str| {
+                let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+                rows(&batches)[0].1
+            };
+            let heaviest = weight(&case.heaviest).await.unwrap_or(0.0);
+            let lightest = weight(&case.lightest).await.unwrap_or(f64::INFINITY);
+            let keys = case.keys as f64;
+            let overflows = !(2.0 * keys * heaviest * case.v_scale).is_finite();
+            // Weights here are positive wherever there's a normalizer, so
+            // `z` is at most `keys · heaviest`.
+            let quotient = lightest / f64::max(keys * heaviest, 1.0);
+            let underflows = quotient * case.v_smallest.min(1.0) < 2.0 * f64::MIN_POSITIVE;
+            if !overflows && !underflows {
                 fail("declined complete inputs".into());
             }
         }

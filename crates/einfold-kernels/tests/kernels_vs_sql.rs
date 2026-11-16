@@ -71,6 +71,8 @@ use einfold_kernels::{
 };
 use einfold_testkit::Rng;
 
+mod reference;
+
 #[derive(Clone, Copy, Debug)]
 enum KeyType {
     Int,
@@ -650,13 +652,21 @@ const HOST: Host = Host {
 /// The kernels' output, from the tables' rows in a random order and random
 /// batches, on a random number of threads, and which algorithm ran.
 fn run_fold(case: &Case, rng: &mut Rng) -> (Vec<RecordBatch>, Algorithm) {
+    run_fold_with(case, rng, None)
+}
+
+fn run_fold_with(
+    case: &Case,
+    rng: &mut Rng,
+    backend: Option<&dyn DenseBackend>,
+) -> (Vec<RecordBatch>, Algorithm) {
     let batches = |t: &Table, rng: &mut Rng| -> Vec<RecordBatch> {
         t.partitions(rng).into_iter().flatten().collect()
     };
     let (a, b) = (batches(&case.a, rng), batches(&case.b, rng));
     let domain = case.domain.as_ref().map(|t| batches(t, rng));
     let threads = 1 + rng.below(8);
-    let folded = fold_within(case, [&a, &b], domain.as_deref(), threads, None, None).unwrap();
+    let folded = fold_within(case, [&a, &b], domain.as_deref(), threads, None, backend).unwrap();
     (folded.batches, folded.algorithm)
 }
 
@@ -678,7 +688,8 @@ impl Budget for Limit {
     }
 
     fn shrink(&self, bytes: usize) {
-        self.given.fetch_sub(bytes, Ordering::Relaxed);
+        let before = self.given.fetch_sub(bytes, Ordering::Relaxed);
+        assert!(before >= bytes, "gave back {bytes} of {before} bytes");
     }
 }
 
@@ -756,6 +767,28 @@ fn check_budget(case: &Case, rng: &mut Rng, fail: impl Fn(String)) {
         (Ok(f), _) if f.algorithm == free.algorithm && same_bits(&f.batches, &free.batches) => {}
         (other, _) => fail(format!(
             "with a backend that declines, given the {asked} bytes it asked for: {other:?}"
+        )),
+    }
+    // A backend that takes everything, given only what einfold
+    // needs, falls back to einfold's own arithmetic, bit for bit; given
+    // plenty, it asks for at least as much.
+    let accepting = reference::Reference::default();
+    match within(asked, Some(&accepting)) {
+        (Ok(f), _) if f.algorithm == free.algorithm && same_bits(&f.batches, &free.batches) => {}
+        (other, given) => fail(format!(
+            "with an accepting backend, given the {asked} bytes it asked for ({given} kept): {other:?}"
+        )),
+    }
+    if accepting.ran.load(Ordering::Relaxed) > 0 {
+        fail(format!(
+            "an accepting backend ran within only the {asked} bytes einfold needs"
+        ));
+    }
+    let accepting = reference::Reference::default();
+    match within(usize::MAX, Some(&accepting)) {
+        (Ok(_), given) if given >= asked => {}
+        (other, given) => fail(format!(
+            "with an accepting backend, kept {given} bytes, fewer than {asked}: {other:?}"
         )),
     }
     let (exact, _) = run(asked);
@@ -906,6 +939,7 @@ async fn fold_matches_sql() {
     let (mut dense_family, mut dense_ran, mut batched_ran) = (0, 0, 0);
     let mut large_batched_ran = 0;
     let (mut unique_checked, mut unique_accepted) = (0, 0);
+    let mut hosted_cases = 0;
     for i in 0..cases {
         let seed = seed.wrapping_add(i);
         let mut rng = Rng::seeded(seed, 0);
@@ -964,6 +998,42 @@ async fn fold_matches_sql() {
         }
         let theirs = ctx.sql(&case.sql).await.unwrap().collect().await.unwrap();
         let mut theirs = oracle_rows(&theirs, keys);
+        // The same case with a reference backend that takes
+        // every product.
+        let reference = reference::Reference::default();
+        let (hosted, hosted_ran) = run_fold_with(&case, &mut rng, Some(&reference));
+        let broken = reference.broken();
+        if !broken.is_empty() {
+            fail(format!("broke the backend's contract: {broken:?}"));
+        }
+        if hosted_ran != ran {
+            fail(format!(
+                "ran {hosted_ran:?} with a backend, {ran:?} without"
+            ));
+        }
+        let offered = reference.ran.load(Ordering::Relaxed);
+        hosted_cases += usize::from(offered > 0);
+        let theirs_sorted = {
+            let mut t = theirs.clone();
+            t.sort_by_key(|((k, v), _)| (k.clone(), v.is_some()));
+            t
+        };
+        let mut hosted = rows(&hosted, keys);
+        hosted.sort_by_key(|(k, v)| (k.clone(), v.is_some()));
+        if hosted.len() != theirs_sorted.len() {
+            fail(format!(
+                "backend: {} rows, SQL has {}",
+                hosted.len(),
+                theirs_sorted.len()
+            ));
+        }
+        for (o, ((k, v), bound)) in hosted.iter().zip(&theirs_sorted) {
+            if o.0 != *k || !equivalent(o.1, *v, *bound) {
+                fail(format!(
+                    "backend ({offered} offered): row {o:?}, SQL's ({k}, {v:?}) within {bound:e}"
+                ));
+            }
+        }
         let mut ours = ours;
         if ours.len() != theirs.len() {
             fail(format!("{} rows, SQL has {}", ours.len(), theirs.len()));
@@ -981,6 +1051,7 @@ async fn fold_matches_sql() {
         "dense path: {dense_ran} of {cases} cases, {batched_ran} with a batch dimension \
          ({large_batched_ran} large); dense family: {dense_family}"
     );
+    eprintln!("offered a backend in {hosted_cases} cases");
     eprintln!("unique-domain check: accepted {unique_accepted} of {unique_checked}");
     // About a third of the dense family qualifies (the rest has duplicate
     // tuples, keys too large for BIGINT, or holes where existence matters);

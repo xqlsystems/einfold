@@ -52,7 +52,11 @@ use crate::stack;
 /// multiplications, or whose arrays take more than `dense_max_bytes`, isn't
 /// offered. The function's results are the session's answers: einfold
 /// doesn't check their precision, so one that computes in `float32` changes
-/// them by as much.
+/// them by as much. einfold offers only work whose sums can't overflow or
+/// underflow in `float64`'s range, which is far wider than `float32`'s
+/// (about `1.2e-38` to `3.4e38`): a `float32` backend can return `inf`,
+/// NaN or 0 where SQL's answer is finite, so it should return `None` for
+/// arrays whose magnitudes it can't hold.
 #[pyclass(name = "EinFold", module = "einfold._native", frozen)]
 #[derive(Default)]
 pub(crate) struct EinFold {

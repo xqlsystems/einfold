@@ -194,6 +194,18 @@ def test_attention_that_could_underflow_isnt_offered(q, k, scale):
     assert not any(kind == "attention" for kind, _ in backend.calls)
 
 
+def test_a_product_whose_sums_could_overflow_isnt_offered():
+    """Factors `[1e308, 1e308, -1e308]` and `[1, 1, 1]`: SQL's sum, left to
+    right, is infinite, and a backend that adds in another order could give
+    1e308. So einfold keeps the work, and the query answers as SQL does."""
+    backend = NumpyBackend()
+    plain, ours = _sessions(backend)
+    _register((plain, ours), "a", ("i", "k"), (1, 3), np.array([1e308, 1e308, -1e308]))
+    _register((plain, ours), "b", ("k", "j"), (3, 1), np.ones(3))
+    _assert_same(plain.sql(MATMUL).to_arrow_table(), ours.sql(MATMUL).to_arrow_table())
+    assert not any(kind == "matmul" for kind, _ in backend.calls)
+
+
 @pytest.mark.parametrize("result, error", [
     (lambda shape: (_ for _ in ()).throw(RuntimeError("the GPU is busy")), "the GPU is busy"),
     (lambda shape: pa.array([1.0, 2.0]), "gave a product 2 values"),

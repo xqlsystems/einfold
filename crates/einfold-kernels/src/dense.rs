@@ -436,8 +436,9 @@ pub(crate) fn fold(
     // The product, by the host's arithmetic if it has some and takes it.
     // Its terms are the matrices' every cell, an absent or NULL one 0, where
     // einfold's own adds only the cells with values: the same sums, as every
-    // factor is finite. Which groups exist, and which are NULL, is decided
-    // below either way.
+    // factor is finite, and within rounding of each other in any order, as
+    // no partial sum can overflow. Which groups exist, and which are NULL,
+    // is decided below either way.
     let shape = ProductShape {
         batches: nw,
         rows: per_batch,
@@ -447,7 +448,7 @@ pub(crate) fn fold(
     let hosted = match options.backend {
         Some(backend)
             if backend.may_run(DenseShape::Product(shape))
-                && a_matrix.iter().chain(&b_matrix).all(|x| x.is_finite()) =>
+                && sums_stay_finite(&a_matrix, &b_matrix, nz) =>
         {
             host_product(backend, &a_matrix, &b_matrix, shape, options)?
         }
@@ -646,6 +647,23 @@ fn domain_batch(
         .collect();
     columns.push(Arc::new(values));
     RecordBatch::try_new(Arc::clone(schema), columns)
+}
+
+/// Whether every factor of `a` and `b` is finite, and no partial sum of
+/// `inner` products of them can overflow, in any order: `2 · inner ·
+/// max|a| · max|b|` is finite, with a factor of 2 for rounding. A backend
+/// adds in its own order, so where a sum could overflow, its answer could
+/// be finite where SQL's is infinite, or the reverse: `[1e308, 1e308,
+/// -1e308]` summed left to right is infinite, and 1e308 in another order.
+fn sums_stay_finite(a: &[f64], b: &[f64], inner: usize) -> bool {
+    let largest = |x: &[f64]| {
+        x.iter()
+            .try_fold(0.0, |m: f64, x| x.is_finite().then(|| m.max(x.abs())))
+    };
+    match (largest(a), largest(b)) {
+        (Some(a), Some(b)) => (2.0 * inner as f64 * a * b).is_finite(),
+        _ => false,
+    }
 }
 
 /// `a · b` from the host's `backend`, `[w][x][y]`, or `None` when it

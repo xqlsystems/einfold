@@ -114,7 +114,13 @@ impl DenseWork<'_> {
 ///
 /// Its results are the host's: einfold doesn't check their precision or
 /// determinism, so a host that computes in `float32`, or adds in an order
-/// that depends on timing, changes the query's answer by as much.
+/// that depends on timing, changes the query's answer by as much. einfold
+/// offers only work whose sums can't overflow, or underflow differently,
+/// in `float64`'s range, whichever order the host adds in. A narrower format
+/// has a narrower range: `float32`'s largest value is about `3.4e38` and its
+/// smallest normal about `1.2e-38`, so such a host can return an infinity,
+/// a NaN or 0 where SQL's answer is finite and nonzero. It should decline
+/// work whose operands it can't hold.
 pub trait DenseBackend: Send + Sync + fmt::Debug {
     /// Whether the backend may take work of `shape`. If not, einfold
     /// computes it itself, without reserving memory for, copying or

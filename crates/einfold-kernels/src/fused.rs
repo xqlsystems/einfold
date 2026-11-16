@@ -542,26 +542,22 @@ fn host_attention(
     // `2.5e-24` when multiplied first. The scores aren't computed yet, so
     // they are bounded from the operands: `|q · k| ≤ |q| |k|`, so every
     // score is within `bound` of 0, and every weight `exp(s - max s)` at
-    // least `exp(-2 · bound)`, with 1 to spare for rounding. With at most
+    // least `exp(-2 · bound)`, with 1 to spare for rounding. Each norm is
+    // scaled by its largest element, so that squaring a tiny one can't
+    // round it to 0. With at most
     // `keys` weights of at most 1, the normalizer is at most `keys`. Work
     // whose lightest quotient, or its product with the smallest nonzero
     // value, could be below the smallest normal double isn't offered.
-    let norm = |squares: &mut dyn Iterator<Item = f64>| squares.fold(0.0, f64::max).sqrt();
     let nx = batches * queries;
     let nj = batches * keys;
-    let q_norm = norm(&mut (0..nx).map(|x| {
-        q[x * features..(x + 1) * features]
-            .iter()
-            .map(|q| q * q)
-            .sum()
-    }));
-    let mut k_squares = vec![0.0; nj];
-    for e in 0..features {
-        for (square, k) in k_squares.iter_mut().zip(&kt[e * nj..(e + 1) * nj]) {
-            *square += k * k;
-        }
-    }
-    let k_norm = norm(&mut k_squares.into_iter());
+    let q_norm = (0..nx)
+        .map(|x| norm(q[x * features..(x + 1) * features].iter().copied()))
+        .fold(0.0, f64::max);
+    // Each key's features are `features` apart: read in place, so that
+    // nothing is allocated before the budget is asked.
+    let k_norm = (0..nj)
+        .map(|j| norm((0..features).map(|e| kt[e * nj + j])))
+        .fold(0.0, f64::max);
     let bound = scale.apply(q_norm * k_norm).abs();
     let smallest = (v.iter().map(|x| x.abs()))
         .filter(|&x| x != 0.0)
@@ -611,6 +607,16 @@ fn host_attention(
         )),
         other => Ok(other),
     }
+}
+
+/// The Euclidean norm of `x`, scaled by its largest magnitude, `m · sqrt(Σ
+/// (x / m)²)`, so that no square underflows or overflows.
+fn norm(x: impl Iterator<Item = f64> + Clone) -> f64 {
+    let largest = x.clone().fold(0.0, |m: f64, x| m.max(x.abs()));
+    if largest == 0.0 {
+        return 0.0;
+    }
+    largest * x.map(|x| (x / largest).powi(2)).sum::<f64>().sqrt()
 }
 
 /// `p`'s rows as a dense `rows × columns` matrix of its column, or `None`

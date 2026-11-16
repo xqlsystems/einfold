@@ -167,22 +167,30 @@ def test_attention_that_could_overflow_isnt_offered():
     assert not any(kind == "attention" for kind, _ in backend.calls)
 
 
-def test_attention_that_could_underflow_isnt_offered():
-    """Scores of `[-744.4, 0, 0]`, so weights of about `[5e-324, 1, 1]`, over
-    values `[1e300, 1e-300, 1e-300]`: SQL's `w / z` rounds the first to 0,
-    where a backend that multiplies before it divides keeps it, and answers
-    `5e-324 · 1e300 / 2`, far from SQL's `1e-300`. So einfold keeps the
-    work, and the query answers as SQL does."""
+@pytest.mark.parametrize("q, k, scale", [
+    (1.0, [-744.4, 0.0, 0.0], ""),
+    # Scores of `[0, 745, 745]` from a tiny query and a large scale: its
+    # square would round to 0, so einfold scales a norm by its largest
+    # element.
+    (1e-200, [0.0, 1.0, 1.0], " * 7.45e202"),
+])
+def test_attention_that_could_underflow_isnt_offered(q, k, scale):
+    """Weights of about `[5e-324, 1, 1]` over values `[1e300, 1e-300,
+    1e-300]`: SQL's `w / z` rounds the first to 0, where a backend that
+    multiplies before it divides keeps it, and answers `5e-324 · 1e300 / 2`,
+    far from SQL's `1e-300`. So einfold keeps the work, and the query
+    answers as SQL does."""
     backend = NumpyBackend()
     plain, ours = _sessions(backend)
-    _register((plain, ours), "q", ("b", "h", "t", "d"), (1, 1, 1, 1), np.ones(1))
-    _register((plain, ours), "k", ("b", "h", "t", "d"), (1, 1, 3, 1), np.array([-744.4, 0.0, 0.0]))
+    _register((plain, ours), "q", ("b", "h", "t", "d"), (1, 1, 1, 1), np.array([q]))
+    _register((plain, ours), "k", ("b", "h", "t", "d"), (1, 1, 3, 1), np.array(k))
     _register((plain, ours), "v", ("b", "h", "t", "c"), (1, 1, 3, 1),
               np.array([1e300, 1e-300, 1e-300]))
-    sql = _attention("", "")
+    sql = _attention(scale, "")
     want = plain.sql(sql).to_arrow_table()
-    assert want.column("x").to_pylist() == [1e-300]
-    _assert_same(want, ours.sql(sql).to_arrow_table())
+    got = ours.sql(sql).to_arrow_table()
+    np.testing.assert_allclose(want.column("x").to_pylist(), [1e-300], rtol=1e-9, atol=0)
+    np.testing.assert_allclose(got.column("x").to_pylist(), [1e-300], rtol=1e-9, atol=0)
     assert not any(kind == "attention" for kind, _ in backend.calls)
 
 

@@ -56,6 +56,28 @@ use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use einfold_testkit::Rng;
 
+#[path = "../../einfold-kernels/tests/reference/mod.rs"]
+mod reference;
+
+/// `plan` with each einfold operator given `backend`, as the
+/// Python bridge gives them a session's.
+fn with_backend(
+    plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    backend: Arc<dyn einfold_kernels::DenseBackend>,
+) -> Arc<dyn datafusion::physical_plan::ExecutionPlan> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    plan.transform_up(|node| {
+        let Some(exec) = node.downcast_ref::<einfold_datafusion::EinFoldExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        let exec: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            Arc::new(exec.with_backend(Arc::clone(&backend)));
+        Ok(Transformed::yes(exec))
+    })
+    .unwrap()
+    .data
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Expect {
     /// A pipeline the rule must find.
@@ -714,6 +736,7 @@ async fn einfold_finds_batched_pipelines_and_changes_no_answer() {
         Err(_) => 120,
     };
     let (mut found, mut fused) = (0, 0);
+    let mut hosted_cases = 0;
     for i in 0..cases {
         let seed = seed.wrapping_add(i);
         let mut rng = Rng::seeded(seed, 0);
@@ -766,6 +789,23 @@ async fn einfold_finds_batched_pipelines_and_changes_no_answer() {
         let shown = DisplayableExecutionPlan::with_metrics(plan.as_ref())
             .indent(true)
             .to_string();
+        // The same plan, given a reference backend.
+        let reference = Arc::new(reference::Reference::default());
+        let hosted_plan = with_backend(
+            frame_plan(&ours, &sql).await,
+            Arc::clone(&reference) as Arc<dyn einfold_kernels::DenseBackend>,
+        );
+        let hosted = keyed_rows(
+            &datafusion::physical_plan::collect(Arc::clone(&hosted_plan), ours.task_ctx())
+                .await
+                .unwrap(),
+        );
+        let broken = reference.broken();
+        if !broken.is_empty() {
+            fail(format!("broke the backend's contract: {broken:?}"));
+        }
+        let offered = reference.ran.load(std::sync::atomic::Ordering::Relaxed);
+        hosted_cases += usize::from(offered > 0);
         let is_pipeline = shown.contains("softmax(") || shown.contains("weights(");
         match (expect, is_pipeline) {
             (Some(Expect::Pipeline), false) => fail(format!("found no pipeline:\n{shown}")),
@@ -792,20 +832,32 @@ async fn einfold_finds_batched_pipelines_and_changes_no_answer() {
                 want.len()
             ));
         }
-        for (o, t) in got.iter().zip(&want) {
-            let same = o.0 == t.0
-                && match (o.1, t.1) {
-                    (Some(x), Some(y)) if x.is_nan() || y.is_nan() => x.is_nan() && y.is_nan(),
-                    (Some(x), Some(y)) if x.is_infinite() || y.is_infinite() => x == y,
-                    (Some(x), Some(y)) => (x - y).abs() <= 1e-9 * (1.0 + y.abs()),
-                    (None, None) => true,
-                    _ => false,
-                };
-            if !same {
-                fail(format!("row {o:?}, DataFusion has {t:?}"));
+        if hosted.len() != want.len() {
+            fail(format!(
+                "backend: {} rows, DataFusion has {}",
+                hosted.len(),
+                want.len()
+            ));
+        }
+        for (label, got) in [("own", &got), ("backend", &hosted)] {
+            for (o, t) in got.iter().zip(&want) {
+                let same = o.0 == t.0
+                    && match (o.1, t.1) {
+                        (Some(x), Some(y)) if x.is_nan() || y.is_nan() => x.is_nan() && y.is_nan(),
+                        (Some(x), Some(y)) if x.is_infinite() || y.is_infinite() => x == y,
+                        (Some(x), Some(y)) => (x - y).abs() <= 1e-9 * (1.0 + y.abs()),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                if !same {
+                    fail(format!(
+                        "{label} ({offered} offered): row {o:?}, DataFusion has {t:?}"
+                    ));
+                }
             }
         }
     }
+    eprintln!("offered a backend in {hosted_cases} of {cases} cases");
     if cases >= 50 {
         assert!(found > 0 && fused > 0, "found {found}, fused {fused}");
     }
@@ -1132,4 +1184,17 @@ async fn a_normalized_sum_whose_products_would_underflow_answers_as_sql() {
             assert!((g - w).abs() <= 1e-12, "{got:?}, DataFusion has {want:?}");
         }
     }
+}
+
+/// `sql`'s physical plan in `ctx`.
+async fn frame_plan(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Arc<dyn datafusion::physical_plan::ExecutionPlan> {
+    ctx.sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap()
 }

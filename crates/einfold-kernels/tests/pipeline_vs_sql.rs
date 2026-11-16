@@ -57,6 +57,9 @@ use einfold_ir::{
 use einfold_kernels::{FloatKeys, Host, Options, Relation};
 use einfold_testkit::Rng;
 
+mod reference;
+use einfold_kernels::DenseBackend;
+
 /// A table of integer keys and a nullable `DOUBLE` value, as rows.
 struct Table {
     schema: SchemaRef,
@@ -529,6 +532,14 @@ const HOST: Host = Host {
 /// The kernel's rows, from the tables in a random order and batches, on a
 /// random number of threads, or `None` if it declined.
 fn run(case: &Case, rng: &mut Rng) -> Option<Vec<RecordBatch>> {
+    run_with(case, rng, None)
+}
+
+fn run_with(
+    case: &Case,
+    rng: &mut Rng,
+    backend: Option<&dyn DenseBackend>,
+) -> Option<Vec<RecordBatch>> {
     let batches = |t: &Table, rng: &mut Rng| -> Vec<RecordBatch> { t.partitions(rng).concat() };
     let (q, k, v) = (
         batches(&case.q, rng),
@@ -544,6 +555,7 @@ fn run(case: &Case, rng: &mut Rng) -> Option<Vec<RecordBatch>> {
     let options = Options {
         host: HOST,
         threads: 1 + rng.below(12),
+        backend,
         ..Options::default()
     };
     let inputs = [
@@ -593,30 +605,58 @@ async fn pipeline_matches_sql() {
             ctx.register_table(name, Arc::new(mem)).unwrap();
         }
         let theirs = rows(&ctx.sql(&case.sql).await.unwrap().collect().await.unwrap());
-        if ours.len() != theirs.len() {
-            fail(format!("{} rows, SQL has {}", ours.len(), theirs.len()));
+        // The same case through a backend that computes in another order.
+        let reference = reference::Reference::default();
+        let hosted = run_with(&case, &mut rng, Some(&reference));
+        let broken = reference.broken();
+        if !broken.is_empty() {
+            fail(format!("broke the backend's contract: {broken:?}"));
         }
-        // An average's rounding is on the scale of the values; a sum's, of
-        // the sum of its terms' magnitudes.
-        let magnitudes = match &case.magnitudes {
-            Some(sql) => rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap()),
-            None => vec![(Vec::new(), Some(case.v_scale)); theirs.len()],
+        let ran = reference.ran.load(std::sync::atomic::Ordering::Relaxed);
+        OFFERED.fetch_add(usize::from(ran > 0), std::sync::atomic::Ordering::Relaxed);
+        let hosted = match hosted {
+            Some(h) => rows(&h),
+            None => fail("declined with a backend where it ran without".into()),
         };
-        for (((ok, ov), (tk, tv)), (_, scale)) in ours.iter().zip(&theirs).zip(&magnitudes) {
-            let bound = 1e-9 * scale.unwrap_or(0.0);
-            let same = match (ov, tv) {
-                (Some(x), Some(y)) if x.is_nan() || y.is_nan() => x.is_nan() && y.is_nan(),
-                (Some(x), Some(y)) if x.is_infinite() || y.is_infinite() => x == y,
-                (Some(x), Some(y)) => (x - y).abs() <= bound,
-                (None, None) => true,
-                _ => false,
+        for (label, ours) in [("own", &ours), ("backend", &hosted)] {
+            let ours = ours.clone();
+            if ours.len() != theirs.len() {
+                fail(format!(
+                    "{label}: {} rows, SQL has {}",
+                    ours.len(),
+                    theirs.len()
+                ));
+            }
+            // An average's rounding is on the scale of the values; a sum's, of
+            // the sum of its terms' magnitudes.
+            let magnitudes = match &case.magnitudes {
+                Some(sql) => rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap()),
+                None => vec![(Vec::new(), Some(case.v_scale)); theirs.len()],
             };
-            if ok != tk || !same {
-                fail(format!("row {ok:?} = {ov:?}, SQL has {tk:?} = {tv:?}"));
+            for (((ok, ov), (tk, tv)), (_, scale)) in ours.iter().zip(&theirs).zip(&magnitudes) {
+                let bound = 1e-9 * scale.unwrap_or(0.0);
+                let same = match (ov, tv) {
+                    (Some(x), Some(y)) if x.is_nan() || y.is_nan() => x.is_nan() && y.is_nan(),
+                    (Some(x), Some(y)) if x.is_infinite() || y.is_infinite() => x == y,
+                    (Some(x), Some(y)) => (x - y).abs() <= bound,
+                    (None, None) => true,
+                    _ => false,
+                };
+                if ok != tk || !same {
+                    fail(format!(
+                        "{label} ({ran} hosted): row {ok:?} = {ov:?}, SQL has {tk:?} = {tv:?}"
+                    ));
+                }
             }
         }
     }
+    eprintln!(
+        "offered a backend in {} cases of {cases}",
+        OFFERED.load(std::sync::atomic::Ordering::Relaxed)
+    );
 }
+
+static OFFERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The pairs of tiles visited and the pairs in all, for attention over `l`
 /// positions under `conditions` between `q.t` and `k.t`, in each of
